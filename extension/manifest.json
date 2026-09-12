@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Jownloader",
+  "version": "0.1.30",
+  "description": "Download every image, video or document on the current page, best quality, into any folder. ⬇ button on every video, collect-as-you-scroll, popup or sidebar.",
+  "permissions": [
+    "nativeMessaging",
+    "notifications",
+    "sidePanel",
+    "storage",
+    "tabs",
+    "webNavigation",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Jownloader",
+    "default_icon": {
+      "128": "icon128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "panel.html"
+  },
+  "icons": {
+    "128": "icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle",
+      "js": [
+        "content.js"
+      ]
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuPRNu+X5YNy13OJwR4oRDUK/R1Zyix4Y2nqIL1iMWwclD/iiFZlZ12ndRjEhHa5GUw1iwtmYi/B4lIPWZpOaNojnzDCb/B8PQC2vP18ln3RT/9meKx9CW783d2VrGrq6HgVdImS5fvjTcIqVptALRpR+c/ZRkcVykosyhkxs7c/JTyJC+I0DgSXX9ERkDeVb1zktiNriJLj7Ja6fSTwXO1FAUXQAUMr6EyzfYl+laC21VjX9mwl5w4666jGndaZpQ44BfyAzBIDnWioiWZaaIylOev8LzuPaVheHkEnrVb2yHsUCE6nXR9Zv8SzhXxFIx3pcvIPLiN8Yq4tTeKKHEQIDAQAB"
+}

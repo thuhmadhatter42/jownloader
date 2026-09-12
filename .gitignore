@@ -1,0 +1,13 @@
+# local working notes and session state — never part of the published project
+CLAUDE.md
+PICKUP.md
+CHANGELOG.md
+.remember/
+archive/
+
+# test profiles, downloads, logs
+tests/test-run/
+
+# extension signing key lives outside the repo
+*.pem
+.DS_Store
