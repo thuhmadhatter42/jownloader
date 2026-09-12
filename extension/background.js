@@ -369,7 +369,51 @@ function notify(title, message) {
   try { chrome.notifications.create({ type: "basic", iconUrl: "icon128.png", title, message: String(message || "").slice(0, 300) }); } catch {}
 }
 
-let pickerOpen = false;   // a Finder folder dialog is up (see chooseDir)
+let pickerOpen = false;   // a Finder dialog is up (folder or file picker); one at a time, never queued
+
+// One Finder dialog at a time: a click while one is up (the popup reopened behind it) is refused, never
+// queued. The popup closes when the dialog takes focus, so results go to storage and the reopened popup reads them.
+async function withPicker(cmd, onResult) {
+  if (pickerOpen) return { ok: false, output: "picker already open" };
+  pickerOpen = true; chrome.runtime.sendMessage({ type: "picker", open: true }).catch(() => {});
+  let r;
+  try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd }); }
+  catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
+  pickerOpen = false; chrome.runtime.sendMessage({ type: "picker", open: false }).catch(() => {});
+  if (r?.ok) await onResult(r);
+  else if (r?.output && r.output !== "cancelled") notify("Jownloader: Finder dialog failed", r.output);
+  return r;
+}
+
+// ---------- batch rename ----------
+// The picked files live in session storage (the popup is gone by the time the dialog closes).
+// name → name_N.ext, numbered oldest file first, counter continuing per target folder like downloads;
+// [date] tokens take the file's own modification date. mode "copy" keeps the originals; dest "" = in place.
+async function getRenameFiles() { return (await chrome.storage.session.get("renameFiles")).renameFiles || []; }
+async function renameBatch(name, dest, mode) {
+  const files = (await getRenameFiles()).sort((a, b) => a.mtime - b.mtime || a.path.localeCompare(b.path));
+  name = typed(name || "");
+  if (!files.length || !name) return { ok: false, output: !name ? "type a name first" : "no files selected" };
+  const dirOf = (p) => p.slice(0, p.lastIndexOf("/"));
+  const groups = new Map();                       // target folder → files, so each folder numbers on its own
+  for (const f of files) { const d = dest || dirOf(f.path); if (!groups.has(d)) groups.set(d, []); groups.get(d).push(f); }
+  const ops = [];
+  for (const [d, fs] of groups) {
+    let n = await nextCounter(d, name, fs.length);
+    for (const f of fs) {
+      const m = /\.([a-z0-9]{2,5})$/i.exec(f.path);
+      ops.push({ src: f.path, dst_dir: dest, name: `${typed(expandDate(name, f.mtime))}_${n++}` + (m ? "." + m[1].toLowerCase() : "") });
+    }
+  }
+  let r;
+  try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "rename", mode, ops }); }
+  catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
+  if (!r?.ok) { notify("Jownloader: rename failed", r?.output); return r; }
+  const done = r.results.filter((x) => x.ok).length, failed = r.results.filter((x) => !x.ok);
+  await chrome.storage.session.remove("renameFiles");
+  if (failed.length) notify("Jownloader: rename", `${failed.length} failed — ${failed[0].output}`);
+  return { ok: true, done, failed: failed.length, error: failed[0]?.output || "", ops };
+}
 
 // ---------- messages ----------
 chrome.runtime.onMessage.addListener((msg, sender, reply) => {
@@ -382,18 +426,17 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     } else if (msg.type === "getProgress") {
       reply({ ...progress });
     } else if (msg.type === "chooseDir") {
-      // Finder picker via the host; the popup closes when the dialog takes focus, so the result is stored
-      // in sync storage and the reopened popup reads it. One picker at a time: a second click while the
-      // dialog is up (the popup reopened) does nothing but say so.
-      if (pickerOpen) { reply({ ok: false, output: "picker already open" }); return; }
-      pickerOpen = true; chrome.runtime.sendMessage({ type: "picker", open: true }).catch(() => {});
-      let r;
-      try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "choose_dir" }); }
-      catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
-      pickerOpen = false; chrome.runtime.sendMessage({ type: "picker", open: false }).catch(() => {});
-      if (r?.ok && r.path) await chrome.storage.sync.set({ dest: r.path });
-      else if (r?.output && r.output !== "cancelled") notify("Jownloader: choose folder failed", r.output);
-      reply(r);
+      reply(await withPicker("choose_dir", (r) => chrome.storage.sync.set({ dest: r.path })));
+    } else if (msg.type === "chooseRenameDest") {
+      reply(await withPicker("choose_dir", (r) => chrome.storage.sync.set({ renameDest: r.path })));
+    } else if (msg.type === "chooseFiles") {
+      reply(await withPicker("choose_files", (r) => chrome.storage.session.set({ renameFiles: r.files })));
+    } else if (msg.type === "getRenameFiles") {
+      reply(await getRenameFiles());
+    } else if (msg.type === "clearRenameFiles") {
+      await chrome.storage.session.remove("renameFiles"); reply({ ok: true });
+    } else if (msg.type === "rename") {
+      reply(await renameBatch(msg.name, msg.dest, msg.mode));
     } else if (msg.type === "pickerOpen") {
       reply(pickerOpen);
     } else if (msg.type === "clearDir") {

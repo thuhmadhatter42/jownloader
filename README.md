@@ -18,6 +18,10 @@ you already have.
   (from the page markup), else the page's date, else today.
 - **Never twice** — every saved URL is remembered and skipped while its file is still in its
   folder. Trash the file and it downloads again. Nothing is ever overwritten (`name (2).ext`).
+- **Batch rename** tab — forgot the prefix? Type it, pick the files in one Finder dialog, and they
+  become `trip_1.mp4, trip_2.mp4 …` (oldest first, numbering continues where that folder's downloads
+  left off; `[date]` tokens take each file's modification date). Tick *Move the files?* to send them
+  to another folder instead, moved or copied. Nothing is ever overwritten.
 - **Popup or side panel** — the panel stays open and rescans as you browse.
 - **Uses your login** — files are fetched by the browser itself, so anything you can see, it can save.
 
@@ -56,6 +60,7 @@ tests/       Playwright harness (no host) and a real-browser CDP test of the wri
 ```
 python3 tests/ext_test.py          # Chromium via Playwright: scanning, naming, dedupe, DRM check, no-host failure
 python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen folder, [date] names, skip-if-on-disk
+python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, missing files
 ```
 
 Both need `pip install playwright` and `playwright install chromium`. The second needs Brave in

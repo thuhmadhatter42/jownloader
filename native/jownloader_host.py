@@ -13,8 +13,13 @@ renamed on close, so a half file never looks finished.
 One-shot (sendNativeMessage, own process each):
   {"cmd": "choose_dir"}                             -> {"ok", "path"}   Finder folder picker
   {"cmd": "exists", "paths": [...]}                 -> {"ok", "exists": [bool...]}   still on disk?
+  {"cmd": "choose_files"}                           -> {"ok", "files": [{"path", "mtime"}...]}   Finder multi-file picker
+  {"cmd": "rename", "mode": "move"|"copy", "ops": [{"src", "dst_dir", "name"}...]}
+                                                    -> {"ok", "results": [{"ok", "path"} | {"ok": false, "output"}...]}
+     batch rename: each src becomes dst_dir/name (dst_dir "" = the file's own folder); "copy" leaves
+     the original in place. Never overwrites: name (2).ext …
 """
-import base64, json, os, struct, subprocess, sys
+import base64, json, os, shutil, struct, subprocess, sys
 
 
 def read_msg():
@@ -41,6 +46,55 @@ def choose_dir():
     if p.returncode != 0 or not path:
         return {"ok": False, "output": "cancelled" if "-128" in p.stderr else p.stderr.strip()}
     return {"ok": True, "path": path.rstrip("/")}
+
+
+def choose_files():
+    """Finder multi-file picker, in front of Brave. Cancel -> ok:false. One path per line."""
+    script = ('tell application "System Events" to activate\n'
+              'tell application "System Events"\n'
+              'set fs to choose file with prompt "Jownloader: files to rename…" with multiple selections allowed\n'
+              'set out to ""\n'
+              'repeat with f in fs\n'
+              'set out to out & POSIX path of f & linefeed\n'
+              'end repeat\n'
+              'return out\n'
+              'end tell')
+    p = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
+    paths = [l for l in p.stdout.split("\n") if l.strip()]
+    if p.returncode != 0 or not paths:
+        return {"ok": False, "output": "cancelled" if "-128" in p.stderr else p.stderr.strip()}
+    files = []
+    for path in paths:
+        try:
+            files.append({"path": path, "mtime": int(os.stat(path).st_mtime * 1000)})
+        except OSError as e:
+            return {"ok": False, "output": str(e)}
+    return {"ok": True, "files": files}
+
+
+def rename(msg):
+    """Batch rename / move / copy. Each op fails on its own; the batch keeps going."""
+    copy = msg.get("mode") == "copy"
+    results = []
+    for op in msg.get("ops") or []:
+        src = op.get("src") or ""
+        name = os.path.basename(op.get("name") or "") or os.path.basename(src)
+        dst_dir = op.get("dst_dir") or os.path.dirname(src)
+        try:
+            if not os.path.isfile(src):
+                raise FileNotFoundError(f"not a file: {src}")
+            os.makedirs(dst_dir, exist_ok=True)
+            if not copy and dst_dir == os.path.dirname(src) and name == os.path.basename(src):
+                results.append({"ok": True, "path": src}); continue      # already named that
+            dst = unique_path(dst_dir, name)
+            if copy:
+                shutil.copy2(src, dst)
+            else:
+                shutil.move(src, dst)                                   # rename, or cross-volume move
+            results.append({"ok": True, "path": dst})
+        except Exception as e:
+            results.append({"ok": False, "output": str(e)})
+    return {"ok": True, "results": results}
 
 
 def unique_path(dst_dir, name):
@@ -119,6 +173,10 @@ def serve():
                 send(r)
         elif msg.get("cmd") == "choose_dir":
             send(choose_dir())
+        elif msg.get("cmd") == "choose_files":
+            send(choose_files())
+        elif msg.get("cmd") == "rename":
+            send(rename(msg))
         else:
             send({"ok": False, "output": "unknown cmd"})
 

@@ -9,6 +9,7 @@
   .host { color: #999; font-size: 12px; margin-bottom: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   button { display: block; width: 100%; margin: 6px 0; padding: 9px; font: 600 13px system-ui; color: #fff; background: #2f6fed; border: 0; border-radius: 6px; cursor: pointer; }
   button:disabled { background: #444; color: #888; cursor: default; }
+  [hidden] { display: none !important; }   /* button { display: block } above would otherwise beat the attribute */
   label { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #333; }
   label span small { display: block; color: #888; font-weight: normal; }
   .row { display: flex; gap: 6px; margin-bottom: 4px; }
@@ -23,9 +24,17 @@
   .warn { color: #fc6; }
   .bar { height: 8px; margin-top: 8px; background: #2a2a2d; border: 1px solid #444; border-radius: 5px; overflow: hidden; }
   .bar div { height: 100%; width: 0; background: #2f6fed; transition: width .15s linear; }
+  .tabs { display: flex; gap: 4px; margin: 0 0 8px; border-bottom: 1px solid #333; }
+  .tabs button { width: auto; flex: 1; margin: 0; padding: 6px; font: 600 12px system-ui; color: #999; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; }
+  .tabs button.on { color: #fff; border-bottom-color: #2f6fed; }
+  .opt { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 0; justify-content: flex-start; }
+  .opt input[type=radio] { margin: 0 4px 0 0; }
+  .files { color: #999; font-size: 12px; margin: 4px 0; }
 </style></head>
 <body>
   <h1>Jownloader <button id="sidebar" title="open Jownloader as a sidebar that stays open while you browse">⧉ sidebar</button></h1>
+  <div class="tabs"><button id="tabDl" class="on">Download</button><button id="tabRn">Batch rename</button></div>
+  <div id="paneDl">
   <div class="host" id="host">scanning…</div>
   <div class="row"><button id="dest" class="dest" title="Downloads">📁 Downloads</button><button id="destClear" class="x" title="back to Downloads" hidden>×</button></div>
   <div class="row"><input id="prefix" placeholder="name → name_1, _2… ([yy-mm-dd] = upload date)"></div>
@@ -37,6 +46,16 @@
   <label><span>Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos"></label>
   <label><span>Button on videos<small>⬇ overlay top-left of every player, shows the quality it will grab</small></span><input type="checkbox" id="showButton"></label>
   <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
+  </div>
+  <div id="paneRn" hidden>
+  <div class="row"><input id="rnName" placeholder="name → name_1, _2… ([yy-mm-dd] = file date)"></div>
+  <div class="row"><button id="rnPick">Select files…</button><button id="rnClear" class="x" title="forget the selected files" hidden>×</button></div>
+  <div class="files" id="rnFiles">no files selected</div>
+  <label class="opt"><input type="checkbox" id="rnMove"><span>Move the files?</span></label>
+  <div class="row"><button id="rnDest" class="dest" disabled title="choose a folder">📁 destination</button><button id="rnDestClear" class="x" title="clear the destination" hidden>×</button></div>
+  <div class="opt"><label class="opt"><input type="radio" name="rnMode" value="move" checked disabled>move</label><label class="opt"><input type="radio" name="rnMode" value="copy" disabled>copy</label></div>
+  <button id="rnGo" disabled>Rename</button>
+  </div>
   <div class="bar" id="bar" hidden><div id="fill"></div></div>
   <div class="status" id="status"></div>
   <script src="popup.js"></script>

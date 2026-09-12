@@ -37,8 +37,8 @@ with sync_playwright() as p:
     check("same-file '2160p' variant → real pixels of what plays", any(l.startswith("⬇ Download ") and "×" in l and "label" not in l for l in labels), True)
     pop = ctx.new_page(); pop.goto(f"chrome-extension://{ext_id}/popup.html"); pop.wait_for_timeout(1500)
     # (the popup opened as a tab scans itself, so counts are 0 here; the scan is checked against the test page below)
-    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:7],
-          ["⧉ sidebar", "📁 Downloads", "×", "Download all images", "Download all videos", "Download all documents", "Download collected"])   # (+ ×, forget saved, yt…)
+    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:9],
+          ["⧉ sidebar", "Download", "Batch rename", "📁 Downloads", "×", "Download all images", "Download all videos", "Download all documents", "Download collected"])   # (+ ×, forget saved, rename tab…)
 
     # the popup's first message must answer (a throw here hung the popup at "scanning…" once)
     first = pop.evaluate("""async () => Promise.race([new Promise(r => setTimeout(() => r('TIMEOUT'), 3000)),
@@ -127,6 +127,11 @@ with sync_playwright() as p:
     pk = pop.evaluate("""async () => { const a = chrome.runtime.sendMessage({type:'chooseDir'}); const open = await chrome.runtime.sendMessage({type:'pickerOpen'});
       const ra = await a; return [open, ra.ok, await chrome.runtime.sendMessage({type:'pickerOpen'})]; }""")
     check("picker flag: up while the dialog call runs, clear after", pk, [True, False, False])
+    pk2 = pop.evaluate("""async () => { const a = chrome.runtime.sendMessage({type:'chooseFiles'}); const b = await chrome.runtime.sendMessage({type:'chooseRenameDest'});
+      const ra = await a; return [b.output, ra.ok, await chrome.runtime.sendMessage({type:'pickerOpen'})]; }""")
+    check("file picker: a second Finder call while one is up is refused, not queued", pk2, ["picker already open", False, False])
+    check("rename with nothing selected fails loud", pop.evaluate("async () => (await chrome.runtime.sendMessage({type:'rename', name:'x', dest:'', mode:'rename'})).output"), "no files selected")
+    check("rename tab present", pop.evaluate("() => [!!document.getElementById('tabRn'), document.getElementById('rnGo').disabled, document.getElementById('rnDest').disabled]"), [True, True, True])
     check("YouTube tracks are never whole files", sw.evaluate("() => [isWhole('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=18', 'video/mp4'), isWhole('https://cdn.x/a.mp4', 'video/mp4')]"), [False, True])
     check("sniffed extensions", sw.evaluate("() => [sniffExt(new Uint8Array([0,0,0,0x18,0x66,0x74,0x79,0x70,0x69,0x73,0x6f,0x6d,0,0])), sniffExt(new Uint8Array([0xff,0xd8,0xff,0xe0,0,0,0,0,0,0,0,0,0])), sniffExt(new Uint8Array([0x1a,0x45,0xdf,0xa3,0,0,0,0,0,0,0,0,0])), sniffExt(new Uint8Array(13))]"), ["mp4", "jpg", "webm", ""])
     ctx.close()

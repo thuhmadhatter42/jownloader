@@ -96,13 +96,64 @@ $("prefix").oninput = () => chrome.storage.sync.set({ prefix: $("prefix").value.
 // Finder picker runs in the native host; the popup closes when the dialog takes focus, so the
 // background stores the result and the reopened popup shows it
 // one Finder dialog at a time: the button is off while it's up (the popup reopens with it still open)
-function pickerState(open) { $("dest").disabled = open; if (open) $("status").textContent = "choose a folder in the Finder window… (or Cancel it)"; }
+function pickerState(open) { for (const id of ["dest", "rnPick", "rnDest"]) $(id).disabled = open || (id === "rnDest" && !$("rnMove").checked); if (open) $("status").textContent = "finish the open Finder window first (or Cancel it)"; }
 chrome.runtime.sendMessage({ type: "pickerOpen" }).then(pickerState).catch(() => {});
 chrome.runtime.onMessage.addListener((m) => { if (m?.type === "picker") pickerState(m.open); });
 $("dest").onclick = () => { pickerState(true); chrome.runtime.sendMessage({ type: "chooseDir" }); };
 $("destClear").onclick = async () => { await chrome.runtime.sendMessage({ type: "clearDir" }); destPath = ""; showDest(); };
 chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.dest) { destPath = ch.dest.newValue || ""; showDest(); } });
 for (const k of ["autoVideos", "showButton", "collect"]) $(k).onchange = () => chrome.storage.sync.set({ [k]: $(k).checked });
+
+// ---------- batch rename tab ----------
+// Selected files live in the background (the popup closes when Finder opens); one Finder window at a time
+// (pickerState above disables both pickers while one is up, and the background refuses a second call).
+let rnDest = "", rnFiles = [];
+const tabs = { tabDl: "paneDl", tabRn: "paneRn" };
+function showTab(id) {
+  for (const [t, pane] of Object.entries(tabs)) { $(t).classList.toggle("on", t === id); $(pane).hidden = t !== id; }
+  try { localStorage.setItem("tab", id); } catch {}
+  $("status").textContent = ""; $("bar").hidden = true;
+}
+for (const t of Object.keys(tabs)) $(t).onclick = () => showTab(t);
+try { if (localStorage.getItem("tab") === "tabRn") showTab("tabRn"); } catch {}
+function showRename() {
+  const n = rnFiles.length, move = $("rnMove").checked;
+  $("rnFiles").textContent = n ? `${n} file${n > 1 ? "s" : ""} selected in ${folderName(rnFiles[0].path.slice(0, rnFiles[0].path.lastIndexOf("/")))}/` : "no files selected";
+  $("rnClear").hidden = !n;
+  $("rnDest").textContent = "📁 " + (rnDest ? folderName(rnDest) : "destination");
+  $("rnDest").title = rnDest || "choose a folder";
+  $("rnDest").disabled = !move;
+  $("rnDestClear").hidden = !move || !rnDest;
+  for (const r of document.querySelectorAll("input[name=rnMode]")) r.disabled = !move;
+  const mode = move ? document.querySelector("input[name=rnMode]:checked").value : "rename";
+  const ready = n && $("rnName").value.trim() && (!move || rnDest);
+  $("rnGo").disabled = !ready;
+  $("rnGo").textContent = mode === "copy" ? `Copy ${n} renamed → ${rnDest ? folderName(rnDest) : "…"}` : mode === "move" ? `Move ${n} renamed → ${rnDest ? folderName(rnDest) : "…"}` : `Rename ${n} file${n === 1 ? "" : "s"}`;
+}
+async function loadRenameFiles() { rnFiles = await chrome.runtime.sendMessage({ type: "getRenameFiles" }).catch(() => []) || []; showRename(); }
+$("rnPick").onclick = () => { pickerState(true); chrome.runtime.sendMessage({ type: "chooseFiles" }); };
+$("rnClear").onclick = async () => { await chrome.runtime.sendMessage({ type: "clearRenameFiles" }); loadRenameFiles(); };
+$("rnDest").onclick = () => { pickerState(true); chrome.runtime.sendMessage({ type: "chooseRenameDest" }); };
+$("rnDestClear").onclick = async () => { await chrome.storage.sync.set({ renameDest: "" }); };
+$("rnMove").onchange = () => { chrome.storage.sync.set({ rnMove: $("rnMove").checked }); showRename(); };
+$("rnName").oninput = () => { chrome.storage.sync.set({ rnName: $("rnName").value.trim() }); showRename(); };
+for (const r of document.querySelectorAll("input[name=rnMode]")) r.onchange = () => { chrome.storage.sync.set({ rnMode: r.value }); showRename(); };
+$("rnGo").onclick = async () => {
+  const move = $("rnMove").checked, mode = move ? document.querySelector("input[name=rnMode]:checked").value : "rename";
+  $("rnGo").disabled = true; $("status").textContent = "renaming…";
+  const r = await chrome.runtime.sendMessage({ type: "rename", name: $("rnName").value.trim(), dest: move ? rnDest : "", mode });
+  if (!r?.ok) { $("status").innerHTML = `<div class="warn">${r?.output || "rename failed"}</div>`; showRename(); return; }
+  const verb = mode === "copy" ? "copied" : mode === "move" ? "moved" : "renamed";
+  $("status").textContent = `${r.done} ${verb} → ${r.ops[0].name}${r.done > 1 ? " … " + r.ops[r.ops.length - 1].name : ""}` + (r.failed ? `\n${r.failed} failed: ${r.error}` : "");
+  loadRenameFiles();
+};
+chrome.storage.sync.get({ renameDest: "", rnMove: false, rnMode: "move", rnName: "" }, (s) => {
+  rnDest = s.renameDest; $("rnMove").checked = s.rnMove; $("rnName").value = s.rnName;
+  for (const r of document.querySelectorAll("input[name=rnMode]")) r.checked = r.value === s.rnMode;
+  showRename();
+});
+chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.renameDest) { rnDest = ch.renameDest.newValue || ""; showRename(); } if (area === "session" && ch.renameFiles) loadRenameFiles(); });
+loadRenameFiles();
 
 // saved-URL memory: skipped while the file is still in its folder; the link wipes it
 async function showSaved() { const n = await chrome.runtime.sendMessage({ type: "savedCount" }).catch(() => 0); $("forget").textContent = `forget saved (${n || 0})`; }
