@@ -12,6 +12,9 @@ with the browser session; this side only writes them.
      ffmpeg -c copy over the tracks (video, or video + audio) into name.mp4 and removes the temps.
      No ffmpeg on this Mac: one track is kept raw (name.ts / name.mp4), two are saved as
      name.video.* and name.audio.* with "output" saying so.
+  {"cmd": "mergepdf", "id", "ids": [...], "name", "dst"} -> {"id", "ok", "path", "bytes"?, "output"?}
+     merges closed temp-track PDFs (from "open" with "temp": true) in order into dst/name.pdf with
+     pypdf; no pypdf → the per-page PDFs are kept as dst/<name>/001.pdf … and "output" says so.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
@@ -215,6 +218,51 @@ def join(msg):
             "output": note + " — video and audio saved as separate files: " + ", ".join(os.path.basename(o) for o in outs)}
 
 
+def mergepdf(msg):
+    """Merge the closed temp-track PDFs of a whole-site PDF crawl, in order, into dst/name.pdf."""
+    sid, ids = msg.get("id"), msg.get("ids") or []
+    dst = msg.get("dst") or os.path.expanduser("~/Downloads")
+    name = os.path.basename(msg.get("name") or "site") or "site"
+    tracks = [TEMP.pop(i) for i in ids if i in TEMP]
+    if len(tracks) != len(ids) or not tracks:
+        for t in tracks:
+            try: os.remove(t)
+            except OSError: pass
+        return {"id": sid, "ok": False, "output": "track missing"}
+    try:
+        from pypdf import PdfReader, PdfWriter
+    except ImportError:
+        folder = os.path.join(dst, name); i = 2; base = folder
+        while os.path.exists(folder):
+            folder = f"{base} ({i})"; i += 1
+        os.makedirs(folder, exist_ok=True)
+        outs = []
+        for i, t in enumerate(tracks, 1):
+            out = os.path.join(folder, f"{i:03d}.pdf")
+            os.replace(t, out); outs.append(out)
+        return {"id": sid, "ok": True, "path": folder,
+                "output": "pypdf not installed — pages kept separately; run native/install.sh"}
+    out = unique_path(dst, name + ".pdf")
+    try:
+        os.makedirs(dst, exist_ok=True)
+        writer = PdfWriter()
+        for t in tracks:
+            reader = PdfReader(t)
+            for page in reader.pages:
+                writer.add_page(page)
+        with open(out + ".jownloading", "wb") as f:
+            writer.write(f)
+        for t in tracks:
+            try: os.remove(t)
+            except OSError: pass
+        os.replace(out + ".jownloading", out)
+        return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
+    except Exception as e:
+        try: os.remove(out + ".jownloading")
+        except OSError: pass
+        return {"id": sid, "ok": False, "output": str(e)}
+
+
 def stream(msg):
     """Streaming save; the extension fetched the bytes itself so every site's login just works."""
     cmd, sid = msg.get("cmd"), msg.get("id")
@@ -292,6 +340,12 @@ def serve():
         elif msg.get("cmd") == "join":
             try:
                 r = finished(join(msg), msg)
+            except Exception as e:
+                r = {"id": msg.get("id"), "ok": False, "output": str(e)}
+            send(r)
+        elif msg.get("cmd") == "mergepdf":
+            try:
+                r = finished(mergepdf(msg), msg)
             except Exception as e:
                 r = {"id": msg.get("id"), "ok": False, "output": str(e)}
             send(r)

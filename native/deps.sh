@@ -50,6 +50,17 @@ ensure_deps() {
     done
     [ -d "$HOME/.local/bin" ] && export PATH="$HOME/.local/bin:$PATH"
 
+    if ! python3 -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('pypdf') else 1)" 2>/dev/null; then
+        if command -v python3 &>/dev/null; then
+            echo "▸ Installing pypdf (PDF merge for Whole-site saves)..."
+            python3 -m pip install --user --quiet pypdf 2>/dev/null \
+                || python3 -m pip install --user --break-system-packages --quiet pypdf 2>/dev/null \
+                || echo "  (pip unavailable or failed — pypdf not installed; whole-site PDF pages will be kept separately)"
+        else
+            echo "  no python3 found — pypdf not installed"
+        fi
+    fi
+
     # Instagram's best-quality video comes through a DASH manifest that gallery-dl hands to yt-dlp by
     # IMPORT, not by running the binary; without it videos still download, at the lower 720p copy.
     local gdl interp

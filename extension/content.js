@@ -207,9 +207,37 @@
     return [...out.values()];
   }
 
+  // Whole-site Markdown: readable text plus headings-as-#-lines from the page's main content.
+  // Not a full HTML-to-Markdown converter — no bold/italic/code/links/lists — just enough structure
+  // to make a crawled page's text useful in one merged file.
+  function siteMarkdown() {
+    const root = document.querySelector("main") || document.querySelector("article") || document.body;
+    const clone = root.cloneNode(true);
+    for (const el of clone.querySelectorAll("script, style, noscript, nav, header, footer")) el.remove();
+    const lines = [];
+    (function walk(node) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const t = node.textContent.trim();
+        if (t) lines.push(t);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE) return;
+      const m = /^h([1-6])$/i.exec(node.tagName);
+      if (m) {
+        const t = node.textContent.trim();
+        if (t) lines.push("#".repeat(+m[1]) + " " + t);
+        return;
+      }
+      for (const child of node.childNodes) walk(child);
+    })(clone);
+    return { title: document.title || "", text: lines.join("\n\n") };
+  }
+
   chrome.runtime.onMessage.addListener((msg, _s, reply) => {
     if (msg.type === "scanFrame") reply({ host: host(), images: scanImages(), videos: scanVideos(), docs: scanDocs() });
     else if (msg.type === "pageChanged") { autoDone.clear(); collected.clear(); }   // load or pushState: a new page
+    else if (msg.type === "siteLinks") reply(Array.from(document.querySelectorAll("a[href]")).map((a) => a.href));
+    else if (msg.type === "siteMarkdown") reply(siteMarkdown());
     return false;
   });
 

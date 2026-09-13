@@ -46,6 +46,8 @@ async function refresh() {
   const eng = engineOf(tab.url);
   $("site").hidden = !eng?.what; $("siteAudio").hidden = eng?.site !== "youtube" || !eng.what;
   if (eng?.what) $("site").textContent = `Download ${eng.what}`;
+  const isHttp = /^https?:\/\//i.test(tab.url || "");
+  $("sitePdf").hidden = $("siteMd").hidden = !isHttp;
   vi = await videoItems();
   const drm = scan.videos.filter((v) => v.drm).length;
   const blobs = scan.videos.filter((v) => v.blob && !v.drm).length;
@@ -100,6 +102,14 @@ for (const [id, mode] of [["site", "video"], ["siteAudio", "audio"]]) $(id).oncl
   if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
 };
 
+// whole-site buttons: crawl same-origin pages breadth-first (capped) and save one merged PDF or Markdown file
+for (const [id, mode] of [["sitePdf", "pdf"], ["siteMd", "md"]]) $(id).onclick = async () => {
+  const maxPages = Math.max(1, parseInt($("sitePages").value, 10) || 50);
+  $("status").textContent = `crawling the site (max ${maxPages} pages)…`;
+  const r = await chrome.runtime.sendMessage({ type: "download", items: [{ url: tab.url, site: true, mode, maxPages }], kind: "site", dest: destPath, prefix: "" });
+  if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
+};
+
 // collected-as-you-scroll list: lives in the background (session storage), count updates live
 function showCollected(n) { $("coll").textContent = `Download collected (${n})`; $("coll").disabled = !n; $("collClear").hidden = !n; }
 chrome.runtime.onMessage.addListener((m) => { if (m?.type === "collected") showCollected(m.n); });
@@ -111,15 +121,17 @@ $("coll").onclick = async () => {
 };
 $("collClear").onclick = () => chrome.runtime.sendMessage({ type: "clearCollected" });
 
-chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "" }, (s) => {
+chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "", sitePages: 50 }, (s) => {
   $("autoVideos").checked = s.autoVideos;
   $("collect").checked = s.collect;
   $("showButton").checked = s.showButton;
   $("strip").checked = s.strip; $("webp").value = s.webp === true ? "jpg" : s.webp || "";
   destPath = s.dest; showDest();
   $("prefix").value = s.prefix;
+  $("sitePages").value = s.sitePages || 50;
 });
 $("prefix").oninput = () => chrome.storage.sync.set({ prefix: $("prefix").value.trim() });
+$("sitePages").oninput = () => chrome.storage.sync.set({ sitePages: Math.max(1, parseInt($("sitePages").value, 10) || 50) });
 // Finder picker runs in the native host; the popup closes when the dialog takes focus, so the
 // background stores the result and the reopened popup shows it
 // one Finder dialog at a time: the button is off while it's up (the popup reopens with it still open)

@@ -38,6 +38,17 @@ you already have.
 - **Convert WebP** switch — every `.webp` saved becomes a `.jpg` at quality 100, or a `.png`.
   Both are also actions in the Batch tab for files already on disk.
 
+## Whole site → PDF / Markdown
+
+Crawls every same-origin page reachable from the page you're on (breadth-first, capped at the max-pages
+number you set, default 50) and saves the whole thing as one merged PDF or one Markdown file. No
+external tools do the crawling — the extension drives it itself with `chrome.tabs` (navigate, wait for
+load, follow same-origin links) and, for PDF, `chrome.tabs`'s DevTools debugger to render each page
+exactly as Brave does. While a PDF crawl runs, Brave shows a "Jownloader started debugging this
+browser" bar — harmless, and it goes away when the crawl finishes. Merging the per-page PDFs into one
+file needs `pypdf`, installed automatically by `native/install.sh`; without it, the pages are saved
+separately instead of merged.
+
 ## What it won't do
 
 - **DRM video** (Widevine / PlayReady) is reported as protected and never saved. Encrypted bytes are
@@ -78,6 +89,7 @@ python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen fo
 python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG / PNG, strip metadata
 python3 tests/streams_test_cdp.py  # real Brave: HLS (TS, AES-128, fMP4 + audio group) and DASH joined into .mp4, DRM refused
 python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named .mp3 (network)
+python3 tests/site_test_cdp.py     # real Brave: Whole-site crawl (its own local fixture site) → merged PDF and Markdown
 ```
 
 Both need `pip install playwright` and `playwright install chromium`. The second needs Brave in

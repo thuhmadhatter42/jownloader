@@ -502,6 +502,119 @@ async function saveStreamViaHost(url, name, dest, fin = {}) {
   }
 }
 
+// ---------- whole site: crawl same-origin pages breadth-first, save one merged PDF or Markdown file ----------
+// Uses chrome.tabs (navigate a background tab, wait for load) + chrome.debugger (Page.printToPDF) — no
+// Node, no headless browser of its own. Link discovery and text extraction go through the existing
+// content script (siteLinks / siteMarkdown), same as every other scan in this file.
+const SITE_ASSET_EXT = /\.(png|jpe?g|gif|webp|svg|ico|bmp|tiff?|pdf|zip|rar|tar|gz|7z|mp4|webm|mov|avi|mkv|mp3|wav|ogg|flac|css|js|mjs|json|xml|woff2?|ttf|eot|otf|exe|dmg|pkg|apk)(\?.*)?$/i;
+// same-origin, no fragment, no asset link, no trailing slash — null if it should not be crawled
+function siteNorm(href, origin) {
+  try {
+    const u = new URL(href, origin);
+    if (u.origin !== origin) return null;
+    u.hash = "";
+    if (SITE_ASSET_EXT.test(u.pathname)) return null;
+    return u.href.replace(/\/$/, "") || u.origin;
+  } catch { return null; }
+}
+function unb64(s) {
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+// resolves once the tab has finished loading (or after a timeout, so a page that never fires "complete" can't wedge the crawl)
+function waitTabLoad(tabId, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let done = false;
+    const timer = setTimeout(finish, timeoutMs);
+    function onUpdated(id, info) { if (id === tabId && info.status === "complete") finish(); }
+    function finish() { if (done) return; done = true; clearTimeout(timer); chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId).then((t) => { if (t.status === "complete") finish(); }).catch(finish);
+  });
+}
+async function siteLinksOf(tabId, origin) {
+  let hrefs; try { hrefs = await chrome.tabs.sendMessage(tabId, { type: "siteLinks" }, { frameId: 0 }); } catch { hrefs = []; }
+  const out = []; for (const h of hrefs || []) { const n = siteNorm(h, origin); if (n) out.push(n); } return out;
+}
+async function siteMarkdownOf(tabId) {
+  try { return await chrome.tabs.sendMessage(tabId, { type: "siteMarkdown" }, { frameId: 0 }) || { title: "", text: "" }; }
+  catch { return { title: "", text: "" }; }
+}
+// Crawls breadth-first from url (same origin only), rendering each page to a PDF (merged by the host) or
+// collecting its readable text into one Markdown file. Resolves {ok, path, ...} or {ok:false, output}.
+async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
+  const port = hostConnect();
+  const origin = new URL(url).origin;
+  const start = siteNorm(url, origin) || url.replace(/\/$/, "") || origin;
+  const visited = new Set([start]), queue = [start];
+  const hostname = new URL(url).hostname.replace(/^www\./, "");
+  const name = sanitize(hostname) || "site";
+  const tab = await chrome.tabs.create({ url: start, active: false });
+  const tabId = tab.id;
+  let attached = false;
+  const ids = [], mdParts = [];
+  let n = 0, first = true;
+  try {
+    if (mode === "pdf") { await chrome.debugger.attach({ tabId }, "1.3"); attached = true; }
+    while (queue.length && n < maxPages) {
+      const pageUrl = queue.shift();
+      if (!first) await chrome.tabs.update(tabId, { url: pageUrl });
+      await waitTabLoad(tabId);
+      first = false;
+      n++;
+      if (mode === "pdf") {
+        const r = await chrome.debugger.sendCommand({ tabId }, "Page.printToPDF", { printBackground: true });
+        const bytes = unb64(r.data);
+        const id = "s" + (++hostSeq);
+        const opened = await hostAsk(port, { cmd: "open", id, name: `${name}.${n}.pdf`, dst: dest || "", temp: true });
+        if (!opened.ok) throw new Error(hostError(opened.output));
+        ids.push(id);
+        for (let o = 0; o < bytes.length; o += CHUNK) {
+          const r2 = await hostAsk(port, { cmd: "chunk", id, data: b64(bytes.subarray(o, o + CHUNK)) });
+          if (!r2.ok) throw new Error(hostError(r2.output));
+        }
+        progress.bytes += bytes.length; pushProgress(false);
+        const closed = await hostAsk(port, { cmd: "close", id });
+        if (!closed.ok) throw new Error(hostError(closed.output));
+      } else {
+        const { title, text } = await siteMarkdownOf(tabId);
+        mdParts.push(`# ${title}\n\n${pageUrl}\n\n${text}\n\n---\n\n`);
+        progress.bytes += text.length; pushProgress(false);
+      }
+      const links = await siteLinksOf(tabId, origin);
+      for (const l of links) if (!visited.has(l)) { visited.add(l); queue.push(l); }
+    }
+  } catch (e) {
+    for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
+    return { ok: false, output: String(e?.message || e) };
+  } finally {
+    if (attached) try { await chrome.debugger.detach({ tabId }); } catch {}
+    if (tabId != null) try { await chrome.tabs.remove(tabId); } catch {}
+  }
+  if (mode === "pdf") {
+    const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
+    return r.ok ? r : { ok: false, output: hostError(r.output) };
+  }
+  const md = mdParts.join("");
+  const bytes = new TextEncoder().encode(md);
+  const id = "s" + (++hostSeq);
+  const opened = await hostAsk(port, { cmd: "open", id, name: name + ".md", dst: dest || "", ...fin });
+  if (!opened.ok) return { ok: false, output: hostError(opened.output) };
+  try {
+    for (let o = 0; o < bytes.length; o += CHUNK) {
+      const r = await hostAsk(port, { cmd: "chunk", id, data: b64(bytes.subarray(o, o + CHUNK)) });
+      if (!r.ok) throw new Error(hostError(r.output));
+    }
+    const closed = await hostAsk(port, { cmd: "close", id });
+    return closed.ok ? closed : { ok: false, output: hostError(closed.output) };
+  } catch (e) {
+    try { port.postMessage({ cmd: "abort", id }); } catch {}
+    return { ok: false, output: String(e?.message || e) };
+  }
+}
+
 // ---------- the engine: sites whose media sits behind a player API ----------
 // The page URL goes to the host, whose engine runs the site's downloader (YouTube video/audio, Instagram,
 // Twitter/X) with the browser's own session. One reply when it is done; the host keeps streaming other files.
@@ -566,9 +679,9 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     for (const raw of items) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
-      const c = it.engine ? canon(it.url) + "#" + (it.mode || "video") : canon(it.url);   // a page saved as video AND as audio = two files
+      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") : it.engine ? canon(it.url) + "#" + (it.mode || "video") : canon(it.url);   // a page saved as video AND as audio = two files
       if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
-      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, mode: it.mode || "video", title: it.title || "", c });
+      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, mode: it.mode || "video", title: it.title || "", c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
@@ -577,8 +690,9 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     const keep = new Set(prior.filter((j, i) => there[i] || !saved[j.c].path).map((j) => j.c));
     for (const j of cands) { if (keep.has(j.c)) skipped++; else { jobs.push(j); inFlight.add(j.c); } }
     let n = prefix ? await nextCounter(dest, typed(prefix), jobs.length) : 0;
-    // a stream's name carries no extension: the host names the joined file (.mp4)
-    for (const j of jobs) j.filename = j.engine ? "" : j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
+    // a stream's name carries no extension: the host names the joined file (.mp4); a site job is named
+    // from the hostname, inside saveSiteViaHost
+    for (const j of jobs) j.filename = j.engine || j.site ? "" : j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
   });
   onQueued({ queued: jobs.length, skipped, unusable });
   if (!jobs.length) return;
@@ -593,7 +707,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         const j = queue.shift();
         let r;
         try {
-          r = j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          r = j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; }

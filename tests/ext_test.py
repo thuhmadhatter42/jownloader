@@ -37,8 +37,8 @@ with sync_playwright() as p:
     check("same-file '2160p' variant → real pixels of what plays", any(l.startswith("⬇ Download ") and "×" in l and "label" not in l for l in labels), True)
     pop = ctx.new_page(); pop.goto(f"chrome-extension://{ext_id}/popup.html"); pop.wait_for_timeout(1500)
     # (the popup opened as a tab scans itself, so counts are 0 here; the scan is checked against the test page below)
-    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:9],
-          ["⧉ sidebar", "Download", "Batch", "📁 Downloads", "×", "Download from this page", "Audio only → MP3 + BPM/key", "Download all images", "Download all videos"])   # (+ ×, forget saved, rename tab…)
+    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:11],
+          ["⧉ sidebar", "Download", "Batch", "📁 Downloads", "×", "Download from this page", "Audio only → MP3 + BPM/key", "Save site as PDF", "Save site as Markdown", "Download all images", "Download all videos"])   # (+ ×, forget saved, rename tab…)
 
     # the popup's first message must answer (a throw here hung the popup at "scanning…" once)
     first = pop.evaluate("""async () => Promise.race([new Promise(r => setTimeout(() => r('TIMEOUT'), 3000)),
