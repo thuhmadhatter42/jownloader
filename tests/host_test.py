@@ -34,6 +34,28 @@ try:
     r = call({"cmd": "rename", "mode": "move", "ops": [{"src": src + "/clip_1.mp4", "dst_dir": dst, "name": "clip_1.mp4"}]})
     check("move to folder", (r["results"][0]["ok"], sorted(os.listdir(dst)), os.path.exists(src + "/clip_1.mp4")), (True, ["clip_1.mp4", "pic_1.jpg"], False))
     check("unknown cmd still refused", call({"cmd": "nope"})["ok"], False)
+
+    # finishing steps: WebP -> JPEG (sips) and strip metadata (exiftool), on files already on disk
+    import importlib.util
+    fin = os.path.join(d, "fin"); os.makedirs(fin)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x48:rate=1", "-frames:v", "1", fin + "/pic.jpg"], check=True)
+    subprocess.run(["exiftool", "-q", "-overwrite_original", "-Comment=secret", "-Artist=me", fin + "/pic.jpg"], check=True)
+    if importlib.util.find_spec("PIL"):
+        from PIL import Image
+        Image.new("RGB", (8, 8), (200, 30, 30)).save(fin + "/pic.webp", "WEBP")
+        # pic.jpg already exists, so the converted webp must land as pic (2).jpg — never overwrite
+        r = call({"cmd": "finish", "paths": [fin + "/pic.webp", fin + "/pic.jpg"], "webp": True, "strip": True})
+        got = [(os.path.basename(x["path"]), x["ok"]) for x in r["results"]]
+        check("webp -> jpg (name taken -> (2)), jpg stripped, both ok", got, [("pic (2).jpg", True), ("pic.jpg", True)])
+        check("original .webp gone, the new jpg is a JPEG", [os.path.exists(fin + "/pic.webp"), open(fin + "/pic (2).jpg", "rb").read(2) == b"\xff\xd8"], [False, True])
+    else:
+        print("skip webp check (no PIL to write a fixture)")
+        r = call({"cmd": "finish", "paths": [fin + "/pic.jpg"], "strip": True})
+        check("jpg stripped ok", r["results"][0]["ok"], True)
+    tags = subprocess.run(["exiftool", "-S", "-Comment", "-Artist", fin + "/pic.jpg"], capture_output=True, text=True).stdout.strip()
+    check("metadata gone after strip", tags, "")
+    r = call({"cmd": "finish", "paths": [fin + "/missing.jpg"], "strip": True})
+    check("missing file fails on its own", r["results"][0]["ok"], False)
 finally:
     shutil.rmtree(d)
 print("ALL GREEN" if not fails else f"{fails} FAILED")

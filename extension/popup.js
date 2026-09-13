@@ -1,5 +1,16 @@
 const $ = (id) => document.getElementById(id);
 let destPath = "", scan = null, tab = null;
+// pages the engine downloads whole (the site's player API, not the page's files): YouTube, Instagram, Twitter/X
+const ENGINE_RE = /^https?:\/\/(?:[\w-]+\.)?(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com)\//i;
+function engineOf(url) {
+  const m = ENGINE_RE.exec(url || "");
+  if (!m) return null;
+  const path = (() => { try { return new URL(url).pathname; } catch { return "/"; } })();
+  const seg = path.split("/").filter(Boolean);
+  if (/youtu/.test(m[1])) return { site: "youtube", what: /\/(watch|shorts\/|live\/)|youtu\.be/.test(url) ? "this video (MP4)" : "" };
+  if (/instagram/.test(m[1])) return { site: "instagram", what: /^(p|reel|reels|tv)$/.test(seg[0] || "") ? "this post" : seg.length === 1 ? `everything from @${seg[0]}` : "" };
+  return { site: "twitter", what: seg[1] === "status" ? "this tweet's media" : seg.length && !/^(home|explore|search|settings|i|messages|notifications)$/.test(seg[0]) ? `all media from @${seg[0]}` : "" };
+}
 const folderName = (path) => (path || "").split("/").filter(Boolean).pop() || "Downloads";
 function showDest() {
   $("dest").textContent = "📁 " + folderName(destPath);
@@ -32,6 +43,9 @@ async function refresh() {
   scan = await chrome.runtime.sendMessage({ type: "scan", tabId: tab.id });
   if (!scan) { $("host").textContent = "can't read this page"; return; }
   $("host").textContent = scan.host;
+  const eng = engineOf(tab.url);
+  $("site").hidden = !eng?.what; $("siteAudio").hidden = eng?.site !== "youtube" || !eng.what;
+  if (eng?.what) $("site").textContent = `Download ${eng.what}`;
   vi = await videoItems();
   const drm = scan.videos.filter((v) => v.drm).length;
   const blobs = scan.videos.filter((v) => v.blob && !v.drm).length;
@@ -43,7 +57,7 @@ async function refresh() {
   const st = [];
   if (drm) st.push(`${drm} protected video${drm > 1 ? "s" : ""} (DRM: Widevine/PlayReady) — encrypted, no tool can save ${drm > 1 ? "them" : "it"}`);
   if (blobs && !scan.captured.length) st.push(`${blobs} streamed player${blobs > 1 ? "s" : ""} — press play so the stream can be captured`);
-  if (!drm && vi.stream) st.push(vi.items.length ? `${vi.items.length} streamed video${vi.items.length > 1 ? "s" : ""} (HLS/DASH) — segments are joined into one .mp4 by ffmpeg` : "streamed video — its playlist could not be read (reload and press play)");
+  if (!drm && vi.stream && !eng) st.push(vi.items.length ? `${vi.items.length} streamed video${vi.items.length > 1 ? "s" : ""} (HLS/DASH) — segments are joined into one .mp4 by ffmpeg` : "streamed video — its playlist could not be read (reload and press play)");
   $("status").innerHTML = st.map((s) => `<div class="warn">${s}</div>`).join("");
 }
 function setCount(id, label, n) { $(id).textContent = `Download all ${label} (${n})`; $(id).disabled = !n; }
@@ -79,6 +93,13 @@ for (const [id, [kind, items]] of Object.entries(batches)) $(id).onclick = async
   if (!r?.queued) $("status").textContent = "nothing new to save" + (r?.skipped ? ` (${r.skipped} already saved before)` : "");
 };
 
+// the engine buttons: the page URL goes to the host, which runs the site's downloader
+for (const [id, mode] of [["site", "video"], ["siteAudio", "audio"]]) $(id).onclick = async () => {
+  $("status").textContent = mode === "audio" ? "downloading audio, then detecting BPM + key…" : "downloading through the site's player API…";
+  const r = await chrome.runtime.sendMessage({ type: "download", items: [{ url: tab.url, engine: true, mode }], kind: "video", dest: destPath, prefix: "" });
+  if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
+};
+
 // collected-as-you-scroll list: lives in the background (session storage), count updates live
 function showCollected(n) { $("coll").textContent = `Download collected (${n})`; $("coll").disabled = !n; $("collClear").hidden = !n; }
 chrome.runtime.onMessage.addListener((m) => { if (m?.type === "collected") showCollected(m.n); });
@@ -90,10 +111,11 @@ $("coll").onclick = async () => {
 };
 $("collClear").onclick = () => chrome.runtime.sendMessage({ type: "clearCollected" });
 
-chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, dest: "", prefix: "" }, (s) => {
+chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: false, dest: "", prefix: "" }, (s) => {
   $("autoVideos").checked = s.autoVideos;
   $("collect").checked = s.collect;
   $("showButton").checked = s.showButton;
+  $("strip").checked = s.strip; $("webp").checked = s.webp;
   destPath = s.dest; showDest();
   $("prefix").value = s.prefix;
 });
@@ -107,7 +129,7 @@ chrome.runtime.onMessage.addListener((m) => { if (m?.type === "picker") pickerSt
 $("dest").onclick = () => { pickerState(true); chrome.runtime.sendMessage({ type: "chooseDir" }); };
 $("destClear").onclick = async () => { await chrome.runtime.sendMessage({ type: "clearDir" }); destPath = ""; showDest(); };
 chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.dest) { destPath = ch.dest.newValue || ""; showDest(); } });
-for (const k of ["autoVideos", "showButton", "collect"]) $(k).onchange = () => chrome.storage.sync.set({ [k]: $(k).checked });
+for (const k of ["autoVideos", "showButton", "collect", "strip", "webp"]) $(k).onchange = () => chrome.storage.sync.set({ [k]: $(k).checked });
 
 // ---------- batch rename tab ----------
 // Selected files live in the background (the popup closes when Finder opens); one Finder window at a time
@@ -133,6 +155,10 @@ function showRename() {
   const mode = move ? document.querySelector("input[name=rnMode]:checked").value : "rename";
   const ready = n && $("rnName").value.trim() && (!move || rnDest);
   $("rnGo").disabled = !ready;
+  $("rnStrip").disabled = !n; $("rnWebp").disabled = !rnFiles.some((f) => /\.webp$/i.test(f.path));
+  $("rnStrip").textContent = n ? `Strip metadata (${n})` : "Strip metadata";
+  const nw = rnFiles.filter((f) => /\.webp$/i.test(f.path)).length;
+  $("rnWebp").textContent = nw ? `WebP → JPEG (${nw})` : "WebP → JPEG";
   $("rnGo").textContent = mode === "copy" ? `Copy ${n} renamed → ${rnDest ? folderName(rnDest) : "…"}` : mode === "move" ? `Move ${n} renamed → ${rnDest ? folderName(rnDest) : "…"}` : `Rename ${n} file${n === 1 ? "" : "s"}`;
 }
 async function loadRenameFiles() { rnFiles = await chrome.runtime.sendMessage({ type: "getRenameFiles" }).catch(() => []) || []; showRename(); }
@@ -150,6 +176,15 @@ $("rnGo").onclick = async () => {
   if (!r?.ok) { $("status").innerHTML = `<div class="warn">${r?.output || "rename failed"}</div>`; showRename(); return; }
   const verb = mode === "copy" ? "copied" : mode === "move" ? "moved" : "renamed";
   $("status").textContent = `${r.done} ${verb} → ${r.ops[0].name}${r.done > 1 ? " … " + r.ops[r.ops.length - 1].name : ""}` + (r.failed ? `\n${r.failed} failed: ${r.error}` : "");
+  loadRenameFiles();
+};
+// the finishing steps on the selected files, in place (no rename)
+for (const [id, opt] of [["rnStrip", "strip"], ["rnWebp", "webp"]]) $(id).onclick = async () => {
+  $(id).disabled = true; $("status").textContent = opt === "strip" ? "stripping metadata…" : "converting…";
+  const r = await chrome.runtime.sendMessage({ type: "finish", paths: rnFiles.map((f) => f.path), [opt]: true });
+  if (!r?.ok) { $("status").innerHTML = `<div class="warn">${r?.output || "failed"}</div>`; showRename(); return; }
+  const bad = r.results.filter((x) => !x.ok), done = r.results.length - bad.length;
+  $("status").textContent = `${done} file${done === 1 ? "" : "s"} ${opt === "strip" ? "stripped" : "converted"}` + (bad.length ? `\n${bad.length} failed: ${bad[0].output}` : "");
   loadRenameFiles();
 };
 chrome.storage.sync.get({ renameDest: "", rnMove: false, rnMode: "move", rnName: "" }, (s) => {

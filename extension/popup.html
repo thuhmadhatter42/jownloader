@@ -33,11 +33,13 @@
 </style></head>
 <body>
   <h1>Jownloader <button id="sidebar" title="open Jownloader as a sidebar that stays open while you browse">⧉ sidebar</button></h1>
-  <div class="tabs"><button id="tabDl" class="on">Download</button><button id="tabRn">Batch rename</button></div>
+  <div class="tabs"><button id="tabDl" class="on">Download</button><button id="tabRn">Batch</button></div>
   <div id="paneDl">
   <div class="host" id="host">scanning…</div>
   <div class="row"><button id="dest" class="dest" title="Downloads">📁 Downloads</button><button id="destClear" class="x" title="back to Downloads" hidden>×</button></div>
   <div class="row"><input id="prefix" placeholder="name → name_1, _2… ([yy-mm-dd] = upload date)"></div>
+  <button id="site" hidden>Download from this page</button>
+  <button id="siteAudio" hidden title="best audio as MP3, BPM and key detected and put in the name">Audio only → MP3 + BPM/key</button>
   <button id="imgs" disabled>Download all images</button>
   <button id="vids" disabled>Download all videos</button>
   <button id="docs" disabled>Download all documents</button>
@@ -45,6 +47,8 @@
   <label><span>Collect as I scroll<small>every picture shown ≥ 300 px on screen is remembered; thumbnails aren't</small></span><input type="checkbox" id="collect"></label>
   <label><span>Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos"></label>
   <label><span>Button on videos<small>⬇ overlay top-left of every player, shows the quality it will grab</small></span><input type="checkbox" id="showButton"></label>
+  <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
+  <label><span>WebP as JPEG<small>every .webp saved becomes a .jpg (quality 100)</small></span><input type="checkbox" id="webp"></label>
   <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
   </div>
   <div id="paneRn" hidden>
@@ -55,6 +59,7 @@
   <div class="row"><button id="rnDest" class="dest" disabled title="choose a folder">📁 destination</button><button id="rnDestClear" class="x" title="clear the destination" hidden>×</button></div>
   <div class="opt"><label class="opt"><input type="radio" name="rnMode" value="move" checked disabled>move</label><label class="opt"><input type="radio" name="rnMode" value="copy" disabled>copy</label></div>
   <button id="rnGo" disabled>Rename</button>
+  <div class="row"><button id="rnStrip" disabled title="remove all metadata from the selected files, in place">Strip metadata</button><button id="rnWebp" disabled title="convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button></div>
   </div>
   <div class="bar" id="bar" hidden><div id="fill"></div></div>
   <div class="status" id="status"></div>

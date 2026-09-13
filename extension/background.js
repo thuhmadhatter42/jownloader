@@ -227,7 +227,7 @@ const STALL_MS = 60000;         // no bytes for this long = the file failed, the
 // Flow-controlled: one chunk in flight per file, the host acks each before the next is sent, so memory
 // stays bounded and every message resets the worker's idle timer. Resolves {ok, path} or {ok:false, output}.
 // Never throws.
-async function saveViaHost(url, name, dest, kind) {
+async function saveViaHost(url, name, dest, kind, fin = {}) {
   const id = "s" + (++hostSeq);
   let stallTimer = 0;
   const read = (reader) => Promise.race([
@@ -247,7 +247,7 @@ async function saveViaHost(url, name, dest, kind) {
     if (ext) name += "." + ext;
   }
   const port = hostConnect();
-  const opened = await hostAsk(port, { cmd: "open", id, name, dst: dest || "" });
+  const opened = await hostAsk(port, { cmd: "open", id, name, dst: dest || "", ...fin });
   if (!opened.ok) { try { reader.cancel(); } catch {} return { ok: false, output: hostError(opened.output) }; }
   try {
     let buf = new Uint8Array(0);
@@ -469,7 +469,7 @@ function streamName(url, title) {
 }
 // Fetch every segment of the stream's best tracks, stream them to the host as temp files, then have the
 // host join them into name.mp4 in dest. Resolves {ok, path} or {ok:false, output}. Never throws.
-async function saveStreamViaHost(url, name, dest) {
+async function saveStreamViaHost(url, name, dest, fin = {}) {
   const port = hostConnect(), ids = [];
   try {
     const text = await fetchText(url);
@@ -494,12 +494,21 @@ async function saveStreamViaHost(url, name, dest) {
       const closed = await hostAsk(port, { cmd: "close", id });
       if (!closed.ok) throw new Error(hostError(closed.output));
     }
-    const r = await hostAsk(port, { cmd: "join", id: "s" + (++hostSeq), ids, name, dst: dest || "" });
+    const r = await hostAsk(port, { cmd: "join", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   } catch (e) {
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
     return { ok: false, output: String(e?.message || e) };
   }
+}
+
+// ---------- the engine: sites whose media sits behind a player API ----------
+// The page URL goes to the host, whose engine runs the site's downloader (YouTube video/audio, Instagram,
+// Twitter/X) with the browser's own session. One reply when it is done; the host keeps streaming other files.
+async function saveEngineViaHost(url, mode, dest, fin = {}) {
+  const port = hostConnect();
+  const r = await hostAsk(port, { cmd: "fetch", id: "s" + (++hostSeq), url, mode, dst: dest || "", ...fin });
+  return r.ok ? r : { ok: false, output: hostError(r.output) };
 }
 
 // ---------- progress (the popup's bar) ----------
@@ -546,8 +555,9 @@ const serial = (fn) => (batchChain = batchChain.then(fn, fn));
 // items: [{url, ctype?, date?}] or plain URLs. onQueued fires with {queued, skipped, unusable} once the
 // batch is deduped, before any bytes move; the popup follows the rest through "progress" messages.
 async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
-  const settings = await chrome.storage.sync.get({ dest: "", prefix: "" });
+  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: false });
   const dest = opts.dest ?? settings.dest, prefix = opts.prefix ?? settings.prefix;
+  const fin = { strip: !!settings.strip, webp: !!settings.webp };   // finishing steps the host applies to every file
   // dedupe within the batch by canonical URL, and against everything ever saved
   const jobs = [], seen = new Set();
   let skipped = 0, unusable = 0;
@@ -556,9 +566,9 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     for (const raw of items) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
-      const c = canon(it.url);
+      const c = it.engine ? canon(it.url) + "#" + (it.mode || "video") : canon(it.url);   // a page saved as video AND as audio = two files
       if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
-      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, title: it.title || "", c });
+      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, mode: it.mode || "video", title: it.title || "", c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
@@ -568,7 +578,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     for (const j of cands) { if (keep.has(j.c)) skipped++; else { jobs.push(j); inFlight.add(j.c); } }
     let n = prefix ? await nextCounter(dest, typed(prefix), jobs.length) : 0;
     // a stream's name carries no extension: the host names the joined file (.mp4)
-    for (const j of jobs) j.filename = j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
+    for (const j of jobs) j.filename = j.engine ? "" : j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
   });
   onQueued({ queued: jobs.length, skipped, unusable });
   if (!jobs.length) return;
@@ -582,7 +592,10 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
       while (queue.length) {
         const j = queue.shift();
         let r;
-        try { r = j.stream ? await saveStreamViaHost(j.url, j.filename, dest) : await saveViaHost(j.url, j.filename, dest, kind); if (r.ok) await markSaved(j.c, r.path); }
+        try {
+          r = j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          if (r.ok) await markSaved(j.c, r.path);
+        }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; }
         inFlight.delete(j.c);
         if (!r.ok) { progress.failed++; progress.error = r.output; console.warn("save failed", j.url, r.output); }
@@ -669,6 +682,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       await chrome.storage.session.remove("renameFiles"); reply({ ok: true });
     } else if (msg.type === "rename") {
       reply(await renameBatch(msg.name, msg.dest, msg.mode));
+    } else if (msg.type === "finish") {
+      let r;
+      try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "finish", paths: msg.paths || [], strip: !!msg.strip, webp: !!msg.webp }); }
+      catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
+      reply(r);
     } else if (msg.type === "pickerOpen") {
       reply(pickerOpen);
     } else if (msg.type === "clearDir") {
@@ -709,7 +727,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       if (!host) { try { host = new URL((await chrome.tabs.get(tabId)).url).hostname; } catch { host = "page"; } }
       reply({ host, images: [...images.values()], videos: [...videos.values()], docs: [...docs.values()], captured: await mediaList(tabId) });
     } else if (msg.type === "getSettings") {
-      reply(await chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, dest: "", prefix: "" }));
+      reply(await chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: false, dest: "", prefix: "" }));
     } else {
       reply(null);
     }

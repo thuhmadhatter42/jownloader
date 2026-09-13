@@ -7,6 +7,8 @@
   window.__jownloader = true;
 
   const settings = { autoVideos: false, showButton: true, collect: false };
+  // on these sites the page URL goes to the engine (the site's player API); the player's own bytes are not the file
+  const ENGINE_PAGE = top === window && /^https?:\/\/(?:[\w-]+\.)?(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com)\//i.test(location.href);
   const autoDone = new Set();      // video URLs already auto-downloaded this page
   const buttons = new Map();       // video element -> overlay button
 
@@ -217,13 +219,14 @@
     const urls = videoUrls(v).filter((u) => !u.startsWith("blob:"));
     const date = dateNear(v);
     let items = urls.map((url) => ({ url, date }));
+    if (ENGINE_PAGE) items = [{ url: location.href, engine: true, mode: "video" }];
     if (!items.length) {
       items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype, date }));
       if (!items.length) items = (await streams()).map((s) => ({ ...s, date }));
       if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); return; }
     }
     const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
-    const what = items[0].stream ? "joining stream" : `saving ${r?.queued}`;
+    const what = items[0].engine ? "downloading" : items[0].stream ? "joining stream" : `saving ${r?.queued}`;
     flash(btn, r?.queued ? `${what} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
   }
   // the HLS/DASH manifests the tab's network layer saw (the background reads them and keeps the masters)
@@ -249,6 +252,7 @@
   function label(v) {
     const [u] = videoUrls(v);
     if (v.mediaKeys) return "⬇ protected (DRM)";
+    if (ENGINE_PAGE) return "⬇ Download" + (v.videoWidth ? ` ${v.videoWidth}×${v.videoHeight}` : "");
     if (u && u.startsWith("blob:")) return "⬇ Download stream" + (v.videoWidth ? ` ${v.videoWidth}×${v.videoHeight}` : "");
     // real pixels of what is playing beat any number in the URL (sites label files above their real size);
     // a variant the player offers beyond what's playing is shown as the site's claim, marked so
@@ -299,7 +303,7 @@
 
   // ---------- auto-download switch ----------
   async function autoGrab(v) {
-    if (!settings.autoVideos || v.mediaKeys || isPreview(v)) return;
+    if (!settings.autoVideos || v.mediaKeys || isPreview(v) || ENGINE_PAGE) return;   // engine pages: the button, on purpose
     let items = videoUrls(v).filter((u) => !u.startsWith("blob:")).map((url) => ({ url }));
     if (!items.length && !v.paused) {
       items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype }));

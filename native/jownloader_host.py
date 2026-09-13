@@ -12,6 +12,11 @@ with the browser session; this side only writes them.
      ffmpeg -c copy over the tracks (video, or video + audio) into name.mp4 and removes the temps.
      No ffmpeg on this Mac: one track is kept raw (name.ts / name.mp4), two are saved as
      name.video.* and name.audio.* with "output" saying so.
+  {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
+     a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
+     port keeps streaming other files meanwhile. mode "video" | "audio".
+  "open" / "join" / "fetch" take "strip": true (remove all metadata) and "webp": true (WebP -> JPEG);
+  both are applied to the finished file(s) before the reply (engine.finish).
 Names are never overwritten: name (2).ext, name (3).ext …  A file is written as name.jownloading and
 renamed on close, so a half file never looks finished.
 
@@ -23,8 +28,14 @@ One-shot (sendNativeMessage, own process each):
                                                     -> {"ok", "results": [{"ok", "path"} | {"ok": false, "output"}...]}
      batch rename: each src becomes dst_dir/name (dst_dir "" = the file's own folder); "copy" leaves
      the original in place. Never overwrites: name (2).ext …
+  {"cmd": "finish", "paths": [...], "strip"?, "webp"?} -> {"ok", "results": [{"path", "ok", "output"}...]}
+     the finishing steps on files already on disk (the Batch tab).
 """
-import base64, json, os, shutil, struct, subprocess, sys
+import base64, json, os, shutil, struct, subprocess, sys, threading
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import engine
+
+SEND_LOCK = threading.Lock()   # fetch replies come from worker threads
 
 
 def read_msg():
@@ -37,8 +48,39 @@ def read_msg():
 
 def send(obj):
     data = json.dumps(obj).encode()
-    sys.stdout.buffer.write(struct.pack("<I", len(data)) + data)
-    sys.stdout.buffer.flush()
+    with SEND_LOCK:
+        sys.stdout.buffer.write(struct.pack("<I", len(data)) + data)
+        sys.stdout.buffer.flush()
+
+
+def finished(reply, msg):
+    """Apply the strip / webp switches carried by the request to the reply's file(s); the reply's
+    path follows a conversion (x.webp -> x.jpg) and a failed step lands in "output"."""
+    if not reply.get("ok") or not (msg.get("strip") or msg.get("webp")):
+        return reply
+    paths = reply.get("files") or ([reply["path"]] if reply.get("path") and os.path.isfile(reply["path"]) else [])
+    if not paths:
+        return reply
+    res = engine.finish(paths, strip=bool(msg.get("strip")), webp=bool(msg.get("webp")))["results"]
+    reply["files"] = [r["path"] for r in res]
+    if reply.get("path") in paths:
+        reply["path"] = res[paths.index(reply["path"])]["path"]
+    bad = [r for r in res if not r["ok"]]
+    if bad:
+        reply["output"] = (reply.get("output") + "; " if reply.get("output") else "") + bad[0]["output"]
+    return reply
+
+
+def fetch_async(msg):
+    """The engine (yt-dlp / gallery-dl) can run for minutes: its own thread, reply when done."""
+    def run():
+        try:
+            r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "")
+        except Exception as e:
+            r = {"ok": False, "output": str(e)}
+        r["id"] = msg.get("id")
+        send(finished(r, msg))
+    threading.Thread(target=run, daemon=True).start()
 
 
 def choose_dir():
@@ -182,7 +224,8 @@ def stream(msg):
         try:
             os.makedirs(dst, exist_ok=True)
             path = unique_path(dst, name)
-            OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "temp": bool(msg.get("temp"))}
+            OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "temp": bool(msg.get("temp")),
+                         "strip": bool(msg.get("strip")), "webp": bool(msg.get("webp"))}
             return {"id": sid, "ok": True, "path": path}
         except Exception as e:
             return {"id": sid, "ok": False, "output": str(e)}
@@ -207,7 +250,7 @@ def stream(msg):
         return {"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}
     try:
         os.replace(st["path"] + ".jownloading", st["path"])
-        return {"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}
+        return finished({"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}, st)
     except Exception as e:
         return {"id": sid, "ok": False, "output": str(e)}
 
@@ -248,10 +291,14 @@ def serve():
                 send(r)
         elif msg.get("cmd") == "join":
             try:
-                r = join(msg)
+                r = finished(join(msg), msg)
             except Exception as e:
                 r = {"id": msg.get("id"), "ok": False, "output": str(e)}
             send(r)
+        elif msg.get("cmd") == "fetch":
+            fetch_async(msg)
+        elif msg.get("cmd") == "finish":
+            send({"ok": True, **engine.finish(msg.get("paths") or [], strip=bool(msg.get("strip")), webp=bool(msg.get("webp")))})
         elif msg.get("cmd") == "choose_dir":
             send(choose_dir())
         elif msg.get("cmd") == "choose_files":

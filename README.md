@@ -25,14 +25,24 @@ you already have.
 - **Popup or side panel** — the panel stays open and rescans as you browse.
 - **Uses your login** — files are fetched by the browser itself, so anything you can see, it can save.
 - **Streams too** — an HLS / DASH player (`.m3u8` / `.mpd`) is saved as one `.mp4`: best variant, segments
-  fetched in order with your session, joined by `ffmpeg` (`brew install ffmpeg`; without it the raw
-  tracks are kept and the popup says so). Clear-key AES-128 HLS is handled; DRM is refused.
+  fetched in order with your session, joined by `ffmpeg` (without it the raw tracks are kept and the
+  popup says so). Clear-key AES-128 HLS is handled; DRM is refused.
+- **YouTube, Instagram, Twitter/X** — on those pages the button reads *Download this video / this post /
+  everything from @name* and the whole thing comes down through the site's own API with your browser
+  session: YouTube as H.264 + AAC `.mp4` (QuickTime-native), or *Audio only* as `.mp3` with the BPM and
+  top-3 keys detected and written into the name (`Song (128.0 BPM Am C F).mp3`); an Instagram post,
+  reel or carousel, or a whole profile (posts, reels, highlights, avatar) into `<username>/`, 1080p
+  video converted from VP9 to H.264; a tweet's media or a user's media timeline into `<name>/`.
+- **Strip metadata** switch — EXIF, GPS, XMP and every other tag removed from each file as it is saved
+  (images via exiftool, audio and video via ffmpeg, streams copied not re-encoded).
+- **WebP as JPEG** switch — every `.webp` saved becomes a `.jpg` at quality 100.
+  Both are also actions in the Batch tab for files already on disk.
 
 ## What it won't do
 
 - **DRM video** (Widevine / PlayReady) is reported as protected and never saved. Encrypted bytes are
   refused before a file is written. There is no circumvention here and none is planned.
-- **YouTube** — its tracks are throttled, split and signature-scrambled; that is `yt-dlp`'s job.
+- **Live streams** have no end to save; they are refused until the site publishes the recording.
 
 ## Install (macOS)
 
@@ -40,8 +50,11 @@ Files are written by a small native-messaging host, a Python script the browser 
 That is what makes "any folder, no dialog" possible; Chrome's own download API can't do it.
 
 1. Clone this repo somewhere it can stay (the browser calls the host by absolute path).
-2. `bash native/install.sh` — registers the host with Brave, Chrome and Chromium. Needs `python3`
-   on the system path; macOS provides it with the Xcode Command Line Tools (`xcode-select --install`).
+2. `bash native/install.sh` — registers the host with Brave, Chrome and Chromium and installs the
+   engine's tools through Homebrew: `yt-dlp`, `ffmpeg`, `gallery-dl`, `exiftool` and the BPM/key
+   analyzer (`essentia-tensorflow`, or `librosa` where no wheel exists). `--no-deps` skips that part.
+   Needs `python3` on the system path; macOS provides it with the Xcode Command Line Tools
+   (`xcode-select --install`).
 3. `brave://extensions` (or `chrome://extensions`) → **Developer mode** on → **Load unpacked** →
    choose the `extension/` folder.
 4. Pin Jownloader from the puzzle-piece menu.
@@ -53,8 +66,8 @@ batch fails with a message saying so; nothing is saved silently anywhere else.
 
 ```
 extension/   the extension (manifest v3, service worker, content script, popup / side panel)
-native/      the native host and its installer
-tests/       Playwright harness (no host) and a real-browser CDP test of the write path
+native/      the native host, the engine (site downloaders, finishing steps, BPM/key analyzer + model) and the installer
+tests/       Playwright harness (no host) and real-browser CDP tests of the write path, streams and the engine
 ```
 
 ## Tests
@@ -62,7 +75,9 @@ tests/       Playwright harness (no host) and a real-browser CDP test of the wri
 ```
 python3 tests/ext_test.py          # Chromium via Playwright: scanning, naming, dedupe, DRM check, no-host failure
 python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen folder, [date] names, skip-if-on-disk
-python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, missing files
+python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG, strip metadata
+python3 tests/streams_test_cdp.py  # real Brave: HLS (TS, AES-128, fMP4 + audio group) and DASH joined into .mp4, DRM refused
+python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named .mp3 (network)
 ```
 
 Both need `pip install playwright` and `playwright install chromium`. The second needs Brave in

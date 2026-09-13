@@ -1,5 +1,7 @@
 #!/bin/bash
-# Registers the Jownloader native host with Brave, Chrome and Chromium. Rerun if this folder moves.
+# Registers the Jownloader native host with Brave, Chrome and Chromium, and installs the engine's tools
+# (yt-dlp, ffmpeg, gallery-dl, exiftool, the BPM/key analyzer) through Homebrew — `--no-deps` skips that.
+# Rerun if this folder moves.
 # The host is a stdio Python script; the browser launches it with the login PATH (/usr/bin:/bin:…), so
 # python3 must resolve there — macOS provides it with the Xcode Command Line Tools (xcode-select --install).
 set -e
@@ -27,3 +29,9 @@ for DIR in "$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts
 JSON
   echo "registered: $DIR/com.jshriver.jownloader.json"
 done
+if [ "$1" != "--no-deps" ]; then
+  source "$HERE/deps.sh"
+  ensure_deps
+  maybe_upgrade_ytdlp
+  echo "engine tools ready: yt-dlp, ffmpeg, gallery-dl, exiftool"
+fi
