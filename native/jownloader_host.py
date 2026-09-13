@@ -15,7 +15,7 @@ with the browser session; this side only writes them.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
-  "open" / "join" / "fetch" take "strip": true (remove all metadata) and "webp": true (WebP -> JPEG);
+  "open" / "join" / "fetch" take "strip": true (remove all metadata) and "webp": "jpg" | "png" (WebP -> that);
   both are applied to the finished file(s) before the reply (engine.finish).
 Names are never overwritten: name (2).ext, name (3).ext …  A file is written as name.jownloading and
 renamed on close, so a half file never looks finished.
@@ -61,7 +61,7 @@ def finished(reply, msg):
     paths = reply.get("files") or ([reply["path"]] if reply.get("path") and os.path.isfile(reply["path"]) else [])
     if not paths:
         return reply
-    res = engine.finish(paths, strip=bool(msg.get("strip")), webp=bool(msg.get("webp")))["results"]
+    res = engine.finish(paths, strip=bool(msg.get("strip")), webp=msg.get("webp") or False)["results"]
     reply["files"] = [r["path"] for r in res]
     if reply.get("path") in paths:
         reply["path"] = res[paths.index(reply["path"])]["path"]
@@ -225,7 +225,7 @@ def stream(msg):
             os.makedirs(dst, exist_ok=True)
             path = unique_path(dst, name)
             OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "temp": bool(msg.get("temp")),
-                         "strip": bool(msg.get("strip")), "webp": bool(msg.get("webp"))}
+                         "strip": bool(msg.get("strip")), "webp": msg.get("webp") or False}
             return {"id": sid, "ok": True, "path": path}
         except Exception as e:
             return {"id": sid, "ok": False, "output": str(e)}
@@ -298,7 +298,7 @@ def serve():
         elif msg.get("cmd") == "fetch":
             fetch_async(msg)
         elif msg.get("cmd") == "finish":
-            send({"ok": True, **engine.finish(msg.get("paths") or [], strip=bool(msg.get("strip")), webp=bool(msg.get("webp")))})
+            send({"ok": True, **engine.finish(msg.get("paths") or [], strip=bool(msg.get("strip")), webp=msg.get("webp") or False)})
         elif msg.get("cmd") == "choose_dir":
             send(choose_dir())
         elif msg.get("cmd") == "choose_files":

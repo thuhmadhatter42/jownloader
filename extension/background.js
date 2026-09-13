@@ -555,9 +555,9 @@ const serial = (fn) => (batchChain = batchChain.then(fn, fn));
 // items: [{url, ctype?, date?}] or plain URLs. onQueued fires with {queued, skipped, unusable} once the
 // batch is deduped, before any bytes move; the popup follows the rest through "progress" messages.
 async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
-  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: false });
+  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: "" });
   const dest = opts.dest ?? settings.dest, prefix = opts.prefix ?? settings.prefix;
-  const fin = { strip: !!settings.strip, webp: !!settings.webp };   // finishing steps the host applies to every file
+  const fin = { strip: !!settings.strip, webp: settings.webp === true ? "jpg" : settings.webp || "" };   // finishing steps the host applies to every file
   // dedupe within the batch by canonical URL, and against everything ever saved
   const jobs = [], seen = new Set();
   let skipped = 0, unusable = 0;
@@ -684,7 +684,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       reply(await renameBatch(msg.name, msg.dest, msg.mode));
     } else if (msg.type === "finish") {
       let r;
-      try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "finish", paths: msg.paths || [], strip: !!msg.strip, webp: !!msg.webp }); }
+      try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "finish", paths: msg.paths || [], strip: !!msg.strip, webp: msg.webp || "" }); }
       catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
       reply(r);
     } else if (msg.type === "pickerOpen") {
@@ -727,7 +727,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       if (!host) { try { host = new URL((await chrome.tabs.get(tabId)).url).hostname; } catch { host = "page"; } }
       reply({ host, images: [...images.values()], videos: [...videos.values()], docs: [...docs.values()], captured: await mediaList(tabId) });
     } else if (msg.type === "getSettings") {
-      reply(await chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: false, dest: "", prefix: "" }));
+      reply(await chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "" }));
     } else {
       reply(null);
     }

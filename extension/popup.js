@@ -111,11 +111,11 @@ $("coll").onclick = async () => {
 };
 $("collClear").onclick = () => chrome.runtime.sendMessage({ type: "clearCollected" });
 
-chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: false, dest: "", prefix: "" }, (s) => {
+chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "" }, (s) => {
   $("autoVideos").checked = s.autoVideos;
   $("collect").checked = s.collect;
   $("showButton").checked = s.showButton;
-  $("strip").checked = s.strip; $("webp").checked = s.webp;
+  $("strip").checked = s.strip; $("webp").value = s.webp === true ? "jpg" : s.webp || "";
   destPath = s.dest; showDest();
   $("prefix").value = s.prefix;
 });
@@ -129,7 +129,8 @@ chrome.runtime.onMessage.addListener((m) => { if (m?.type === "picker") pickerSt
 $("dest").onclick = () => { pickerState(true); chrome.runtime.sendMessage({ type: "chooseDir" }); };
 $("destClear").onclick = async () => { await chrome.runtime.sendMessage({ type: "clearDir" }); destPath = ""; showDest(); };
 chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.dest) { destPath = ch.dest.newValue || ""; showDest(); } });
-for (const k of ["autoVideos", "showButton", "collect", "strip", "webp"]) $(k).onchange = () => chrome.storage.sync.set({ [k]: $(k).checked });
+for (const k of ["autoVideos", "showButton", "collect", "strip"]) $(k).onchange = () => chrome.storage.sync.set({ [k]: $(k).checked });
+$("webp").onchange = () => chrome.storage.sync.set({ webp: $("webp").value });
 
 // ---------- batch rename tab ----------
 // Selected files live in the background (the popup closes when Finder opens); one Finder window at a time
@@ -155,10 +156,10 @@ function showRename() {
   const mode = move ? document.querySelector("input[name=rnMode]:checked").value : "rename";
   const ready = n && $("rnName").value.trim() && (!move || rnDest);
   $("rnGo").disabled = !ready;
-  $("rnStrip").disabled = !n; $("rnWebp").disabled = !rnFiles.some((f) => /\.webp$/i.test(f.path));
+  $("rnStrip").disabled = !n; $("rnWebp").disabled = $("rnPng").disabled = !rnFiles.some((f) => /\.webp$/i.test(f.path));
   $("rnStrip").textContent = n ? `Strip metadata (${n})` : "Strip metadata";
   const nw = rnFiles.filter((f) => /\.webp$/i.test(f.path)).length;
-  $("rnWebp").textContent = nw ? `WebP → JPEG (${nw})` : "WebP → JPEG";
+  $("rnWebp").textContent = nw ? `WebP → JPEG (${nw})` : "WebP → JPEG"; $("rnPng").textContent = nw ? `WebP → PNG (${nw})` : "WebP → PNG";
   $("rnGo").textContent = mode === "copy" ? `Copy ${n} renamed → ${rnDest ? folderName(rnDest) : "…"}` : mode === "move" ? `Move ${n} renamed → ${rnDest ? folderName(rnDest) : "…"}` : `Rename ${n} file${n === 1 ? "" : "s"}`;
 }
 async function loadRenameFiles() { rnFiles = await chrome.runtime.sendMessage({ type: "getRenameFiles" }).catch(() => []) || []; showRename(); }
@@ -179,9 +180,9 @@ $("rnGo").onclick = async () => {
   loadRenameFiles();
 };
 // the finishing steps on the selected files, in place (no rename)
-for (const [id, opt] of [["rnStrip", "strip"], ["rnWebp", "webp"]]) $(id).onclick = async () => {
+for (const [id, opt, val] of [["rnStrip", "strip", true], ["rnWebp", "webp", "jpg"], ["rnPng", "webp", "png"]]) $(id).onclick = async () => {
   $(id).disabled = true; $("status").textContent = opt === "strip" ? "stripping metadata…" : "converting…";
-  const r = await chrome.runtime.sendMessage({ type: "finish", paths: rnFiles.map((f) => f.path), [opt]: true });
+  const r = await chrome.runtime.sendMessage({ type: "finish", paths: rnFiles.map((f) => f.path), [opt]: val });
   if (!r?.ok) { $("status").innerHTML = `<div class="warn">${r?.output || "failed"}</div>`; showRename(); return; }
   const bad = r.results.filter((x) => !x.ok), done = r.results.length - bad.length;
   $("status").textContent = `${done} file${done === 1 ? "" : "s"} ${opt === "strip" ? "stripped" : "converted"}` + (bad.length ? `\n${bad.length} failed: ${bad[0].output}` : "");

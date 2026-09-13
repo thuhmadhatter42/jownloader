@@ -44,7 +44,10 @@ try:
         from PIL import Image
         Image.new("RGB", (8, 8), (200, 30, 30)).save(fin + "/pic.webp", "WEBP")
         # pic.jpg already exists, so the converted webp must land as pic (2).jpg — never overwrite
-        r = call({"cmd": "finish", "paths": [fin + "/pic.webp", fin + "/pic.jpg"], "webp": True, "strip": True})
+        Image.new("RGB", (8, 8), (30, 30, 200)).save(fin + "/pic2.webp", "WEBP")
+        r = call({"cmd": "finish", "paths": [fin + "/pic2.webp"], "webp": "png"})
+        check("webp -> png", [(os.path.basename(x["path"]), x["ok"]) for x in r["results"]] + [open(fin + "/pic2.png", "rb").read(4) == b"\x89PNG"], [("pic2.png", True), True])
+        r = call({"cmd": "finish", "paths": [fin + "/pic.webp", fin + "/pic.jpg"], "webp": "jpg", "strip": True})
         got = [(os.path.basename(x["path"]), x["ok"]) for x in r["results"]]
         check("webp -> jpg (name taken -> (2)), jpg stripped, both ok", got, [("pic (2).jpg", True), ("pic.jpg", True)])
         check("original .webp gone, the new jpg is a JPEG", [os.path.exists(fin + "/pic.webp"), open(fin + "/pic (2).jpg", "rb").read(2) == b"\xff\xd8"], [False, True])

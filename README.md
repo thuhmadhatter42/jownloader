@@ -35,7 +35,7 @@ you already have.
   video converted from VP9 to H.264; a tweet's media or a user's media timeline into `<name>/`.
 - **Strip metadata** switch — EXIF, GPS, XMP and every other tag removed from each file as it is saved
   (images via exiftool, audio and video via ffmpeg, streams copied not re-encoded).
-- **WebP as JPEG** switch — every `.webp` saved becomes a `.jpg` at quality 100.
+- **Convert WebP** switch — every `.webp` saved becomes a `.jpg` at quality 100, or a `.png`.
   Both are also actions in the Batch tab for files already on disk.
 
 ## What it won't do
@@ -75,7 +75,7 @@ tests/       Playwright harness (no host) and real-browser CDP tests of the writ
 ```
 python3 tests/ext_test.py          # Chromium via Playwright: scanning, naming, dedupe, DRM check, no-host failure
 python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen folder, [date] names, skip-if-on-disk
-python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG, strip metadata
+python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG / PNG, strip metadata
 python3 tests/streams_test_cdp.py  # real Brave: HLS (TS, AES-128, fMP4 + audio group) and DASH joined into .mp4, DRM refused
 python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named .mp3 (network)
 ```

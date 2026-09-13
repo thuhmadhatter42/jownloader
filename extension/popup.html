@@ -12,6 +12,7 @@
   [hidden] { display: none !important; }   /* button { display: block } above would otherwise beat the attribute */
   label { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #333; }
   label span small { display: block; color: #888; font-weight: normal; }
+  label select { font: 12px system-ui; color: #eee; background: #2a2a2d; border: 1px solid #444; border-radius: 6px; padding: 4px 6px; }
   .row { display: flex; gap: 6px; margin-bottom: 4px; }
   .row input { flex: 1; min-width: 0; padding: 7px 8px; font: 12px system-ui; color: #eee; background: #2a2a2d; border: 1px solid #444; border-radius: 6px; }
   .row input::placeholder { color: #777; }
@@ -48,7 +49,7 @@
   <label><span>Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos"></label>
   <label><span>Button on videos<small>⬇ overlay top-left of every player, shows the quality it will grab</small></span><input type="checkbox" id="showButton"></label>
   <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
-  <label><span>WebP as JPEG<small>every .webp saved becomes a .jpg (quality 100)</small></span><input type="checkbox" id="webp"></label>
+  <label><span>Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
   <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
   </div>
   <div id="paneRn" hidden>
@@ -59,7 +60,7 @@
   <div class="row"><button id="rnDest" class="dest" disabled title="choose a folder">📁 destination</button><button id="rnDestClear" class="x" title="clear the destination" hidden>×</button></div>
   <div class="opt"><label class="opt"><input type="radio" name="rnMode" value="move" checked disabled>move</label><label class="opt"><input type="radio" name="rnMode" value="copy" disabled>copy</label></div>
   <button id="rnGo" disabled>Rename</button>
-  <div class="row"><button id="rnStrip" disabled title="remove all metadata from the selected files, in place">Strip metadata</button><button id="rnWebp" disabled title="convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button></div>
+  <div class="row"><button id="rnStrip" disabled title="remove all metadata from the selected files, in place">Strip metadata</button><button id="rnWebp" disabled title="convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button><button id="rnPng" disabled title="convert the selected .webp files to .png (originals removed)">WebP → PNG</button></div>
   </div>
   <div class="bar" id="bar" hidden><div id="fill"></div></div>
   <div class="status" id="status"></div>

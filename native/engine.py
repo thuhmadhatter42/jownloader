@@ -14,7 +14,7 @@ The extension fetches ordinary files itself. For sites that hide their media beh
                                   <username>-<mon-dd-yy>-<NN>.<ext>; 1080p DASH video via yt-dlp, VP9 -> H.264
       twitter.com / x.com      -> gallery-dl: a tweet = its media, a profile = its media timeline, into <name>/
   finish(paths, strip, webp)   strip = remove all metadata (images: exiftool -all=; audio/video: ffmpeg -map_metadata -1,
-                               streams copied); webp = WebP -> JPEG (sips, quality 100)
+                               streams copied); webp = "jpg" | "png": WebP -> JPEG (quality 100) or PNG (sips)
 
 Sign-in: the browser session is read from the cookie stores on this Mac (Brave first, then Chrome,
 Firefox, Safari …) — nothing is asked for and nothing leaves the machine.
@@ -489,17 +489,20 @@ def strip_metadata(path):
     return True, ""
 
 
-def webp_to_jpeg(path):
-    """WebP -> JPEG next to it with macOS's sips (quality 100), original removed. Returns (ok, new path or message)."""
+def webp_to_jpeg(path, fmt="jpg"):
+    """WebP -> JPEG (quality 100) or PNG next to it with macOS's sips, original removed.
+    Returns (ok, new path or message)."""
     p = Path(path)
     if p.suffix.lower() != ".webp":
         return True, str(p)
-    out = p.with_suffix(".jpg")
+    fmt = "png" if str(fmt).lower() == "png" else "jpg"
+    out = p.with_suffix("." + fmt)
     n = 2
     while out.exists():
-        out = p.with_name(f"{p.stem} ({n}).jpg")
+        out = p.with_name(f"{p.stem} ({n}).{fmt}")
         n += 1
-    code, _, err = _run(["/usr/bin/sips", "-s", "format", "jpeg", "-s", "formatOptions", "100", str(p), "--out", str(out)], timeout=300)
+    opts = ["-s", "format", "png"] if fmt == "png" else ["-s", "format", "jpeg", "-s", "formatOptions", "100"]
+    code, _, err = _run(["/usr/bin/sips", *opts, str(p), "--out", str(out)], timeout=300)
     if code != 0 or not out.exists():
         return False, (err.strip() or "sips failed")
     p.unlink()
@@ -507,12 +510,13 @@ def webp_to_jpeg(path):
 
 
 def finish(paths, strip=False, webp=False):
-    """Apply the finishing switches to saved files. Returns {results: [{path, ok, output}]}."""
+    """Apply the finishing switches to saved files; webp = "jpg" | "png" | falsy.
+    Returns {results: [{path, ok, output}]}."""
     results = []
     for path in paths or []:
         ok, msg, cur = True, "", str(path)
         if webp:
-            ok, r = webp_to_jpeg(cur)
+            ok, r = webp_to_jpeg(cur, webp)
             if ok:
                 cur = r
             else:
