@@ -73,6 +73,12 @@ That is what makes "any folder, no dialog" possible; Chrome's own download API c
 If you move the folder, run `native/install.sh` again. If the host isn't reachable, every file in a
 batch fails with a message saying so; nothing is saved silently anywhere else.
 
+`native/install.sh` registers the host and installs the tools above through Homebrew. After that,
+the extension keeps them current on its own: it checks on every install/update and installs anything
+missing automatically (a badge on the icon shows while that runs), and the popup has its own
+"Dependencies" row with a ✓/✗ per tool and an **Install missing dependencies** button for whenever
+one needs a manual nudge (e.g. after a Homebrew upgrade removes something).
+
 ## Layout
 
 ```

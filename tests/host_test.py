@@ -35,6 +35,13 @@ try:
     check("move to folder", (r["results"][0]["ok"], sorted(os.listdir(dst)), os.path.exists(src + "/clip_1.mp4")), (True, ["clip_1.mp4", "pic_1.jpg"], False))
     check("unknown cmd still refused", call({"cmd": "nope"})["ok"], False)
 
+    # deps: fast presence check, never installs anything (setup actually installs — not run in a test)
+    r = call({"cmd": "deps"})
+    names = ["yt-dlp", "ffmpeg", "gallery-dl", "exiftool", "pypdf", "analyzer"]
+    check("deps reply ok", r["ok"], True)
+    check("deps reply has all six names, each a bool",
+          [n in r.get("deps", {}) and isinstance(r["deps"][n].get("present"), bool) for n in names], [True] * 6)
+
     # finishing steps: WebP -> JPEG (sips) and strip metadata (exiftool), on files already on disk
     import importlib.util
     fin = os.path.join(d, "fin"); os.makedirs(fin)

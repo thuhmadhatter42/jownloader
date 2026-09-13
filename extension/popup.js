@@ -208,6 +208,34 @@ chrome.storage.sync.get({ renameDest: "", rnMove: false, rnMode: "move", rnName:
 chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.renameDest) { rnDest = ch.renameDest.newValue || ""; showRename(); } if (area === "session" && ch.renameFiles) loadRenameFiles(); });
 loadRenameFiles();
 
+// ---------- dependencies ----------
+const DEP_LABEL = { "yt-dlp": "yt-dlp", ffmpeg: "ffmpeg", "gallery-dl": "gallery-dl", exiftool: "exiftool", pypdf: "pypdf", analyzer: "BPM/key analyzer" };
+async function showDeps() {
+  const r = await chrome.runtime.sendMessage({ type: "deps" }).catch(() => null);
+  if (!r?.ok) { $("deps").textContent = "Dependencies: " + (r?.output || "native host not reachable — run native/install.sh"); $("depsInstall").hidden = true; return; }
+  const missing = Object.entries(r.deps).filter(([, v]) => !v.present).map(([k]) => k);
+  $("deps").textContent = "Dependencies: " + Object.entries(r.deps).map(([k, v]) => (v.present ? "✓ " : "✗ ") + (DEP_LABEL[k] || k)).join("   ");
+  $("depsInstall").hidden = !missing.length;
+}
+$("depsInstall").onclick = async () => {
+  $("depsInstall").disabled = true;
+  $("status").textContent = "installing missing dependencies… (this can take a few minutes)";
+  const r = await chrome.runtime.sendMessage({ type: "setup" }).catch(() => null);
+  $("depsInstall").disabled = false;
+  $("status").textContent = r?.ok
+    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}` : "all dependencies installed")
+    : (r?.output || "install failed");
+  showDeps();
+};
+showDeps();
+// an install/update auto-check may have run before this popup ever opened — show what it found, once
+chrome.runtime.sendMessage({ type: "getSetupResult" }).then((r) => {
+  if (!r) return;
+  $("status").textContent = r.ok
+    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}` : "dependencies installed")
+    : (r.output || "dependency install failed");
+}).catch(() => {});
+
 // saved-URL memory: skipped while the file is still in its folder; the link wipes it
 async function showSaved() { const n = await chrome.runtime.sendMessage({ type: "savedCount" }).catch(() => 0); $("forget").textContent = `forget saved (${n || 0})`; }
 $("forget").onclick = async () => { await chrome.runtime.sendMessage({ type: "forgetSaved" }); showSaved(); $("status").textContent = "saved-list forgotten — everything counts as new"; };

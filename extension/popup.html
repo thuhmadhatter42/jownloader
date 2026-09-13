@@ -52,6 +52,8 @@
   <label><span>Button on videos<small>⬇ overlay top-left of every player, shows the quality it will grab</small></span><input type="checkbox" id="showButton"></label>
   <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
   <label><span>Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
+  <div class="files" id="deps">Dependencies: checking…</div>
+  <button id="depsInstall" hidden>Install missing dependencies</button>
   <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
   </div>
   <div id="paneRn" hidden>

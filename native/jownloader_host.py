@@ -18,6 +18,10 @@ with the browser session; this side only writes them.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
+  {"cmd": "setup", "id"} -> {"id", "ok", "output", "missing": [...]}
+     runs native/deps.sh's ensure_deps (brew installs can take minutes): its own thread, reply when
+     done. "output" is the tail of what it printed; "missing" is whichever of the six deps below are
+     still absent afterward (empty when everything installed clean).
   "open" / "join" / "fetch" take "strip": true (remove all metadata) and "webp": "jpg" | "png" (WebP -> that);
   both are applied to the finished file(s) before the reply (engine.finish).
 Names are never overwritten: name (2).ext, name (3).ext …  A file is written as name.jownloading and
@@ -33,8 +37,11 @@ One-shot (sendNativeMessage, own process each):
      the original in place. Never overwrites: name (2).ext …
   {"cmd": "finish", "paths": [...], "strip"?, "webp"?} -> {"ok", "results": [{"path", "ok", "output"}...]}
      the finishing steps on files already on disk (the Batch tab).
+  {"cmd": "deps"} -> {"ok", "deps": {"yt-dlp"|"ffmpeg"|"gallery-dl"|"exiftool"|"pypdf"|"analyzer":
+                                      {"present": bool, "version": str}}}
+     fast presence + version check of the six things native/deps.sh installs. Never installs anything.
 """
-import base64, json, os, shutil, struct, subprocess, sys, threading
+import base64, importlib.metadata, importlib.util, json, os, re, shutil, struct, subprocess, sys, threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine
 
@@ -83,6 +90,80 @@ def fetch_async(msg):
             r = {"ok": False, "output": str(e)}
         r["id"] = msg.get("id")
         send(finished(r, msg))
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _cli_version(cmd, args):
+    """Present + a short version string, without running anything that installs or upgrades."""
+    path = shutil.which(cmd)
+    if not path:
+        return False, ""
+    try:
+        p = subprocess.run([path, *args], capture_output=True, text=True, timeout=5)
+        line = ((p.stdout or p.stderr or "").strip().splitlines() or [""])[0]
+        return True, line[:80]
+    except Exception:
+        return True, ""   # on PATH but wouldn't run — still "present" for the ✓/✗
+
+
+def _pkg_version(name):
+    """find_spec avoids importing the package (some are slow); version comes from its own metadata."""
+    if importlib.util.find_spec(name) is None:
+        return False, ""
+    try:
+        return True, importlib.metadata.version(name)
+    except Exception:
+        return True, ""
+
+
+def _analyzer_version():
+    """bpm.py uses whichever of these is installed, essentia first (see native/deps.sh). The importable
+    module is "essentia" but the pip distribution (and its version metadata) is "essentia-tensorflow"."""
+    if importlib.util.find_spec("essentia") is not None:
+        try:
+            return True, "essentia " + importlib.metadata.version("essentia-tensorflow")
+        except Exception:
+            return True, "essentia"
+    ok, ver = _pkg_version("librosa")
+    if ok:
+        return True, "librosa " + ver
+    return False, ""
+
+
+def check_deps():
+    """Fast presence + version check of exactly what native/deps.sh installs. Never installs anything."""
+    out = {}
+    for name, cmd, args in (
+        ("yt-dlp", "yt-dlp", ["--version"]),
+        ("ffmpeg", "ffmpeg", ["-version"]),
+        ("gallery-dl", "gallery-dl", ["--version"]),
+        ("exiftool", "exiftool", ["-ver"]),
+    ):
+        present, ver = _cli_version(cmd, args)
+        if present and cmd == "ffmpeg":
+            m = re.search(r"version (\S+)", ver)
+            if m:
+                ver = m.group(1)
+        out[name] = {"present": present, "version": ver}
+    out["pypdf"] = dict(zip(("present", "version"), _pkg_version("pypdf")))
+    out["analyzer"] = dict(zip(("present", "version"), _analyzer_version()))
+    return out
+
+
+def setup_async(msg):
+    """native/deps.sh's ensure_deps, sourced the way install.sh sources it. brew installs can take
+    minutes: its own thread, reply when done (never blocks the port)."""
+    def run():
+        deps_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deps.sh")
+        try:
+            p = subprocess.run(["/bin/bash", "-c", f'source "{deps_sh}" && ensure_deps'],
+                                capture_output=True, text=True, timeout=1800)
+            lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip()]
+            output, ok = "\n".join(lines[-20:]), p.returncode == 0
+        except Exception as e:
+            output, ok = str(e), False
+        missing = [name for name, info in check_deps().items() if not info["present"]]
+        send({"id": msg.get("id"), "ok": ok, "output": output, "missing": missing})
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -351,6 +432,8 @@ def serve():
             send(r)
         elif msg.get("cmd") == "fetch":
             fetch_async(msg)
+        elif msg.get("cmd") == "setup":
+            setup_async(msg)
         elif msg.get("cmd") == "finish":
             send({"ok": True, **engine.finish(msg.get("paths") or [], strip=bool(msg.get("strip")), webp=msg.get("webp") or False)})
         elif msg.get("cmd") == "choose_dir":
@@ -359,6 +442,8 @@ def serve():
             send(choose_files())
         elif msg.get("cmd") == "rename":
             send(rename(msg))
+        elif msg.get("cmd") == "deps":
+            send({"ok": True, "deps": check_deps()})
         else:
             send({"ok": False, "output": "unknown cmd"})
 

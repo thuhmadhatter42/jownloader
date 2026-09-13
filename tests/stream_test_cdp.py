@@ -11,8 +11,10 @@ EXT_ID = open(ROOT + "/native/EXTENSION_ID").read().strip()
 dest = sys.argv[1] if len(sys.argv) > 1 else ""
 extra = sys.argv[2] if len(sys.argv) > 2 else ""
 where = dest or os.path.expanduser("~/Downloads")
+# --block-new-web-contents: a page under test may try to window.open/target=_blank a popup (ad, popunder
+# — never wanted on screen); this refuses the new web contents at the Chromium level before it ever paints.
 proc = subprocess.Popen(["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", f"--user-data-dir={PROF}", "--remote-debugging-port=9335",
-    f"--load-extension={EXT}", "--no-first-run", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
+    f"--load-extension={EXT}", "--no-first-run", "--block-new-web-contents", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 fails = 0
 def check(label, got, want):
@@ -26,6 +28,10 @@ try:
     with sync_playwright() as p:
         b = p.chromium.connect_over_cdp("http://127.0.0.1:9335"); ctx = b.contexts[0]
         pop = ctx.new_page()
+        # belt and suspenders, registered only after our own page exists: any OTHER page target that
+        # slips past --block-new-web-contents (a real anti-adblock popunder can) is closed the instant
+        # it appears, so nothing sits open on screen.
+        ctx.on("page", lambda p2: None if p2 is pop else p2.close())
         ctx.new_cdp_session(pop).send("Browser.setDownloadBehavior", {"behavior": "default"})   # Playwright would hijack downloads
         pop.goto(f"chrome-extension://{EXT_ID}/popup.html"); pop.wait_for_timeout(2500)
         items = [{"url": "https://picsum.photos/id/40/300/200.jpg", "date": "2025-03-07"}, {"url": "https://picsum.photos/id/41/300/200.jpg"}]

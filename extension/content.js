@@ -11,6 +11,9 @@
   const ENGINE_PAGE = top === window && /^https?:\/\/(?:[\w-]+\.)?(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com)\//i.test(location.href);
   const autoDone = new Set();      // video URLs already auto-downloaded this page
   const buttons = new Map();       // video element -> overlay button
+  const pending = new Map();       // canonical job key -> the button that queued it (for a late saveResult)
+  const canon = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return u; } };
+  const jobKey = (it) => it.engine ? canon(it.url) + "#" + (it.mode || "video") : it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") : canon(it.url);
 
   function host() {
     if (top === window) return location.hostname;
@@ -238,24 +241,37 @@
     else if (msg.type === "pageChanged") { autoDone.clear(); collected.clear(); }   // load or pushState: a new page
     else if (msg.type === "siteLinks") reply(Array.from(document.querySelectorAll("a[href]")).map((a) => a.href));
     else if (msg.type === "siteMarkdown") reply(siteMarkdown());
+    else if (msg.type === "saveResult") {
+      const btn = pending.get(msg.c);
+      if (btn) { pending.delete(msg.c); flash(btn, msg.ok ? (msg.output ? `saved (${msg.output})` : "saved ✓") : `failed — ${msg.output || "unknown error"}`, 6000); }
+    }
     return false;
   });
 
   // ---------- download helpers ----------
+  // Whatever happens, the button always shows something: the immediate flash below reflects only
+  // "queued" (the save itself runs async, after this reply); a later "saveResult" message corrects
+  // the record on THIS button if the save then actually fails (or succeeds with a caveat) — never
+  // just a console warning nobody sees. Any unexpected throw here is also caught, never silent.
   async function downloadVideo(v, btn) {
-    if (v.mediaKeys) { flash(btn, "protected video (DRM) — can't be saved by any tool", 4000); return; }
-    const urls = videoUrls(v).filter((u) => !u.startsWith("blob:"));
-    const date = dateNear(v);
-    let items = urls.map((url) => ({ url, date }));
-    if (ENGINE_PAGE) items = [{ url: location.href, engine: true, mode: "video" }];
-    if (!items.length) {
-      items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype, date }));
-      if (!items.length) items = (await streams()).map((s) => ({ ...s, date }));
-      if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); return; }
+    try {
+      if (v.mediaKeys) { flash(btn, "protected video (DRM) — can't be saved by any tool", 4000); return; }
+      const urls = videoUrls(v).filter((u) => !u.startsWith("blob:"));
+      const date = dateNear(v);
+      let items = urls.map((url) => ({ url, date }));
+      if (ENGINE_PAGE) items = [{ url: location.href, engine: true, mode: "video" }];
+      if (!items.length) {
+        items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype, date }));
+        if (!items.length) items = (await streams()).map((s) => ({ ...s, date }));
+        if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); return; }
+      }
+      const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
+      if (r?.queued) for (const it of items) pending.set(jobKey(it), btn);
+      const what = items[0].engine ? "downloading" : items[0].stream ? "joining stream" : `saving ${r?.queued}`;
+      flash(btn, r?.queued ? `${what} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
+    } catch (e) {
+      flash(btn, `failed — ${e?.message || e}`, 4000);
     }
-    const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
-    const what = items[0].engine ? "downloading" : items[0].stream ? "joining stream" : `saving ${r?.queued}`;
-    flash(btn, r?.queued ? `${what} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
   }
   // the HLS/DASH manifests the tab's network layer saw (the background reads them and keeps the masters)
   async function streams() {

@@ -39,6 +39,7 @@ async function addMedia(tabId, url, info) {
 function clearMedia(tabId) {
   chrome.storage.session.remove(mediaKey(tabId));
   chrome.tabs.sendMessage(tabId, { type: "pageChanged" }).catch(() => {});
+  manifestCache.clear();   // a new page's manifest URLs are never the ones just cached
 }
 
 // ---------- collected-as-you-scroll images (session storage, survives worker restarts) ----------
@@ -202,6 +203,33 @@ function hostAsk(port, msg) {
 const NO_HOST = /not found|forbidden|disconnected/i;
 const hostError = (out) => NO_HOST.test(out || "") ? "native host not installed — run native/install.sh" : out;
 
+// ---------- dependencies (yt-dlp, ffmpeg, gallery-dl, exiftool, pypdf, the BPM/key analyzer) ----------
+async function getDeps() {
+  try { return await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "deps" }); }
+  catch (e) { return { ok: false, output: hostError(String(e?.message || e)) }; }
+}
+// brew installs can take minutes: the SAME persistent port fetch() uses, so it never blocks on the
+// one-shot channel's own timeout. Releases the port again when done unless a batch is mid-flight.
+async function runSetup() {
+  const port = hostConnect();
+  const r = await hostAsk(port, { cmd: "setup", id: "s" + (++hostSeq) });
+  hostRelease();
+  return r.ok ? r : { ...r, output: hostError(r.output) };
+}
+// install / update: check once, and only bother the user (badge) if something is actually missing
+chrome.runtime.onInstalled.addListener(() => {
+  (async () => {
+    const d = await getDeps();
+    if (!d?.ok) return;   // host unreachable — nothing to check yet; the popup's own status explains why
+    const missing = Object.entries(d.deps).filter(([, v]) => !v.present).map(([k]) => k);
+    if (!missing.length) return;
+    try { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: "…" }); } catch {}
+    const r = await runSetup();
+    try { chrome.action.setBadgeText({ text: r.missing?.length ? "!" : "" }); if (r.missing?.length) chrome.action.setBadgeBackgroundColor({ color: "#d33" }); } catch {}
+    await chrome.storage.session.set({ setupResult: { ok: r.ok, output: r.output || "", missing: r.missing || [] } });
+  })();
+});
+
 function b64(bytes) {
   let s = "";
   for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
@@ -286,6 +314,18 @@ async function fetchText(url) {
   const res = await fetch(url, { credentials: "include" });
   if (!res.ok) throw new Error(`HTTP ${res.status} (${url.split("/").pop().split("?")[0].slice(0, 40)})`);
   return res.text();
+}
+// Some CDNs sign the manifest URL for one fetch only (a repeat of the exact same URL, even from the
+// page that just used it, comes back 403). streamCandidates() reads a manifest to classify it, then
+// saveStreamViaHost() reads the SAME url to actually save it — two fetches of one one-shot URL. Cache
+// the body per exact URL so only the first caller ever hits the network; the second reuses it. A
+// failed fetch is never cached, so a real retry still gets a real attempt.
+const manifestCache = new Map();   // url -> Promise<string>
+function fetchManifestOnce(url) {
+  if (!manifestCache.has(url)) {
+    manifestCache.set(url, fetchText(url).catch((e) => { manifestCache.delete(url); throw e; }));
+  }
+  return manifestCache.get(url);
 }
 // one segment (or a byte range of one); a fetch silent for STALL_MS fails the file
 async function fetchBytes(url, range) {
@@ -445,9 +485,11 @@ function dashTracks(text, url) {
 // the manifests worth offering for a tab: masters (and media playlists no captured master lists), newest first
 async function streamsFor(tabId) {
   const cap = (await mediaList(tabId)).filter((c) => isManifest(c.url, c.ctype)).sort((a, b) => b.ts - a.ts);
-  const found = [], children = new Set();
+  const found = [], children = new Set(), failed = [];
   for (const c of cap) {
-    let text; try { text = await fetchText(c.url); } catch { continue; }
+    let text;
+    try { text = await fetchManifestOnce(c.url); }
+    catch (e) { failed.push({ url: c.url, output: String(e?.message || e) }); continue; }
     if (text.trimStart().startsWith("#EXTM3U")) {
       const m = parseHls(text, c.url);
       if (m.master) for (const v of [...m.variants, ...m.audio]) children.add(canon(v.url));
@@ -455,7 +497,12 @@ async function streamsFor(tabId) {
     } else if (/<MPD[\s>]/i.test(text)) found.push({ url: c.url, master: true });
   }
   const seen = new Set();
-  return found.filter((s) => (s.master || !children.has(canon(s.url))) && !seen.has(canon(s.url)) && seen.add(canon(s.url))).map((s) => ({ url: s.url, stream: true }));
+  const ok = found.filter((s) => (s.master || !children.has(canon(s.url))) && !seen.has(canon(s.url)) && seen.add(canon(s.url))).map((s) => ({ url: s.url, stream: true }));
+  if (ok.length || !failed.length) return ok;
+  // every manifest the tab captured failed to (re-)fetch (a one-shot signed URL some sites issue,
+  // already spent by the page's own player): offer the newest one anyway, so the real save is attempted
+  // and its real error reaches the user — never a silent drop that shows the wrong "press play" message.
+  return [{ url: failed[0].url, stream: true }];
 }
 // a stream's file name when nothing was typed: the last meaningful path segment of the manifest URL
 // (not index/master/a hex id …), else the page title
@@ -472,7 +519,7 @@ function streamName(url, title) {
 async function saveStreamViaHost(url, name, dest, fin = {}) {
   const port = hostConnect(), ids = [];
   try {
-    const text = await fetchText(url);
+    const text = await fetchManifestOnce(url);
     const tracks = text.trimStart().startsWith("#EXTM3U") ? await hlsTracks(url, text) : dashTracks(text, url);
     for (const t of tracks) {
       const id = "s" + (++hostSeq);
@@ -498,9 +545,14 @@ async function saveStreamViaHost(url, name, dest, fin = {}) {
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   } catch (e) {
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
-    return { ok: false, output: String(e?.message || e) };
+    return { ok: false, output: streamError(String(e?.message || e)) };
   }
 }
+// a 401/403 fetching the manifest itself (not a segment) almost always means the site signed that
+// exact URL for one use, and the page's own player already spent it — never a fetch we can retry
+const streamError = (msg) => /^HTTP 40[13] \([^)]*\.(m3u8|mpd)\)/.test(msg || "")
+  ? `${msg} — this site's video link is good for one use and the page already used it; refresh the page and download immediately`
+  : msg;
 
 // ---------- whole site: crawl same-origin pages breadth-first, save one merged PDF or Markdown file ----------
 // Uses chrome.tabs (navigate a background tab, wait for load) + chrome.debugger (Page.printToPDF) — no
@@ -715,6 +767,10 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         if (!r.ok) { progress.failed++; progress.error = r.output; console.warn("save failed", j.url, r.output); }
         else if (r.output) progress.error = r.output;   // saved, with a caveat (e.g. no ffmpeg: tracks left separate)
         progress.done++; pushProgress(false);
+        // the ⬇ button's own flash only reflects "queued", not how the save actually finished (it runs
+        // async, after the button already replied) — tell the originating tab the real outcome so a
+        // failure that happens after the click is never silent.
+        if (opts.tabId != null) chrome.tabs.sendMessage(opts.tabId, { type: "saveResult", c: j.c, ok: r.ok, output: r.output || "" }).catch(() => {});
       }
     }));
   } finally {
@@ -780,7 +836,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     const tabId = msg.tabId ?? sender.tab?.id;
     if (msg.type === "download") {
       let replied = false;
-      await downloadAll(msg.items, msg.kind, { dest: msg.dest, prefix: msg.prefix }, (q) => { replied = true; reply(q); });
+      await downloadAll(msg.items, msg.kind, { dest: msg.dest, prefix: msg.prefix, tabId }, (q) => { replied = true; reply(q); });
       if (!replied) reply({ queued: 0, skipped: 0, unusable: 0 });
     } else if (msg.type === "getProgress") {
       reply({ ...progress });
@@ -842,6 +898,17 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       reply({ host, images: [...images.values()], videos: [...videos.values()], docs: [...docs.values()], captured: await mediaList(tabId) });
     } else if (msg.type === "getSettings") {
       reply(await chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "" }));
+    } else if (msg.type === "deps") {
+      reply(await getDeps());
+    } else if (msg.type === "setup") {
+      try { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: "…" }); } catch {}
+      const r = await runSetup();
+      try { chrome.action.setBadgeText({ text: r.missing?.length ? "!" : "" }); if (r.missing?.length) chrome.action.setBadgeBackgroundColor({ color: "#d33" }); } catch {}
+      reply(r);
+    } else if (msg.type === "getSetupResult") {
+      const { setupResult } = await chrome.storage.session.get("setupResult");
+      await chrome.storage.session.remove("setupResult");
+      reply(setupResult || null);
     } else {
       reply(null);
     }
