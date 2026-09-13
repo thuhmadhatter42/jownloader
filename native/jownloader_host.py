@@ -7,6 +7,11 @@ with the browser session; this side only writes them.
   {"cmd": "chunk", "id", "data": base64}  -> {"id", "ok"}            acked: the extension sends the next only after this
   {"cmd": "close", "id"}                 -> {"id", "ok", "path", "bytes"}
   {"cmd": "abort", "id"}                 -> {"id", "ok": false}
+  {"cmd": "join", "id", "ids": [...], "name", "dst"} -> {"id", "ok", "path", "bytes", "output"?}
+     an HLS/DASH stream: "open" with "temp": true keeps each track as a temp file on close; "join" runs
+     ffmpeg -c copy over the tracks (video, or video + audio) into name.mp4 and removes the temps.
+     No ffmpeg on this Mac: one track is kept raw (name.ts / name.mp4), two are saved as
+     name.video.* and name.audio.* with "output" saying so.
 Names are never overwritten: name (2).ext, name (3).ext …  A file is written as name.jownloading and
 renamed on close, so a half file never looks finished.
 
@@ -105,7 +110,67 @@ def unique_path(dst_dir, name):
     return out
 
 
-OPEN = {}   # id -> {"f": file, "path": str, "bytes": int}
+OPEN = {}   # id -> {"f": file, "path": str, "bytes": int, "temp": bool}
+TEMP = {}   # id -> path of a closed temp track (a .jownloading file waiting for "join")
+
+
+def ffmpeg_path():
+    """ffmpeg, wherever Homebrew or a manual install put it (the browser's PATH lacks /opt/homebrew/bin)."""
+    for c in [shutil.which("ffmpeg"), "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", os.path.expanduser("~/bin/ffmpeg")]:
+        if c and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def join(msg):
+    """Join the temp tracks of one stream into dst/name.mp4 (ffmpeg -c copy); temps are removed."""
+    sid, ids = msg.get("id"), msg.get("ids") or []
+    dst = msg.get("dst") or os.path.expanduser("~/Downloads")
+    name = os.path.basename(msg.get("name") or "video") or "video"
+    tracks = [TEMP.pop(i) for i in ids if i in TEMP]
+    if len(tracks) != len(ids) or not tracks:
+        for t in tracks:
+            try: os.remove(t)
+            except OSError: pass
+        return {"id": sid, "ok": False, "output": "track missing"}
+    raw_ext = lambda t: os.path.splitext(t[:-len(".jownloading")])[1] or ".mp4"
+    ff = ffmpeg_path()
+    if ff:
+        out = unique_path(dst, name + ".mp4")
+        cmd = [ff, "-nostdin", "-y", "-loglevel", "error"]
+        for t in tracks:
+            cmd += ["-i", t]
+        for i in range(len(tracks)):
+            cmd += ["-map", str(i)]
+        cmd += ["-c", "copy", "-movflags", "+faststart", "-f", "mp4", out + ".jownloading"]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            err = "" if p.returncode == 0 else (p.stderr.strip().splitlines() or ["ffmpeg failed"])[-1]
+        except Exception as e:
+            err = str(e)
+        if not err:
+            for t in tracks:
+                try: os.remove(t)
+                except OSError: pass
+            os.replace(out + ".jownloading", out)
+            return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
+        try: os.remove(out + ".jownloading")
+        except OSError: pass
+        note = "ffmpeg could not join the tracks (" + err + ")"
+    else:
+        note = "ffmpeg not found (brew install ffmpeg)"
+    # no ffmpeg / it failed: keep what was fetched, say so
+    if len(tracks) == 1:
+        out = unique_path(dst, name + raw_ext(tracks[0]))
+        os.replace(tracks[0], out)
+        return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out), "output": note + " — saved raw as " + os.path.basename(out)}
+    outs = []
+    for t in tracks:
+        base = os.path.basename(t[:-len(".jownloading")])          # name.video.mp4 / name.audio.mp4 (+ (2) suffix)
+        out = unique_path(dst, base)
+        os.replace(t, out); outs.append(out)
+    return {"id": sid, "ok": True, "path": outs[0], "bytes": sum(os.path.getsize(o) for o in outs),
+            "output": note + " — video and audio saved as separate files: " + ", ".join(os.path.basename(o) for o in outs)}
 
 
 def stream(msg):
@@ -117,12 +182,16 @@ def stream(msg):
         try:
             os.makedirs(dst, exist_ok=True)
             path = unique_path(dst, name)
-            OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0}
+            OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "temp": bool(msg.get("temp"))}
             return {"id": sid, "ok": True, "path": path}
         except Exception as e:
             return {"id": sid, "ok": False, "output": str(e)}
     st = OPEN.get(sid)
     if not st:
+        if cmd == "abort" and sid in TEMP:              # a closed track of a stream that failed later
+            try: os.remove(TEMP.pop(sid))
+            except OSError: pass
+            return {"id": sid, "ok": False, "output": "aborted"}
         return {"id": sid, "ok": False, "output": "not open"}
     if cmd == "chunk":
         data = base64.b64decode(msg.get("data", ""))
@@ -133,6 +202,9 @@ def stream(msg):
         try: os.remove(st["path"] + ".jownloading")
         except OSError: pass
         return {"id": sid, "ok": False, "output": "aborted"}
+    if st["temp"]:                                      # a stream track: stays hidden until "join"
+        TEMP[sid] = st["path"] + ".jownloading"
+        return {"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}
     try:
         os.replace(st["path"] + ".jownloading", st["path"])
         return {"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}
@@ -149,6 +221,9 @@ def main():
                 st["f"].close(); os.remove(st["path"] + ".jownloading")
             except OSError:
                 pass
+        for t in TEMP.values():
+            try: os.remove(t)
+            except OSError: pass
 
 
 def serve():
@@ -171,6 +246,12 @@ def serve():
                 r = {"id": msg.get("id"), "ok": False, "output": str(e)}
             if r is not None:
                 send(r)
+        elif msg.get("cmd") == "join":
+            try:
+                r = join(msg)
+            except Exception as e:
+                r = {"id": msg.get("id"), "ok": False, "output": str(e)}
+            send(r)
         elif msg.get("cmd") == "choose_dir":
             send(choose_dir())
         elif msg.get("cmd") == "choose_files":

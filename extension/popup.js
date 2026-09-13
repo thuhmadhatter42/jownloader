@@ -7,19 +7,24 @@ function showDest() {
   $("destClear").hidden = !destPath;
 }
 
-// {items, direct}: real <video> sources when the page has them (reliable), else whole files the network
-// layer captured for the tab — one per file, largest variant (can include DRM segments, so less trusted)
-function videoItems() {
+// {items, direct, stream}: real <video> sources when the page has them (reliable); else the HLS/DASH
+// streams the tab played (one per manifest, joined into one file each); else whole files the network layer
+// captured for the tab — one per file, largest variant (can include DRM segments, so less trusted)
+let vi = { items: [], direct: false, stream: false };
+async function videoItems() {
   const direct = scan.videos.filter((v) => !v.blob && !v.drm).map((v) => ({ url: v.url, date: v.date }));
-  if (direct.length) return { items: direct, direct: true };
+  if (direct.length) return { items: direct, direct: true, stream: false };
   // a manifest or segment in the tab means the player streams; the whole files around it are other clips
-  if (scan.captured.some((c) => !c.whole)) return { items: [], direct: false };
+  if (scan.captured.some((c) => !c.whole)) {
+    const streams = (await chrome.runtime.sendMessage({ type: "streamCandidates", tabId: tab.id }).catch(() => null)) || [];
+    return { items: streams.map((s) => ({ ...s, title: tab.title || "" })), direct: false, stream: true };
+  }
   const best = new Map();
   for (const c of scan.captured.filter((c) => c.whole)) {
     let k; try { const u = new URL(c.url); k = u.origin + u.pathname; } catch { k = c.url; }
     if (!best.has(k) || (c.size || 0) > (best.get(k).size || 0)) best.set(k, c);
   }
-  return { items: [...best.values()].map((c) => ({ url: c.url, ctype: c.ctype })), direct: false };
+  return { items: [...best.values()].map((c) => ({ url: c.url, ctype: c.ctype })), direct: false, stream: false };
 }
 
 async function refresh() {
@@ -27,7 +32,7 @@ async function refresh() {
   scan = await chrome.runtime.sendMessage({ type: "scan", tabId: tab.id });
   if (!scan) { $("host").textContent = "can't read this page"; return; }
   $("host").textContent = scan.host;
-  const vi = videoItems();
+  vi = await videoItems();
   const drm = scan.videos.filter((v) => v.drm).length;
   const blobs = scan.videos.filter((v) => v.blob && !v.drm).length;
   // captured-stream fallback on a DRM page = the encrypted tracks: not offered
@@ -38,7 +43,7 @@ async function refresh() {
   const st = [];
   if (drm) st.push(`${drm} protected video${drm > 1 ? "s" : ""} (DRM: Widevine/PlayReady) — encrypted, no tool can save ${drm > 1 ? "them" : "it"}`);
   if (blobs && !scan.captured.length) st.push(`${blobs} streamed player${blobs > 1 ? "s" : ""} — press play so the stream can be captured`);
-  if (!drm && scan.captured.some((c) => !c.whole)) st.push("HLS/DASH stream on page — segments not grabbable here (use yt-dlp)");
+  if (!drm && vi.stream) st.push(vi.items.length ? `${vi.items.length} streamed video${vi.items.length > 1 ? "s" : ""} (HLS/DASH) — segments are joined into one .mp4 by ffmpeg` : "streamed video — its playlist could not be read (reload and press play)");
   $("status").innerHTML = st.map((s) => `<div class="warn">${s}</div>`).join("");
 }
 function setCount(id, label, n) { $(id).textContent = `Download all ${label} (${n})`; $(id).disabled = !n; }
@@ -67,7 +72,7 @@ async function pollProgress() {
 pollProgress();
 
 // the three "Download all" buttons: reply comes back once the batch is queued; the bar does the rest
-const batches = { imgs: ["image", () => scan.images], vids: ["video", () => videoItems().items], docs: ["doc", () => scan.docs.map((d) => ({ url: d.url }))] };
+const batches = { imgs: ["image", () => scan.images], vids: ["video", () => vi.items], docs: ["doc", () => scan.docs.map((d) => ({ url: d.url }))] };
 for (const [id, [kind, items]] of Object.entries(batches)) $(id).onclick = async () => {
   $("status").textContent = `queuing ${kind}s → ${folderName(destPath)} …`;
   const r = await chrome.runtime.sendMessage({ type: "download", items: items(), kind, dest: destPath, prefix: $("prefix").value.trim() });

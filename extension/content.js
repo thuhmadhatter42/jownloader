@@ -219,10 +219,17 @@
     let items = urls.map((url) => ({ url, date }));
     if (!items.length) {
       items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype, date }));
-      if (!items.length) { flash(btn, "streamed video (HLS/DASH) — segments, not grabbable here", 4000); return; }
+      if (!items.length) items = (await streams()).map((s) => ({ ...s, date }));
+      if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); return; }
     }
     const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
-    flash(btn, r?.queued ? `saving ${r.queued} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
+    const what = items[0].stream ? "joining stream" : `saving ${r?.queued}`;
+    flash(btn, r?.queued ? `${what} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
+  }
+  // the HLS/DASH manifests the tab's network layer saw (the background reads them and keeps the masters)
+  async function streams() {
+    const list = (await chrome.runtime.sendMessage({ type: "streamCandidates" }).catch(() => null)) || [];
+    return list.map((s) => ({ ...s, title: document.title }));
   }
   // Whole files the tab's network layer saw, offered for an MSE/blob player ONLY when the tab holds no
   // stream manifest or segment: if it does, the player is a segment stream and any whole file in the
@@ -242,6 +249,7 @@
   function label(v) {
     const [u] = videoUrls(v);
     if (v.mediaKeys) return "⬇ protected (DRM)";
+    if (u && u.startsWith("blob:")) return "⬇ Download stream" + (v.videoWidth ? ` ${v.videoWidth}×${v.videoHeight}` : "");
     // real pixels of what is playing beat any number in the URL (sites label files above their real size);
     // a variant the player offers beyond what's playing is shown as the site's claim, marked so
     if (u === (v.currentSrc || v.src) && v.videoWidth) return `⬇ Download ${v.videoWidth}×${v.videoHeight}`;
@@ -293,7 +301,10 @@
   async function autoGrab(v) {
     if (!settings.autoVideos || v.mediaKeys || isPreview(v)) return;
     let items = videoUrls(v).filter((u) => !u.startsWith("blob:")).map((url) => ({ url }));
-    if (!items.length && !v.paused) items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype }));
+    if (!items.length && !v.paused) {
+      items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype }));
+      if (!items.length) items = await streams();
+    }
     items = items.filter((i) => !autoDone.has(i.url));
     if (!items.length) return;
     items.forEach((i) => autoDone.add(i.url));

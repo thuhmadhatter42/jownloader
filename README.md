@@ -24,13 +24,15 @@ you already have.
   to another folder instead, moved or copied. Nothing is ever overwritten.
 - **Popup or side panel** — the panel stays open and rescans as you browse.
 - **Uses your login** — files are fetched by the browser itself, so anything you can see, it can save.
+- **Streams too** — an HLS / DASH player (`.m3u8` / `.mpd`) is saved as one `.mp4`: best variant, segments
+  fetched in order with your session, joined by `ffmpeg` (`brew install ffmpeg`; without it the raw
+  tracks are kept and the popup says so). Clear-key AES-128 HLS is handled; DRM is refused.
 
 ## What it won't do
 
 - **DRM video** (Widevine / PlayReady) is reported as protected and never saved. Encrypted bytes are
   refused before a file is written. There is no circumvention here and none is planned.
-- **HLS / DASH segment streams** aren't reassembled. The popup says so and points at `yt-dlp`.
-  YouTube falls in this bucket.
+- **YouTube** — its tracks are throttled, split and signature-scrambled; that is `yt-dlp`'s job.
 
 ## Install (macOS)
 
