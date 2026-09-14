@@ -18,3 +18,6 @@ native/.cookie-source
 native/.last-ytdlp-upgrade
 native/cookies.txt
 native/.venv*/
+
+# local exports for the user, never pushed
+handoff/
