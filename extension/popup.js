@@ -223,7 +223,7 @@ $("depsInstall").onclick = async () => {
   const r = await chrome.runtime.sendMessage({ type: "setup" }).catch(() => null);
   $("depsInstall").disabled = false;
   $("status").textContent = r?.ok
-    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}` : "all dependencies installed")
+    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}` : "all dependencies installed")
     : (r?.output || "install failed");
   showDeps();
 };
@@ -232,7 +232,7 @@ showDeps();
 chrome.runtime.sendMessage({ type: "getSetupResult" }).then((r) => {
   if (!r) return;
   $("status").textContent = r.ok
-    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}` : "dependencies installed")
+    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}` : "dependencies installed")
     : (r.output || "dependency install failed");
 }).catch(() => {});
 

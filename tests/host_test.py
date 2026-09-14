@@ -1,8 +1,11 @@
 # Native-host rename test: drives native/jownloader_host.py over its stdio protocol with real files in a
 # temp folder (no Finder dialog, no browser). Run: python3 tests/host_test.py
-import json, os, struct, subprocess, sys, tempfile, shutil
+import json, os, select, struct, subprocess, sys, tempfile, time, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.path.join(os.path.dirname(HERE), "native", "jownloader_host.py")
+BROWSER_ENV = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]}   # how Brave launches the host: login PATH, HOME, nothing else
+# the interpreter the browser's PATH resolves (Xcode CLT python3) — proves the host re-execs into the venv itself
+BOOT_PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
 fails = 0
 def check(label, got, want):
     global fails
@@ -10,9 +13,39 @@ def check(label, got, want):
     print(f"{'ok  ' if ok else 'FAIL'} {label}: {got}" + ("" if ok else f"   want {want}"))
 def call(msg):
     data = json.dumps(msg).encode()
-    p = subprocess.run([sys.executable, HOST], input=struct.pack("<I", len(data)) + data, capture_output=True)
+    p = subprocess.run([BOOT_PY, HOST], input=struct.pack("<I", len(data)) + data,
+                        capture_output=True, env=BROWSER_ENV)
     n = struct.unpack("<I", p.stdout[:4])[0]
     return json.loads(p.stdout[4:4 + n])
+def _read_n(stream, n, deadline):
+    buf = b""
+    while len(buf) < n:
+        remaining = deadline - time.time()
+        if remaining <= 0 or not select.select([stream], [], [], remaining)[0]:
+            raise TimeoutError("host did not reply in time")
+        chunk = os.read(stream.fileno(), n - len(buf))   # unbuffered: a buffered read() would slurp the
+        if not chunk:                                      # rest of the reply and starve the next select()
+            raise EOFError("host closed without replying")
+        buf += chunk
+    return buf
+def call_port(msg, timeout=180):
+    # setup/fetch reply asynchronously from a background thread on the persistent port — closing
+    # stdin right after the request (like call() does) races the daemon thread's send() against
+    # process exit, so keep stdin open and read exactly one framed reply instead.
+    data = json.dumps(msg).encode()
+    p = subprocess.Popen([BOOT_PY, HOST], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, env=BROWSER_ENV)
+    try:
+        p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
+        deadline = time.time() + timeout
+        n = struct.unpack("<I", _read_n(p.stdout, 4, deadline))[0]
+        return json.loads(_read_n(p.stdout, n, deadline))
+    finally:
+        try: p.stdin.close()
+        except Exception: pass
+        p.terminate()
+        try: p.wait(timeout=5)
+        except Exception: p.kill()
 
 d = tempfile.mkdtemp(prefix="jown-rename-")
 try:
@@ -41,6 +74,31 @@ try:
     check("deps reply ok", r["ok"], True)
     check("deps reply has all six names, each a bool",
           [n in r.get("deps", {}) and isinstance(r["deps"][n].get("present"), bool) for n in names], [True] * 6)
+
+    # the host re-execs into native/.venv when it exists (deps.sh's ensure_venv) — launched here the
+    # way the browser launches it (env PATH=/usr/bin:/bin only), so this is the real path, not a guess.
+    venv_py = os.path.join(os.path.dirname(HOST), ".venv", "bin", "python3")   # literal, not realpath: the
+    # venv symlink resolves to the same binary the venv was built from, which would pass without any re-exec
+    if os.path.exists(venv_py):
+        check("deps reply names the venv python", r.get("python", ""), venv_py)
+        check("pypdf present when the venv has it", r["deps"]["pypdf"]["present"], True)
+
+        # --deps CLI mode (used by setup_async to re-check from a fresh process when the port
+        # process itself launched too early to have re-execed): prints json and exits, no framing.
+        cp = subprocess.run([BOOT_PY, HOST, "--deps"], capture_output=True, text=True,
+                             env=BROWSER_ENV, timeout=30)
+        info = json.loads(cp.stdout)
+        check("--deps CLI mode answers from the venv", info.get("python", ""), venv_py)
+        check("--deps CLI mode: pypdf present", info["deps"]["pypdf"]["present"], True)
+
+        # setup over the persistent port, venv already fully populated: ensure_deps has nothing left
+        # to install, so this should come back quickly with nothing missing and the venv as "python".
+        r = call_port({"cmd": "setup", "id": "s1"})
+        check("setup reply ok", r.get("ok"), True)
+        check("setup reply: nothing missing (venv already populated)", r.get("missing"), [])
+        check("setup reply names the venv python", r.get("python", ""), venv_py)
+    else:
+        print("skip venv python check (native/.venv not built — run: source native/deps.sh && ensure_deps)")
 
     # finishing steps: WebP -> JPEG (sips) and strip metadata (exiftool), on files already on disk
     import importlib.util

@@ -17,3 +17,4 @@ __pycache__/
 native/.cookie-source
 native/.last-ytdlp-upgrade
 native/cookies.txt
+native/.venv*/

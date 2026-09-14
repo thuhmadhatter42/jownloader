@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Jownloader native-messaging host. The extension talks to it two ways:
+"""Jownloader native-messaging host.
+
+The browser launches this with PATH=/usr/bin:/bin, so the shebang above only ever resolves to the
+Xcode CLT python3 — that is the bootstrap, never where library deps (pypdf, the BPM/key analyzer)
+live. Before anything else runs, this re-execs into native/.venv (built by deps.sh's ensure_venv) when
+it exists, so the process that answers every command below is always the venv's interpreter.
+
+The extension talks to it two ways:
 
 Persistent port (one process per download batch) — streaming saves. The extension fetched the bytes
 with the browser session; this side only writes them.
@@ -18,10 +25,11 @@ with the browser session; this side only writes them.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
-  {"cmd": "setup", "id"} -> {"id", "ok", "output", "missing": [...]}
+  {"cmd": "setup", "id"} -> {"id", "ok", "output", "missing": [...], "python": str}
      runs native/deps.sh's ensure_deps (brew installs can take minutes): its own thread, reply when
      done. "output" is the tail of what it printed; "missing" is whichever of the six deps below are
-     still absent afterward (empty when everything installed clean).
+     still absent afterward (empty when everything installed clean); "python" is sys.executable —
+     native/.venv's interpreter once it exists, so a persistent "missing" names which Python answered.
   "open" / "join" / "fetch" take "strip": true (remove all metadata) and "webp": "jpg" | "png" (WebP -> that);
   both are applied to the finished file(s) before the reply (engine.finish).
 Names are never overwritten: name (2).ext, name (3).ext …  A file is written as name.jownloading and
@@ -38,10 +46,20 @@ One-shot (sendNativeMessage, own process each):
   {"cmd": "finish", "paths": [...], "strip"?, "webp"?} -> {"ok", "results": [{"path", "ok", "output"}...]}
      the finishing steps on files already on disk (the Batch tab).
   {"cmd": "deps"} -> {"ok", "deps": {"yt-dlp"|"ffmpeg"|"gallery-dl"|"exiftool"|"pypdf"|"analyzer":
-                                      {"present": bool, "version": str}}}
+                                      {"present": bool, "version": str}}, "python": str}
      fast presence + version check of the six things native/deps.sh installs. Never installs anything.
+     "python" is sys.executable, so the popup/tests can see which interpreter answered.
 """
 import base64, importlib.metadata, importlib.util, json, os, re, shutil, struct, subprocess, sys, threading
+
+# Re-exec into native/.venv (deps.sh's ensure_venv) before any third-party import or stdin read: the
+# shebang above is only the bootstrap (Brave launches us with PATH=/usr/bin:/bin -> Xcode CLT python3),
+# and library deps (pypdf, the BPM/key analyzer) live only in the venv. Compare realpaths since the
+# venv's python3 is itself a symlink.
+_VENV_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python3")
+if os.path.exists(_VENV_PY) and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY, *sys.argv])
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine
 
@@ -162,8 +180,24 @@ def setup_async(msg):
             output, ok = "\n".join(lines[-20:]), p.returncode == 0
         except Exception as e:
             output, ok = str(e), False
-        missing = [name for name, info in check_deps().items() if not info["present"]]
-        send({"id": msg.get("id"), "ok": ok, "output": output, "missing": missing})
+        # On a first-run install this process was launched (and re-exec-checked) BEFORE ensure_deps
+        # ever created native/.venv, so it's still running under the old (system) Python and an
+        # in-process check_deps() would see none of what ensure_deps just installed into the venv.
+        # Re-check in a fresh venv-interpreter subprocess whenever the venv exists and this process
+        # isn't already it; fall back to the in-process check on any error (e.g. venv missing).
+        missing, python = None, sys.executable
+        if os.path.exists(_VENV_PY) and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY):
+            try:
+                cp = subprocess.run([_VENV_PY, os.path.abspath(__file__), "--deps"],
+                                     capture_output=True, text=True, timeout=60)
+                info = json.loads(cp.stdout)
+                missing = [name for name, v in info["deps"].items() if not v["present"]]
+                python = info["python"]
+            except Exception:
+                missing = None
+        if missing is None:
+            missing = [name for name, info in check_deps().items() if not info["present"]]
+        send({"id": msg.get("id"), "ok": ok, "output": output, "missing": missing, "python": python})
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -443,10 +477,17 @@ def serve():
         elif msg.get("cmd") == "rename":
             send(rename(msg))
         elif msg.get("cmd") == "deps":
-            send({"ok": True, "deps": check_deps()})
+            send({"ok": True, "deps": check_deps(), "python": sys.executable})
         else:
             send({"ok": False, "output": "unknown cmd"})
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--deps":
+        # One-shot CLI mode, used by setup_async to re-check deps in the venv process: the re-exec
+        # block above already ran by this point, so this always prints from native/.venv when it
+        # exists — even when *this* process itself was launched too early to have re-execed (the
+        # port process that received "setup" started before ensure_deps had created the venv).
+        print(json.dumps({"deps": check_deps(), "python": sys.executable}))
+        sys.exit(0)
     main()

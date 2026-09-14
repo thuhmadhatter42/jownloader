@@ -226,7 +226,7 @@ chrome.runtime.onInstalled.addListener(() => {
     try { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: "…" }); } catch {}
     const r = await runSetup();
     try { chrome.action.setBadgeText({ text: r.missing?.length ? "!" : "" }); if (r.missing?.length) chrome.action.setBadgeBackgroundColor({ color: "#d33" }); } catch {}
-    await chrome.storage.session.set({ setupResult: { ok: r.ok, output: r.output || "", missing: r.missing || [] } });
+    await chrome.storage.session.set({ setupResult: { ok: r.ok, output: r.output || "", missing: r.missing || [], python: r.python || "" } });
   })();
 });
 
