@@ -321,9 +321,29 @@ async function fetchText(url) {
 // the body per exact URL so only the first caller ever hits the network; the second reuses it. A
 // failed fetch is never cached, so a real retry still gets a real attempt.
 const manifestCache = new Map();   // url -> Promise<string>
+// A site that spends the one-shot URL in the page's own player leaves nothing to fetch: the first request
+// we make is already the second one. hook.js (page world) copies the manifest text the page itself got,
+// hookbridge.js forwards it here, and it is kept (session storage: survives a worker restart) keyed by the
+// exact URL. A copy is always preferred to a request; the network is only the fallback.
+const MT_KEY = "manifestTexts", MT_MAX = 40, MT_AGE = 30 * 60 * 1000;
+let mtChain = Promise.resolve();
+function storeManifestText(url, text) {
+  const step = async () => {
+    const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {}, now = Date.now();
+    all[url] = { text, ts: now };
+    for (const [k] of Object.entries(all).sort((a, b) => b[1].ts - a[1].ts).filter(([, v], i) => i >= MT_MAX || now - v.ts > MT_AGE)) delete all[k];
+    await chrome.storage.session.set({ [MT_KEY]: all });
+  };
+  return (mtChain = mtChain.then(step, step));
+}
+async function pageManifestText(url) {
+  await mtChain.catch(() => {});
+  const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {};
+  return (all[url] || all[normalizeMediaUrl(url)])?.text || null;
+}
 function fetchManifestOnce(url) {
   if (!manifestCache.has(url)) {
-    manifestCache.set(url, fetchText(url).catch((e) => { manifestCache.delete(url); throw e; }));
+    manifestCache.set(url, pageManifestText(url).then((t) => t ?? fetchText(url)).catch((e) => { manifestCache.delete(url); throw e; }));
   }
   return manifestCache.get(url);
 }
@@ -381,7 +401,7 @@ async function hlsTracks(url, text) {
     if (a) tracks.push({ kind: "audio", url: a.url });   // a rendition with a URI is a separate playlist (muxed audio has none)
   } else tracks.push({ kind: "video", url, parsed: m });
   for (const t of tracks) {
-    const p = t.parsed || parseHls(await fetchText(t.url), t.url);
+    const p = t.parsed || parseHls(await fetchManifestOnce(t.url), t.url);
     if (p.master) throw new Error("nested master playlist");
     if (p.live) throw new Error("live stream — it has no end to save yet");
     if (!p.segs.length) throw new Error("empty playlist");
@@ -879,6 +899,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       reply((await savedKeys()).length);
     } else if (msg.type === "getMedia") {
       reply(await mediaList(tabId));
+    } else if (msg.type === "manifestText") {
+      if (typeof msg.url === "string" && typeof msg.text === "string") await storeManifestText(msg.url, msg.text);
+      reply({ ok: true });
     } else if (msg.type === "streamCandidates") {
       reply(await streamsFor(tabId));
     } else if (msg.type === "scan") {
