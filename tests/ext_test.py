@@ -49,6 +49,7 @@ with sync_playwright() as p:
     check("tab 3 Extra tools holds rename + strip + WebP", where(["rnName", "rnPick", "rnGo", "rnStrip", "rnWebp", "rnPng", "strip", "webp"]), ["paneTools"] * 8)
     check("tab labels", [pop.text_content(i) for i in ("#tabDl", "#tabPdf", "#tabTools")], ["Video / Images", "PDF", "Extra tools"])
     check("only the Video / Images pane shows first", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [False, True, True])
+    check("tab bar fits on one line at 300px", pop.evaluate("() => [...document.querySelectorAll('.tabs button')].map(b => Math.round(b.getBoundingClientRect().height) < 30)"), [True, True, True])
     pop.screenshot(path=SHOT + "/popup-tab1-video-images.png")
     pop.click("#tabPdf"); pop.wait_for_timeout(200)
     check("PDF tab shown, others hidden", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [True, False, True])

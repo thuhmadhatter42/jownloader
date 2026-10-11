@@ -652,7 +652,7 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
     if (tabId != null) try { await chrome.tabs.remove(tabId); } catch {}
   }
   if (mode === "pdf") {
-    const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, titles, split: true, dst: dest || "", ...fin });
+    const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, titles, dst: dest || "", ...fin });
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   }
   const md = mdParts.join("");

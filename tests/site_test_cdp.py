@@ -1,4 +1,4 @@
-# Real Brave + CDP: Whole-site crawl (its own local fixture site) → per-page PDFs named by page title
+# Real Brave + CDP: Whole-site crawl (its own local fixture site) → one merged PDF named by the first page title
 # (or one Markdown file). NOTE: the installed native host answers, so install it from this tree first. Breadth-first same-origin crawl (external links, #fragments, asset links skipped), maxPages
 # cap, never-overwrite naming, dedupe by canon(url)+"#site-"+mode regardless of maxPages.
 # Run: python3 tests/site_test_cdp.py   (needs pypdf: python3 -m pip install --user pypdf)
@@ -89,9 +89,10 @@ try:
         check("pdf crawl: none failed", pr["failed"], 0)
         if pr["failed"]:
             print("   progress.error:", pr.get("error"))
-        d1 = OUT + "/127.0.0.1"
-        check("follow-links crawl: one PDF per page, named by title (never 001.pdf)",
-              sorted(os.listdir(d1)) if os.path.isdir(d1) else None, ["Docs Home.pdf", "Page A.pdf", "Page B.pdf", "Page C.pdf"])
+        import pypdf
+        f1 = OUT + "/Docs Home.pdf"
+        check("follow-links crawl: ONE merged PDF named by the first page title", sorted(os.path.basename(f) for f in glob.glob(OUT + "/*.pdf")), ["Docs Home.pdf"])
+        check("merged PDF has 4 pages", len(pypdf.PdfReader(f1).pages) if os.path.exists(f1) else None, 4)
         check("a crawl-progress badge never lingers", pr.get("crawl"), None)
 
         # 2. Markdown crawl, maxPages 50 -> one .md with all four titles in crawl order, no leaked external domain
@@ -111,8 +112,8 @@ try:
         r3, pr3 = batch("pdf", 2, forget=True)
         check("maxPages=2 crawl queued", r3, {"queued": 1, "skipped": 0, "unusable": 0})
         check("maxPages=2 crawl: none failed", pr3["failed"], 0)
-        d2 = OUT + "/127.0.0.1 (2)"
-        check("second folder (never overwrote the first), 2 pages", sorted(os.listdir(d2)) if os.path.isdir(d2) else None, ["Docs Home.pdf", "Page A.pdf"])
+        f2 = OUT + "/Docs Home (2).pdf"
+        check("second PDF (never overwrote the first), 2 pages", len(pypdf.PdfReader(f2).pages) if os.path.exists(f2) else None, 2)
 
         # 4. rerun of check 1 verbatim, no forgetSaved -> deduped against the still-on-disk folder
         r4, pr4 = batch("pdf", 50)
@@ -121,9 +122,9 @@ try:
         # 5. "This page only" (no follow): exactly the start page, as <title>.pdf; a second run never overwrites
         r5, pr5 = batch("pdf", 50, forget=True, follow=False)
         check("this-page-only crawl queued, none failed", [r5, pr5["failed"]], [{"queued": 1, "skipped": 0, "unusable": 0}, 0])
-        check("Docs Home.pdf saved beside the folders", sorted(os.path.basename(f) for f in glob.glob(OUT + "/*.pdf")), ["Docs Home.pdf"])
+        check("page-only save is <title>.pdf, 1 page, next free name", [os.path.exists(OUT + "/Docs Home (3).pdf") and len(pypdf.PdfReader(OUT + "/Docs Home (3).pdf").pages)], [1])
         batch("pdf", 50, forget=True, follow=False)
-        check("second page-only run -> (2)", sorted(os.path.basename(f) for f in glob.glob(OUT + "/*.pdf")), ["Docs Home (2).pdf", "Docs Home.pdf"])
+        check("second page-only run -> (4)", os.path.exists(OUT + "/Docs Home (4).pdf"), True)
 
         b.close()
 finally:

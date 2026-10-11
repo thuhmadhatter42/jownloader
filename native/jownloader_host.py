@@ -21,8 +21,9 @@ with the browser session; this side only writes them.
      name.video.* and name.audio.* with "output" saying so.
   {"cmd": "mergepdf", "id", "ids": [...], "name", "dst", "titles"?: [...], "split"?} -> {"id", "ok", "path", "bytes"?, "output"?}
      finishes closed temp-track PDFs (from "open" with "temp": true), in order. One page -> dst/<title>.pdf.
-     Several pages with "split" (or no pypdf) -> one PDF per page named by its title in dst/<name>/ (never
-     001.pdf); otherwise merged with pypdf into dst/name.pdf. Never overwrites: name (2).pdf.
+     Several pages -> merged with pypdf into one PDF named after the first page's title (else dst/<name>.pdf).
+     No pypdf (or "split") -> one PDF per page named by its title in dst/<name>/ (never 001.pdf).
+     Never overwrites: name (2).pdf.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
@@ -345,8 +346,9 @@ def safe_name(title, fallback):
 
 def mergepdf(msg):
     """Finish a whole-site PDF crawl from its closed temp-track PDFs, in page order.
-    One page -> dst/<title>.pdf. Several pages -> "split" (or no pypdf): one PDF per page, named by its
-    title, in dst/<name>/ (never 001.pdf); otherwise merged into dst/<name>.pdf. Nothing is overwritten."""
+    One page -> dst/<title>.pdf. Several pages -> merged into one PDF named after the first page's title
+    (else <name>.pdf); with no pypdf (or "split") one PDF per page, named by title, in dst/<name>/
+    (never 001.pdf). Nothing is overwritten."""
     sid, ids = msg.get("id"), msg.get("ids") or []
     dst = msg.get("dst") or os.path.expanduser("~/Downloads")
     name = os.path.basename(msg.get("name") or "site") or "site"
@@ -379,7 +381,8 @@ def mergepdf(msg):
             if PdfReader is None and not msg.get("split"):
                 r["output"] = "pypdf not installed — pages kept separately; run native/install.sh"
             return r
-        out = unique_path(dst, name + ".pdf")
+        first = safe_name(titles[0] if titles else "", "")
+        out = unique_path(dst, (first or name) + ".pdf")
         try:
             writer = PdfWriter()
             for t in tracks:
