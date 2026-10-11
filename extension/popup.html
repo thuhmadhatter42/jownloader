@@ -46,6 +46,13 @@
   <button id="imgs" disabled>Download all images</button>
   <button id="vids" disabled>Download all videos</button>
   <button id="docs" disabled>Download all documents</button>
+  <div id="spotify" hidden>
+    <button id="spGo" title="every song matched to its best upload, AAC saved as-is, tagged; one folder named after the list">Download this list as audio</button>
+    <div class="files">Also count songs in these folders as already downloaded:</div>
+    <div id="spLibs"></div>
+    <div class="row"><button id="spLibAdd" class="dest" title="a folder holding one sub-folder per list; songs found there are skipped, never copied">+ add a library folder…</button></div>
+    <label><span>BPM + key in the names<small>detected from the saved file (read-only), added to each song's name</small></span><input type="checkbox" id="spBpm"></label>
+  </div>
   <div class="row"><button id="coll" disabled>Download collected (0)</button><button id="collClear" class="x" title="forget the collected list" hidden>×</button></div>
   <label><span>Collect as I scroll<small>every picture shown ≥ 300 px on screen is remembered; thumbnails aren't</small></span><input type="checkbox" id="collect"></label>
   <label><span>Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos"></label>
@@ -69,4 +76,5 @@
   <div class="bar" id="bar" hidden><div id="fill"></div></div>
   <div class="status" id="status"></div>
   <script src="popup.js"></script>
+  <script src="spotify.js"></script>
 </body></html>

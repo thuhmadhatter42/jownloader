@@ -670,10 +670,34 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
 // ---------- the engine: sites whose media sits behind a player API ----------
 // The page URL goes to the host, whose engine runs the site's downloader (YouTube video/audio, Instagram,
 // Twitter/X) with the browser's own session. One reply when it is done; the host keeps streaming other files.
-async function saveEngineViaHost(url, mode, dest, fin = {}) {
+async function saveEngineViaHost(url, mode, dest, fin = {}, extra = {}) {
   const port = hostConnect();
-  const r = await hostAsk(port, { cmd: "fetch", id: "s" + (++hostSeq), url, mode, dst: dest || "", ...fin });
+  const r = await hostAsk(port, { cmd: "fetch", id: "s" + (++hostSeq), url, mode, dst: dest || "", ...fin, ...extra });
   return r.ok ? r : { ok: false, output: hostError(r.output) };
+}
+
+// ---------- Spotify links ----------
+// A link's track list comes from the host (the link's public embed page, no sign-in); every song then runs
+// through the engine as its own item, so progress, the Batch counts and dedupe all work unchanged.
+// Songs are fetched one at a time, SPOTIFY_GAP_MS apart (start to start), so YouTube never sees a burst.
+const SPOTIFY_GAP_MS = 20000;   // keep equal to engine.py's SPOTIFY_GAP_S
+let spotifyChain = Promise.resolve(), spotifyLast = 0;
+function spotifyTurn(fn) {
+  const run = spotifyChain.then(async () => {
+    const wait = spotifyLast + SPOTIFY_GAP_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    spotifyLast = Date.now();
+    return fn();
+  });
+  spotifyChain = run.catch(() => {});
+  return run;
+}
+async function spotifyList(url) {
+  const port = hostConnect();
+  try {
+    const r = await hostAsk(port, { cmd: "list", id: "s" + (++hostSeq), url });
+    return r.ok ? r : { ok: false, output: hostError(r.output) };
+  } finally { hostRelease(); }
 }
 
 // ---------- progress (the popup's bar) ----------
@@ -720,7 +744,7 @@ const serial = (fn) => (batchChain = batchChain.then(fn, fn));
 // items: [{url, ctype?, date?}] or plain URLs. onQueued fires with {queued, skipped, unusable} once the
 // batch is deduped, before any bytes move; the popup follows the rest through "progress" messages.
 async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
-  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: "" });
+  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: "", spotifyBpm: false });
   const dest = opts.dest ?? settings.dest, prefix = opts.prefix ?? settings.prefix;
   const fin = { strip: !!settings.strip, webp: settings.webp === true ? "jpg" : settings.webp || "" };   // finishing steps the host applies to every file
   // dedupe within the batch by canonical URL, and against everything ever saved
@@ -731,9 +755,10 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     for (const raw of items) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
-      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") : it.engine ? canon(it.url) + "#" + (it.mode || "video") : canon(it.url);   // a page saved as video AND as audio = two files
+      // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder)
+      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") : it.engine ? canon(it.url) + "#" + (it.mode || "video") + (it.spotify ? ":" + (it.spotify.folder || "") : "") : canon(it.url);
       if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
-      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, mode: it.mode || "video", title: it.title || "", c });
+      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
@@ -759,7 +784,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         const j = queue.shift();
         let r;
         try {
-          r = j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; }
@@ -838,6 +863,19 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       let replied = false;
       await downloadAll(msg.items, msg.kind, { dest: msg.dest, prefix: msg.prefix, tabId }, (q) => { replied = true; reply(q); });
       if (!replied) reply({ queued: 0, skipped: 0, unusable: 0 });
+    } else if (msg.type === "spotifyList") {
+      reply(await spotifyList(msg.url));
+    } else if (msg.type === "spotifySync") {
+      // what is already in the list's folder (renamed to the list's current order) or in an extra library folder
+      let r;
+      try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "sync", id: "y", dst: msg.dst || "", folder: msg.folder, tracks: msg.tracks, total: msg.total, libs: (await chrome.storage.sync.get({ spotifyLibs: [] })).spotifyLibs }); }
+      catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
+      reply(r?.ok ? r : { ok: false, output: hostError(r?.output) || "native host did not answer" });
+    } else if (msg.type === "addSpotifyLib") {
+      reply(await withPicker("choose_dir", async (r) => {
+        const { spotifyLibs } = await chrome.storage.sync.get({ spotifyLibs: [] });
+        if (!spotifyLibs.includes(r.path)) await chrome.storage.sync.set({ spotifyLibs: [...spotifyLibs, r.path] });
+      }));
     } else if (msg.type === "getProgress") {
       reply({ ...progress });
     } else if (msg.type === "chooseDir") {

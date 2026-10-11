@@ -13,7 +13,11 @@ The extension fetches ordinary files itself. For sites that hide their media beh
                                   a profile = posts, reels, highlights, avatar, into <username>/ as
                                   <username>-<mon-dd-yy>-<NN>.<ext>; 1080p DASH video via yt-dlp, VP9 -> H.264
       twitter.com / x.com      -> gallery-dl: a tweet = its media, a profile = its media timeline, into <name>/
-  finish(paths, strip, webp)   strip = remove all metadata (images: exiftool -all=; audio/video: ffmpeg -map_metadata -1,
+      open.spotify.com         -> a track / album / playlist / artist link: spotify_list() reads the public embed page
+                                  (no sign-in) into a track list; each track is matched to the best upload by length
+                                  + title (spotify_match), its audio saved as-is (AAC .m4a, never re-encoded) as
+                                  <list name>/NN - Artists - Title.m4a and tagged (title, artist, album, number, cover)
+  finish(paths, strip, webp)  strip = remove all metadata (images: exiftool -all=; audio/video: ffmpeg -map_metadata -1,
                                streams copied); webp = "jpg" | "png": WebP -> JPEG (quality 100) or PNG (sips)
 
 Sign-in: the browser session is read from the cookie stores on this Mac (Brave first, then Chrome,
@@ -44,6 +48,7 @@ os.environ["PATH"] = ":".join([
 YOUTUBE_RE = re.compile(r"^https?://(?:www\.|m\.|music\.)?(?:youtube\.com/|youtu\.be/)", re.I)
 INSTAGRAM_RE = re.compile(r"^https?://(?:www\.)?instagram\.com/", re.I)
 TWITTER_RE = re.compile(r"^https?://(?:www\.|mobile\.)?(?:twitter\.com|x\.com)/", re.I)
+SPOTIFY_RE = re.compile(r"^https?://open\.spotify\.com/(?:intl-[a-z]{2,5}(?:-[a-z]{2,4})?/)?(track|album|playlist|artist)/([A-Za-z0-9]+)", re.I)
 
 
 def site_of(url):
@@ -54,6 +59,8 @@ def site_of(url):
         return "instagram"
     if TWITTER_RE.match(url or ""):
         return "twitter"
+    if SPOTIFY_RE.match(url or ""):
+        return "spotify"
     return None
 
 
@@ -202,6 +209,440 @@ def youtube(url, mode, outdir):
         with open(log, "a") as f:
             f.write(f"Input URL: {url}\nDownloaded: {path.name}\n\n")
     return {"ok": True, "path": str(path), "files": [str(path)], "output": note}
+
+
+# ══════════════════════════════════════════════════════════════════════════════ Spotify links
+# A Spotify link is never downloaded from Spotify. The public embed page lists the tracks (title, artists,
+# length); each one is matched to the best upload by length + title, and that upload's audio is saved as-is.
+SPOTIFY_EMBED_CAP = 100        # the embed page lists at most this many tracks of a playlist (verified)
+SPOTIFY_GAP_S = 20             # the extension waits this long between two tracks of a list (see background.js)
+EMBED_DIR_ENV = "JOWNLOADER_EMBED_DIR"   # tests: read <dir>/<kind>.html instead of the network
+SPOTIFY_MAX_GAP_S = 15         # an upload this far from the track's length is never the track
+_NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+_yt_working = None             # the cookie strategy that last worked, tried first for the next track
+
+
+def spotify_parse(url):
+    """(kind, id) of a Spotify link, or (None, None)."""
+    m = SPOTIFY_RE.match((url or "").strip())
+    return (m.group(1).lower(), m.group(2)) if m else (None, None)
+
+
+def _spotify_embed(kind, sid):
+    """The entity dict inside the embed page's __NEXT_DATA__ (props.pageProps.state.data.entity)."""
+    fixtures = os.environ.get(EMBED_DIR_ENV)
+    if fixtures:
+        html = (Path(fixtures) / f"{kind}.html").read_text(encoding="utf-8")
+    else:
+        req = urllib.request.Request(f"https://open.spotify.com/embed/{kind}/{sid}", headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            html = resp.read().decode("utf-8", "replace")
+    m = _NEXT_DATA.search(html)
+    if not m:
+        raise ValueError("the page had no track data")
+    return json.loads(m.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+
+
+def _best_image(entity):
+    """URL of the largest picture in an embed entity (track / album art, playlist cover)."""
+    imgs = list(((entity.get("visualIdentity") or {}).get("image")) or [])
+    imgs += list(((entity.get("coverArt") or {}).get("sources")) or [])
+    imgs = [i for i in imgs if i.get("url")]
+    imgs.sort(key=lambda i: i.get("maxWidth") or i.get("width") or 0, reverse=True)
+    return imgs[0]["url"] if imgs else ""
+
+
+def spotify_list(url):
+    """Spotify link -> {ok, name, kind, cover, truncated, tracks:[{title, artists, album, number, duration_ms, cover, url}]}.
+    truncated = the embed page may have cut the list short (a playlist at the cap) — the extension then
+    collects the rest from the open page. Never raises."""
+    kind, sid = spotify_parse(url)
+    if not kind:
+        return {"ok": False, "output": "That isn't a Spotify track, album, playlist or artist link."}
+    try:
+        e = _spotify_embed(kind, sid)
+    except Exception as exc:
+        return {"ok": False, "output": f"Couldn't read that Spotify link ({exc}). Is it public?"}
+    name = e.get("name") or e.get("title") or kind
+    cover = _best_image(e)
+    if kind == "track":
+        rows = [{"uri": e.get("uri") or f"spotify:track:{sid}", "title": e.get("name") or e.get("title"),
+                 "subtitle": ", ".join(a.get("name", "") for a in e.get("artists") or []), "duration": e.get("duration")}]
+    else:
+        rows = e.get("trackList") or []
+    tracks = []
+    for r in rows:
+        tid = (r.get("uri") or "").rsplit(":", 1)[-1]
+        if not tid or not r.get("title"):
+            continue
+        tracks.append({"title": r["title"], "artists": r.get("subtitle") or "", "album": name if kind == "album" else "",
+                       "number": len(tracks) + 1, "duration_ms": r.get("duration") or 0,
+                       "cover": cover, "url": f"https://open.spotify.com/track/{tid}"})
+    if not tracks:
+        return {"ok": False, "output": "No songs found in that Spotify link."}
+    return {"ok": True, "name": name, "kind": kind, "id": sid, "cover": cover, "tracks": tracks,
+            "truncated": kind == "playlist" and len(tracks) >= SPOTIFY_EMBED_CAP,
+            "note": "an artist link lists the artist's top tracks only" if kind == "artist" else ""}
+
+
+# ---- matching a track to an upload
+_BAD_WORDS = ("live", "remix", "cover", "sped up", "slowed", "karaoke", "instrumental", "nightcore", "reverb",
+              "8d", "bass boosted", "mashup", "reaction", "tutorial", "acoustic")
+
+
+def _norm(text):
+    import unicodedata
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text or "").lower()).strip()
+
+
+def _core_title(title):
+    """Track title without '(feat. x)', '- Remastered 2011', '- Single Version' and the like."""
+    t = re.sub(r"\s*[(\[](?:feat|ft|with)\b[^)\]]*[)\]]", "", title or "", flags=re.I)
+    t = re.sub(r"\s+-\s+.*$", "", t)
+    return _norm(t)
+
+
+def spotify_score(track, cand, strict=False):
+    """Score one search hit for a track (higher is better); None = never acceptable.
+    cand = {title, channel, duration (s)}. Length is the main signal (+4 within 3 s, +2 within 8 s, hard
+    reject beyond SPOTIFY_MAX_GAP_S); the upload's title must contain the track's title (symbol-only
+    titles excepted); 'Artist - Topic' channels and 'official audio' score up; live / remix / cover /
+    sped up / slowed / karaoke / instrumental score down unless the track's own title says so.
+    A hit with no length is never accepted (live streams, 77-minute sets). A symbol-only title has no words to
+    match, so it needs length within 3 s AND the artist's name in the upload's title or channel. strict (the
+    shortened last-resort query) also needs length within 3 s: never a blind first hit."""
+    ctitle, want = _norm(cand.get("title")), _core_title(track.get("title"))
+    channel = _norm(cand.get("channel"))
+    symbols_only = not re.search(r"\w", want)
+    if not symbols_only and want not in ctitle:
+        return None
+    score = 0
+    want_s = (track.get("duration_ms") or 0) / 1000
+    got_s = cand.get("duration")
+    main_artist = _norm((track.get("artists") or "").split(",")[0])
+    if want_s:
+        if not got_s:
+            return None
+        gap = abs(got_s - want_s)
+        if gap > SPOTIFY_MAX_GAP_S or ((strict or symbols_only) and gap > 3):
+            return None
+        score += 4 if gap <= 3 else 2 if gap <= 8 else 0
+    if symbols_only and not (main_artist and (main_artist in channel or main_artist in ctitle)):
+        return None
+    if main_artist and main_artist in channel:
+        score += 1
+    if channel.endswith("- topic"):
+        score += 3
+    if "official audio" in ctitle:
+        score += 1
+    if "lyric" in ctitle:
+        score -= 1
+    own = _norm(track.get("title"))
+    for w in _BAD_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", ctitle) and not re.search(rf"\b{re.escape(w)}\b", own):
+            score -= 5
+    return score
+
+
+def _yt_order():
+    return ([_yt_working] if _yt_working is not None else []) + [s for s in YT_STRATEGIES if s != _yt_working]
+
+
+def _yt_search(query, n=5):
+    """Top n hits as [{title, channel, duration, url}] via yt-dlp (cookie strategies, last good one first)."""
+    global _yt_working
+    err = []
+    for extra in _yt_order():
+        code, out, e = _yt("--dump-json", "--flat-playlist", "--no-warnings", *extra, f"ytsearch{n}:{query}")
+        hits = []
+        for line in out.splitlines():
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("id"):
+                hits.append({"title": d.get("title") or "", "channel": d.get("channel") or d.get("uploader") or "",
+                             "duration": d.get("duration"), "url": d.get("url") or f"https://www.youtube.com/watch?v={d['id']}"})
+        if code == 0 and hits:
+            _yt_working = extra
+            return hits, []
+        err = (out + e).splitlines()
+    return [], err
+
+
+def spotify_queries(track):
+    """Search phrasings, best first. The last is short, for titles made of symbols that find nothing otherwise."""
+    artists, title = track.get("artists") or "", _core_title(track.get("title")) or track.get("title") or ""
+    first = artists.split(",")[0].strip()
+    qs = [f"{artists} - {title}", f"{first} {title} audio", f"{first} {(title.split() or [''])[0]}"]
+    return [q.strip() for i, q in enumerate(qs) if q.strip() and q not in qs[:i]]
+
+
+GOOD_ENOUGH = 6      # stop searching once a hit scores this well (length within 3 s + a channel / audio bonus)
+MIN_SCORE = 3        # below this nothing is saved: a wrong upload is worse than a listed failure
+
+
+def spotify_match(track, search=None):
+    """(url or None, message). search(query) -> (hits, err); default = yt-dlp. Up to three searches."""
+    search = search or _yt_search
+    best, last_err = None, []
+    for i, q in enumerate(spotify_queries(track)):
+        hits, last_err = search(q)
+        for h in hits:
+            s = spotify_score(track, h, strict=(i == 2))
+            if s is not None and (best is None or s > best[0]):
+                best = (s, h["url"])
+        if best and best[0] >= GOOD_ENOUGH:
+            break
+    if best and best[0] >= MIN_SCORE:
+        return best[1], ""
+    if not best and last_err:
+        return None, _yt_explain(last_err)
+    return None, "no matching upload found"
+
+
+# ---- saving + tagging
+def _fetch_bytes(url, limit=15_000_000):
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read(limit)
+
+
+def _yt_download_native(url, outtmpl, extra):
+    """Audio exactly as the upload carries it: AAC in .m4a when there is one, else the best audio stream
+    in its own container (Opus -> .opus, a stream copy). Never an --audio-format conversion."""
+    code, out, err = _yt("-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "best", "-o", outtmpl,
+                         "--no-playlist", "--quiet", "--no-progress", "--print", "after_move:filepath", *extra, url)
+    if code != 0:
+        return False, None, (out + err).splitlines()
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    path = Path(lines[-1]) if lines else None
+    if not (path and path.exists()):
+        import glob
+        base, stem = Path(outtmpl).parent, Path(outtmpl).name.replace(".%(ext)s", "")
+        found = sorted(base.glob(f"{glob.escape(stem)}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        path = found[0] if found else None
+    return True, path, []
+
+
+def spotify_tag(path, meta, cover=None, year=""):
+    """Write title / artist / album / track number / cover into the saved file. m4a -> MP4 atoms, opus ->
+    Vorbis comments + picture. Other containers are left as they are. Returns '' or a caveat."""
+    try:
+        import mutagen  # noqa: F401
+    except ImportError:
+        return "mutagen not installed — run native/install.sh (saved untagged)"
+    p = Path(path)
+    ext = p.suffix.lower()
+    n, total = meta.get("number") or 0, meta.get("total") or 0
+    is_png = bool(cover) and cover[:4] == b"\x89PNG"
+    try:
+        if ext in (".m4a", ".mp4"):
+            from mutagen.mp4 import MP4, MP4Cover
+            f = MP4(str(p))
+            f["\xa9nam"], f["\xa9ART"] = [meta.get("title") or p.stem], [meta.get("artists") or ""]
+            if meta.get("album"):
+                f["\xa9alb"] = [meta["album"]]
+            if n:
+                f["trkn"] = [(n, total or 0)]
+            if year:
+                f["\xa9day"] = [year]
+            if cover:
+                f["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_PNG if is_png else MP4Cover.FORMAT_JPEG)]
+            f.save()
+        elif ext == ".opus":
+            import base64
+            from mutagen.oggopus import OggOpus
+            from mutagen.flac import Picture
+            f = OggOpus(str(p))
+            f["title"], f["artist"] = [meta.get("title") or p.stem], [meta.get("artists") or ""]
+            if meta.get("album"):
+                f["album"] = [meta["album"]]
+            if n:
+                f["tracknumber"] = [f"{n}/{total}" if total else str(n)]
+            if year:
+                f["date"] = [year]
+            if cover:
+                pic = Picture()
+                pic.type, pic.mime, pic.data = 3, "image/png" if is_png else "image/jpeg", cover
+                f["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
+            f.save()
+        else:
+            return f"{ext or 'this'} files can't be tagged — saved untagged"
+    except Exception as exc:
+        return f"saved, but tagging failed: {exc}"
+    return ""
+
+
+def _cover_bytes(url):
+    """The picture at url, or None: a dead or 404 cover link never fails a song."""
+    if not url:
+        return None
+    try:
+        return _fetch_bytes(url)
+    except Exception:
+        return None
+
+
+# ---- what is already downloaded: matched on "Artists - Title", not on the file's exact name
+_NUM_PREFIX = re.compile(r"^\d{1,4}\s*(?:-\s+|_)\s*")
+_BPM_SUFFIX = re.compile(r"\s\(\d+(?:\.\d+)? BPM [^)]*\)$")
+AUDIO_EXT = {".m4a", ".mp4", ".mp3", ".opus", ".ogg", ".oga", ".webm", ".flac", ".wav", ".aif", ".aiff", ".aac", ".alac", ".wma"}
+
+
+def _alnum(text):
+    return re.sub(r"[\W_]+", "", _norm(text))
+
+
+def spotify_keys(track):
+    """Every spelling of 'Artists - Title' a saved file may carry: all artists or the first, full or trimmed title."""
+    artists, title = track.get("artists") or "", track.get("title") or ""
+    first = artists.split(",")[0]
+    return {_alnum(a + t) for a in (artists, first) for t in (title, _core_title(title))} - {""}
+
+
+def _file_key(name):
+    """A saved file's name without extension, leading 'NN - ' / 'NN_' and BPM/key suffix, reduced to letters + digits."""
+    stem = Path(name).stem if Path(name).suffix.lower() in AUDIO_EXT else name
+    return _alnum(_BPM_SUFFIX.sub("", _NUM_PREFIX.sub("", stem)))
+
+
+def _scan(folder):
+    """[(path, key)] for the audio files in a folder (not recursive); a missing folder = empty."""
+    out = []
+    try:
+        for e in os.scandir(folder):
+            if e.is_file() and Path(e.name).suffix.lower() in AUDIO_EXT and not e.name.startswith("."):
+                out.append((e.path, _file_key(e.name)))
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def find_existing(folder, track):
+    """Path of a file in folder that is this track (any number, any extension), else None."""
+    keys = spotify_keys(track)
+    return next((p for p, k in _scan(folder) if k in keys), None)
+
+
+def library_folder_name(name):
+    """A list name as a library tool writes it to disk."""
+    return re.sub(r'[/\\?%*:|"<>]', "-", name or "").strip()
+
+
+def spotify_stem(meta, total=None):
+    """NN - Artists - Title (no number for a lone song)."""
+    width = max(2, len(str(total or meta.get("total") or 0)))
+    base = " - ".join(x for x in (safe_name(meta.get("artists") or ""), safe_name(meta.get("title") or "")) if x and x != "download")
+    stem = (f"{int(meta['number']):0{width}d} - " if meta.get("number") and meta.get("folder") else "") + base
+    return stem[:180].strip(". ")
+
+
+def spotify_sync(dst, folder, tracks, libs=(), total=None):
+    """Before a list is queued, look at what is already there.
+      - files in <dst>/<folder>/ that are songs of this list are renamed in place to the list's current
+        numbering (two-phase, so a reorder that swaps numbers never collides; a clash with an unrelated
+        file gets ' (2)'; nothing is overwritten; a file whose song left the list is never touched)
+      - songs found in <lib>/<folder as a library tool writes it>/ count as downloaded too (never copied)
+    Returns {ok, have: [indexes already in the folder], inlib: [indexes found in a library], renamed, notes}."""
+    dest = Path(dst or DOWNLOADS).expanduser() / safe_name(folder)
+    files, used, have, plan = _scan(dest), set(), [], []
+    for i, t in enumerate(tracks):
+        keys = spotify_keys(t)
+        m = next(((p, k) for p, k in files if p not in used and k in keys), None)
+        if not m:
+            continue
+        used.add(m[0])
+        have.append(i)
+        cur = Path(m[0])
+        bpm = _BPM_SUFFIX.search(cur.stem)
+        new = spotify_stem({**t, "folder": folder}, total or len(tracks)) + (bpm.group(0) if bpm else "") + cur.suffix
+        if new != cur.name:
+            plan.append((cur, new))
+    moved = []
+    for n, (src, new) in enumerate(plan):       # phase 1: out of the way; phase 2: into place
+        tmp = src.with_name(f".jown-sync-{n}{src.suffix}")
+        try:
+            src.rename(tmp)
+            moved.append((tmp, src, new))
+        except OSError:
+            pass
+    renamed = 0
+    for tmp, src, new in moved:
+        target, k = src.with_name(new), 2
+        while target.exists():
+            target = src.with_name(f"{Path(new).stem} ({k}){Path(new).suffix}")
+            k += 1
+        try:
+            tmp.rename(target)
+            renamed += 1
+        except OSError:
+            tmp.rename(src)
+    inlib, notes = [], []
+    for lib in libs or []:
+        lp = Path(lib).expanduser()
+        if not lp.is_dir():
+            notes.append(f"library folder not found (drive not connected?): {lp.name or lib}")
+            continue
+        ld = lp / library_folder_name(folder)
+        if not ld.is_dir():
+            continue
+        lkeys = {k for _, k in _scan(ld)}
+        for i, t in enumerate(tracks):
+            if i not in have and i not in inlib and lkeys & spotify_keys(t):
+                inlib.append(i)
+    return {"ok": True, "have": have, "inlib": sorted(inlib), "renamed": renamed, "notes": notes}
+
+
+def spotify_track(meta, outdir, analyze=False):
+    """Download one Spotify track described by meta ({title, artists, album, number, total, duration_ms,
+    cover, url, folder}) into outdir/<folder>/NN - Artists - Title.<ext>, tagged. Never overwrites."""
+    err = _need("yt-dlp", "ffmpeg")
+    if err:
+        return {"ok": False, "output": err}
+    folder = Path(outdir) / safe_name(meta["folder"]) if meta.get("folder") else Path(outdir)
+    stem = spotify_stem(meta)
+    os.makedirs(folder, exist_ok=True)
+    there = find_existing(folder, meta)
+    if there:
+        return {"ok": True, "path": there, "files": [], "skipped": 1, "output": ""}
+    yt, msg = spotify_match(meta)
+    if not yt:
+        return {"ok": False, "output": f"{meta.get('title')}: {msg}"}
+    tid = (meta.get("url") or "").rstrip("/").rsplit("/", 1)[-1]
+    year, cover_url = "", meta.get("cover") or ""
+    try:        # this track's own embed: the album art of THIS song (a playlist's cover is not it) + release year
+        e = _spotify_embed("track", tid)
+        cover_url = _best_image(e) or cover_url
+        year = ((e.get("releaseDate") or {}).get("isoString") or "")[:10]
+    except Exception:
+        pass
+    global _yt_working
+    ok, path, last_err = False, None, []
+    outtmpl = str(folder / f"{stem}.%(ext)s")
+    for extra in _yt_order():
+        ok, path, last_err = _yt_download_native(yt, outtmpl, extra)
+        if ok:
+            _yt_working = extra
+            break
+    if not ok or not path:
+        return {"ok": False, "output": f"{meta.get('title')}: {_yt_explain(last_err, yt)}"}
+    cover = _cover_bytes(cover_url) or (_cover_bytes(meta.get("cover")) if meta.get("cover") != cover_url else None)
+    notes = []
+    caveat = spotify_tag(path, meta, cover, year)
+    if caveat:
+        notes.append(caveat)
+    if analyze:        # read-only analysis of the saved file; only its name changes
+        res = _analyze(path)
+        if res:
+            bpm, keys = res
+            new = path.with_name(f"{path.stem} ({bpm} BPM {' '.join(keys)}){path.suffix}")
+            if not new.exists():
+                path.rename(new)
+                path = new
+        else:
+            notes.append("no BPM/key analyzer installed — run native/install.sh")
+    return {"ok": True, "path": str(path), "files": [str(path)], "output": "; ".join(notes), "format": path.suffix.lower().lstrip(".")}
 
 
 # ══════════════════════════════════════════════════════════════════════════════ Instagram / Twitter
@@ -529,7 +970,7 @@ def finish(paths, strip=False, webp=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════ entry
-def fetch(url, mode="video", outdir=""):
+def fetch(url, mode="video", outdir="", meta=None, analyze=False):
     outdir = str(Path(outdir or DOWNLOADS).expanduser())
     try:
         os.makedirs(outdir, exist_ok=True)
@@ -538,6 +979,12 @@ def fetch(url, mode="video", outdir=""):
             return youtube(url, "audio" if mode == "audio" else "video", outdir)
         if site in ("instagram", "twitter"):
             return social(site, url, outdir)
+        if site == "spotify":
+            if not meta:
+                return {"ok": False, "output": "Spotify links go through the list first (spotify_list)"}
+            if os.environ.get("JOWNLOADER_DRYRUN"):      # tests: show what reached the engine, touch nothing
+                return {"ok": True, "output": "dry-run " + json.dumps({"analyze": bool(analyze), "folder": meta.get("folder"), "number": meta.get("number")})}
+            return spotify_track(meta, outdir, bool(analyze))
         return {"ok": False, "output": "no engine for this site"}
     except Exception as e:      # never let a site module take the host down
         return {"ok": False, "output": str(e)}
@@ -547,6 +994,24 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
+    if "--list" in sys.argv:        # engine.py --list <spotify url>  -> the track list as JSON
+        print(json.dumps(spotify_list(sys.argv[sys.argv.index("--list") + 1]), indent=1))
+        sys.exit(0)
+    if "--spotify" in sys.argv:     # engine.py --spotify <url> <out-dir> [--bpm]  -> every track of the link
+        args = [a for a in sys.argv[1:] if not a.startswith("--")]
+        lst = spotify_list(args[0])
+        if not lst["ok"]:
+            print(lst["output"])
+            sys.exit(1)
+        res = []
+        for t in lst["tracks"][: int(os.environ.get("JOWNLOADER_LIMIT", "9999"))]:
+            meta = {**t, "total": len(lst["tracks"]), "folder": "" if lst["kind"] == "track" else lst["name"],
+                    "album": t["album"] or lst["name"]}
+            res.append(fetch(t["url"], "audio", args[1] if len(args) > 1 else "", meta, "--bpm" in sys.argv))
+            if len(lst["tracks"]) > 1:
+                time.sleep(SPOTIFY_GAP_S)
+        print(json.dumps(res, indent=1))
+        sys.exit(0 if all(r.get("ok") for r in res) else 1)
     r = fetch(sys.argv[1], sys.argv[3] if len(sys.argv) > 3 else "video", sys.argv[2] if len(sys.argv) > 2 else "")
     print(json.dumps(r, indent=1))
     sys.exit(0 if r.get("ok") else 1)

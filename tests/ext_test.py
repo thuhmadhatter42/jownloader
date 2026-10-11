@@ -134,5 +134,36 @@ with sync_playwright() as p:
     check("rename tab present", pop.evaluate("() => [!!document.getElementById('tabRn'), document.getElementById('rnGo').disabled, document.getElementById('rnDest').disabled]"), [True, True, True])
     check("YouTube tracks are never whole files", sw.evaluate("() => [isWhole('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=18', 'video/mp4'), isWhole('https://cdn.x/a.mp4', 'video/mp4')]"), [False, True])
     check("sniffed extensions", sw.evaluate("() => [sniffExt(new Uint8Array([0,0,0,0x18,0x66,0x74,0x79,0x70,0x69,0x73,0x6f,0x6d,0,0])), sniffExt(new Uint8Array([0xff,0xd8,0xff,0xe0,0,0,0,0,0,0,0,0,0])), sniffExt(new Uint8Array([0x1a,0x45,0xdf,0xa3,0,0,0,0,0,0,0,0,0])), sniffExt(new Uint8Array(13))]"), ["mp4", "jpg", "webm", ""])
+    # Spotify links: the BPM/key checkbox (present, off by default, persists in sync storage), the song items
+    # (one engine item per song, folder in the dedupe key) and the host message they ride on. No network, no host.
+    check("spotify block hidden off Spotify pages; checkbox present and off by default",
+          pop.evaluate("() => [document.getElementById('spotify').hidden, !!document.getElementById('spBpm'), document.getElementById('spBpm').checked]"), [True, True, False])
+    pop.evaluate("() => { const c = document.getElementById('spBpm'); c.checked = true; c.dispatchEvent(new Event('change')); }")
+    pop.wait_for_timeout(300)
+    check("checkbox persists to chrome.storage.sync", pop.evaluate("async () => (await chrome.storage.sync.get({spotifyBpm: false})).spotifyBpm"), True)
+    pop2 = ctx.new_page(); pop2.goto(f"chrome-extension://{ext_id}/popup.html"); pop2.wait_for_timeout(800)
+    check("a reopened popup shows it on", pop2.evaluate("() => document.getElementById('spBpm').checked"), True)
+    pop2.close()
+    sw.evaluate("() => { globalThis.__sent = []; globalThis.__orig = saveEngineViaHost; saveEngineViaHost = async (...a) => { __sent.push(a); return { ok: true, path: '' }; }; }")
+    song = lambda url, folder, n: {"url": url, "engine": True, "mode": "audio", "spotify": {"title": "T", "artists": "A", "album": "L", "number": n, "total": 2, "duration_ms": 1000, "cover": "", "url": url, "folder": folder}}
+    r = pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'song', dest:'/d', prefix:'', items})",
+                     [song("https://open.spotify.com/track/aaa", "List", 1), song("https://open.spotify.com/track/aaa?si=x", "List", 1)])
+    check("song items: the same song twice in one list = one", r, {"queued": 1, "skipped": 1, "unusable": 0})
+    pop.wait_for_timeout(500)
+    sent = sw.evaluate("() => __sent")
+    check("host message: audio mode, destination, meta (folder, number) and analyze=true ride on the song",
+          [[a[0], a[1], a[2], a[4]["analyze"], a[4]["meta"]["folder"], a[4]["meta"]["number"]] for a in sent], [["https://open.spotify.com/track/aaa", "audio", "/d", True, "List", 1]])
+    pop.evaluate("() => chrome.storage.sync.set({spotifyBpm: false})")
+    r = pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'song', dest:'/d', prefix:'', items})", [song("https://open.spotify.com/track/aaa", "Other list", 1)])
+    check("the same song in another list's folder is its own file", r["queued"], 1)
+    pop.wait_for_timeout(500)   # (its turn starts when the 20 s gap after the first has passed — the stub answers at once either way)
+    check("extra library folders: none by default", pop.evaluate("async () => (await chrome.storage.sync.get({spotifyLibs: null})).spotifyLibs"), None)
+    pop.evaluate("() => chrome.storage.sync.set({spotifyLibs: ['/some/Music Library']})"); pop.wait_for_timeout(400)
+    check("a stored library folder shows by its name, with a remove button", pop.evaluate("() => [document.getElementById('spLibs').textContent, document.querySelectorAll('#spLibs .x').length]"), ["📚 Music Library×", 1])
+    pop.evaluate("() => document.querySelector('#spLibs .x').click()"); pop.wait_for_timeout(400)
+    check("removing it empties the setting", pop.evaluate("async () => (await chrome.storage.sync.get({spotifyLibs: null})).spotifyLibs"), [])
+    sy = pop.evaluate("async () => await chrome.runtime.sendMessage({type:'spotifySync', dst:'', folder:'L', tracks:[], total:0})")
+    check("list check with no host fails loud (the popup then queues nothing)", [sy["ok"], "install.sh" in sy["output"]], [False, True])
+    sw.evaluate("() => { saveEngineViaHost = __orig; }")
     ctx.close()
 print("ALL GREEN" if not fails else f"{fails} FAILED")

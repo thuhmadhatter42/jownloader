@@ -38,6 +38,28 @@ you already have.
 - **Convert WebP** switch — every `.webp` saved becomes a `.jpg` at quality 100, or a `.png`.
   Both are also actions in the Batch tab for files already on disk.
 
+## Spotify links → tagged audio
+
+Open a Spotify track, album, playlist or artist page and the popup offers **Download this list as audio
+(N songs)**. The song list is read from the link's public embed page — no sign-in, no developer key (an
+artist link lists the artist's top tracks only). Each song is matched to the best upload by length (within
+3 s; anything more than 15 s off is never taken), title and uploader, and its audio is saved exactly as
+the upload carries it — AAC in `.m4a`, never re-encoded (if an upload only has Opus, that is kept as
+`.opus`). Files land in one folder per list: `<destination>/<list name>/NN - Artists - Title.m4a`, tagged
+with title, artist, album, track number, release year and the song's own album art. A song nothing
+matches is reported by name and the rest carry on. Songs are fetched one at a time, 20 s apart.
+
+- A playlist longer than the embed page's 100 songs is read off the open page by scrolling it.
+- Run the same list again and only missing songs download; files already in the list's folder are kept
+  and renamed in place to the list's current order. Nothing is ever deleted or overwritten — a song that
+  left the list keeps its file.
+- **Also count songs in these folders as already downloaded**: add library folders (one sub-folder per
+  list, files named `NN_Artist - Title.ext`); songs found there are skipped, not copied. A folder that is
+  not mounted is noted and skipped.
+- **BPM + key in the names** (off by default): each file is analysed read-only and renamed
+  `Title (128.0 BPM Am C F).m4a`.
+- Needs `yt-dlp`, `ffmpeg` and `mutagen` (all installed by `native/install.sh`).
+
 ## Whole site → PDF / Markdown
 
 Crawls every same-origin page reachable from the page you're on (breadth-first, capped at the max-pages
@@ -92,7 +114,8 @@ tests/       Playwright harness (no host) and real-browser CDP tests of the writ
 ```
 python3 tests/ext_test.py          # Chromium via Playwright: scanning, naming, dedupe, DRM check, no-host failure
 python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen folder, [date] names, skip-if-on-disk
-python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG / PNG, strip metadata
+python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG / PNG, strip metadata,
+                                   # Spotify lists / matching / tags / re-run rules (saved pages in tests/fixtures, no network)
 python3 tests/streams_test_cdp.py  # real Brave: HLS (TS, AES-128, fMP4 + audio group) and DASH joined into .mp4, DRM refused
 python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named .mp3 (network)
 python3 tests/site_test_cdp.py     # real Brave: Whole-site crawl (its own local fixture site) → merged PDF and Markdown

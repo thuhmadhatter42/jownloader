@@ -236,11 +236,52 @@
     return { title: document.title || "", text: lines.join("\n\n") };
   }
 
+  // A Spotify playlist page draws only the rows near the viewport. Scroll the list top to bottom and keep
+  // every row seen (title, artists, album, length, track link, position) — for lists the link's embed page
+  // cuts short (it lists at most 100). Rows are keyed by their position, so a row drawn twice counts once.
+  async function spotifyRows() {
+    const rowSel = '[data-testid="tracklist-row"]';
+    const first = document.querySelector(rowSel);
+    if (!first) return [];
+    let scroller = first.parentElement;
+    while (scroller && scroller !== document.documentElement && !(scroller.scrollHeight > scroller.clientHeight + 20 && /(auto|scroll)/.test(getComputedStyle(scroller).overflowY))) scroller = scroller.parentElement;
+    scroller = scroller && scroller !== document.documentElement ? scroller : document.scrollingElement;
+    const seen = new Map();
+    const read = () => {
+      for (const row of document.querySelectorAll(rowSel)) {
+        const idx = parseInt(row.getAttribute("aria-rowindex") || "", 10) || 0;
+        const link = row.querySelector('a[href*="/track/"]');
+        const id = (link?.getAttribute("href") || "").match(/\/track\/([A-Za-z0-9]+)/)?.[1];
+        if (!id) continue;
+        const key = idx || id;
+        if (seen.has(key)) continue;
+        const arts = [...row.querySelectorAll('a[href*="/artist/"]')].map((a) => a.textContent.trim()).filter(Boolean);
+        const len = ([...row.querySelectorAll("div")].map((d) => d.children.length ? "" : d.textContent.trim()).filter((t) => /^\d+:\d{2}(:\d{2})?$/.test(t)).pop() || "").split(":").reduce((a, n) => a * 60 + (+n || 0), 0);
+        seen.set(key, { order: idx, title: (link.textContent || "").trim(), artists: [...new Set(arts)].join(", "), album: row.querySelector('a[href*="/album/"]')?.textContent.trim() || "", duration_ms: len * 1000, url: "https://open.spotify.com/track/" + id });
+      }
+    };
+    const start = scroller.scrollTop;
+    scroller.scrollTop = 0; await new Promise((r) => setTimeout(r, 300));
+    let still = 0;
+    for (let i = 0; i < 600 && still < 4; i++) {
+      const before = seen.size; read();
+      still = seen.size === before ? still + 1 : 0;
+      const atEnd = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 4;
+      if (atEnd && still >= 2) break;
+      scroller.scrollTop += Math.max(200, scroller.clientHeight * 0.8);
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    read();
+    scroller.scrollTop = start;
+    return [...seen.values()].sort((a, b) => a.order - b.order).map(({ order, ...t }) => t);
+  }
+
   chrome.runtime.onMessage.addListener((msg, _s, reply) => {
     if (msg.type === "scanFrame") reply({ host: host(), images: scanImages(), videos: scanVideos(), docs: scanDocs() });
     else if (msg.type === "pageChanged") { autoDone.clear(); collected.clear(); }   // load or pushState: a new page
     else if (msg.type === "siteLinks") reply(Array.from(document.querySelectorAll("a[href]")).map((a) => a.href));
     else if (msg.type === "siteMarkdown") reply(siteMarkdown());
+    else if (msg.type === "spotifyRows" && top === window) { spotifyRows().then(reply, () => reply(null)); return true; }
     else if (msg.type === "saveResult") {
       const btn = pending.get(msg.c);
       if (btn) { pending.delete(msg.c); flash(btn, msg.ok ? (msg.output ? `saved (${msg.output})` : "saved ✓") : `failed — ${msg.output || "unknown error"}`, 6000); }

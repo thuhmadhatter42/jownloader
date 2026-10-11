@@ -28,13 +28,13 @@ def _read_n(stream, n, deadline):
             raise EOFError("host closed without replying")
         buf += chunk
     return buf
-def call_port(msg, timeout=180):
+def call_port(msg, timeout=180, env=None):
     # setup/fetch reply asynchronously from a background thread on the persistent port — closing
     # stdin right after the request (like call() does) races the daemon thread's send() against
     # process exit, so keep stdin open and read exactly one framed reply instead.
     data = json.dumps(msg).encode()
     p = subprocess.Popen([BOOT_PY, HOST], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          stderr=subprocess.DEVNULL, env=BROWSER_ENV)
+                          stderr=subprocess.DEVNULL, env=env or BROWSER_ENV)
     try:
         p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
         deadline = time.time() + timeout
@@ -124,6 +124,144 @@ try:
     check("metadata gone after strip", tags, "")
     r = call({"cmd": "finish", "paths": [fin + "/missing.jpg"], "strip": True})
     check("missing file fails on its own", r["results"][0]["ok"], False)
+
+    # ---- Spotify links: the track list from saved embed pages (no network), the flag that reaches the engine,
+    # the match scoring, the tags and the never-overwrite rule. Fixtures: tests/fixtures/{track,album,playlist,artist}.html
+    FIX = os.path.join(HERE, "fixtures")
+    FENV = {**BROWSER_ENV, "JOWNLOADER_EMBED_DIR": FIX}
+    def lst(url): return call_port({"cmd": "list", "id": "l1", "url": url}, env=FENV)
+    r = lst("https://open.spotify.com/album/0ETFjACtuP2ADo6LFhL6HN?si=x")
+    t0 = r.get("tracks", [{}])[0]
+    check("list album: name, kind, 17 tracks, not truncated, id echoed", [r.get("ok"), r.get("name"), r.get("kind"), len(r.get("tracks", [])), r.get("truncated"), r.get("id")],
+          [True, "Abbey Road (Remastered 2009)", "album", 17, False, "l1"])
+    check("list album: first track fields", [t0.get("title"), t0.get("artists"), t0.get("album"), t0.get("number"), t0.get("duration_ms"), t0.get("url"), bool(t0.get("cover"))],
+          ["Come Together - Remastered 2009", "The Beatles", "Abbey Road (Remastered 2009)", 1, 259946, "https://open.spotify.com/track/2EqlS6tkEnglzr7tkKAAYD", True])
+    r = lst("https://open.spotify.com/intl-de/playlist/37i9dQZF1DWXRqgorJj26U")
+    check("list playlist: 100 tracks (the embed's cap) = truncated, numbered 1..100; the embed has no per-track cover, so each track carries the list's", [r.get("ok"), len(r["tracks"]), r.get("truncated"), [t["number"] for t in r["tracks"]] == list(range(1, 101)), bool(r["cover"]) and r["tracks"][0]["cover"] == r["cover"]], [True, 100, True, True, True])
+    r = lst("https://open.spotify.com/track/4u7EnebtmKWzUH433cf5Qv")
+    check("list track: one song, artists joined, length", [r.get("kind"), [(t["title"], t["artists"], t["duration_ms"]) for t in r["tracks"]]], ["track", [("Bohemian Rhapsody - Remastered 2011", "Queen", 354320)]])
+    r = lst("https://open.spotify.com/artist/1dfeR4HaWDbWqFHLkxsg1d")
+    check("list artist: top tracks only, said so", [r.get("kind"), len(r["tracks"]), "top tracks" in r.get("note", "")], ["artist", 10, True])
+    r = lst("https://example.com/album/abc")
+    check("list: not a Spotify link fails loud", [r.get("ok"), "Spotify" in r.get("output", "")], [False, True])
+
+    DRY = {**BROWSER_ENV, "JOWNLOADER_DRYRUN": "1"}
+    meta = {"title": "T", "artists": "A", "number": 7, "total": 12, "duration_ms": 1000, "url": "https://open.spotify.com/track/abc", "folder": "My List"}
+    r = call_port({"cmd": "fetch", "id": "f1", "url": meta["url"], "mode": "audio", "dst": d, "meta": meta, "analyze": True}, env=DRY)
+    check("fetch spotify: analyze=true, folder and number reach the engine", r.get("output"), 'dry-run {"analyze": true, "folder": "My List", "number": 7}')
+    r = call_port({"cmd": "fetch", "id": "f2", "url": meta["url"], "mode": "audio", "dst": d, "meta": meta}, env=DRY)
+    check("fetch spotify: analyze defaults off", r.get("output"), 'dry-run {"analyze": false, "folder": "My List", "number": 7}')
+    r = call_port({"cmd": "fetch", "id": "f3", "url": meta["url"], "mode": "audio", "dst": d}, env=DRY)
+    check("fetch spotify without a list entry fails loud", [r.get("ok"), "list" in r.get("output", "")], [False, True])
+
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "native"))
+    import engine
+    # matching: a stand-in for the search (the real one is yt-dlp); scores decide, not search order
+    trk = {"title": "Bohemian Rhapsody - Remastered 2011", "artists": "Queen", "duration_ms": 354320}
+    def fake(hits): return lambda q: (hits, [])
+    H = lambda title, ch, dur, url: {"title": title, "channel": ch, "duration": dur, "url": url}
+    live = H("Queen - Bohemian Rhapsody (Live Aid 1985)", "Live Aid", 165, "u-live")
+    vid = H("Queen - Bohemian Rhapsody (Official Video Remastered)", "Queen Official", 360, "u-video")
+    topic = H("Bohemian Rhapsody - Remastered 2011", "Queen - Topic", 355, "u-topic")
+    remix = H("Queen - Bohemian Rhapsody (Remix)", "Queen Official", 354, "u-remix")
+    other = H("Some Cover Band - Bohemian Rhapsody", "Band", 354, "u-other")
+    check("match: Topic upload within 3 s beats an official video 6 s off", engine.spotify_match(trk, fake([live, vid, topic]))[0], "u-topic")
+    check("match: a remix at the right length loses to the 6-s-off original", engine.spotify_match(trk, fake([remix, vid]))[0], "u-video")
+    check("match: wrong length (live, 165 s) is rejected outright", engine.spotify_match(trk, fake([live])), (None, "no matching upload found"))
+    check("match: a title that does not contain the track's is rejected", engine.spotify_match(trk, fake([other]))[0], None)
+    live_trk = {"title": "Live Forever", "artists": "Oasis", "duration_ms": 276000}
+    check("match: 'live' in the track's own title is not a penalty", engine.spotify_match(live_trk, fake([H("Oasis - Live Forever", "Oasis", 277, "u1")]))[0], "u1")
+    sym = {"title": "\u22c6.\u2729 \u02da", "artists": "Someone", "duration_ms": 120000}
+    check("match: a symbol-only title still matches on length", engine.spotify_match(sym, fake([H("someone - whatever", "Someone", 121, "u2")]))[0], "u2")
+    check("match: queries run full, then audio, then short", engine.spotify_queries({"title": "Song (feat. X) - Remastered", "artists": "A, B"}), ["A, B - song", "A song audio", "A song"])
+    check("sites: spotify routes to its engine branch", [engine.site_of("https://open.spotify.com/album/x"), engine.site_of("https://open.spotify.com/intl-es/track/x"), engine.site_of("https://open.spotify.com/user/x")], ["spotify", "spotify", None])
+
+    # the file side needs mutagen (native/.venv): tags written into a real m4a, never overwritten
+    if os.path.exists(venv_py) and subprocess.run([venv_py, "-c", "import mutagen"], capture_output=True).returncode == 0:
+        sp = os.path.join(d, "sp"); os.makedirs(sp)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "aac", sp + "/s.m4a"], check=True)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=1", "-frames:v", "1", sp + "/c.jpg"], check=True)
+        probe = """
+import sys, json; sys.path.insert(0, sys.argv[1]); import engine
+from mutagen.mp4 import MP4
+m = {"title": "Song", "artists": "A, B", "album": "Alb", "number": 3, "total": 12}
+cover = open(sys.argv[2] + "/c.jpg", "rb").read()
+note = engine.spotify_tag(sys.argv[2] + "/s.m4a", m, cover, "1975-11-21")
+f = MP4(sys.argv[2] + "/s.m4a")
+print(json.dumps([note, f["\\xa9nam"], f["\\xa9ART"], f["\\xa9alb"], f["trkn"], f["\\xa9day"], len(f["covr"][0]) > 100, f.info.codec]))
+"""
+        out = subprocess.run([venv_py, "-c", probe, os.path.join(os.path.dirname(HERE), "native"), sp], capture_output=True, text=True)
+        check("tags: title, artist, album, track n/total, year, cover in an m4a, still AAC",
+              json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else out.stderr[-300:],
+              ["", ["Song"], ["A, B"], ["Alb"], [[3, 12]], ["1975-11-21"], True, "mp4a.40.2"])
+        os.makedirs(sp + "/My List")
+        open(sp + "/My List/03 - A, B - Song (71 BPM A# D# Cm).m4a", "w").write("x")
+        r = engine.spotify_track({"title": "Song", "artists": "A, B", "number": 3, "total": 12, "folder": "My List", "url": "https://open.spotify.com/track/x"}, sp)
+        check("an existing song (even renamed with BPM/key) is skipped, nothing fetched, nothing overwritten",
+              [r.get("ok"), r.get("skipped"), os.listdir(sp + "/My List")], [True, 1, ["03 - A, B - Song (71 BPM A# D# Cm).m4a"]])
+    else:
+        print("skip tag checks (native/.venv has no mutagen — run: source native/deps.sh && ensure_deps)")
+
+    # ---- matching rules learned the hard way: length is essential, symbol-only titles need artist + length, the
+    # short last-resort query is never a blind first hit, cookie fallbacks reach the search, a dead cover link is harmless
+    check("score: a hit with no length is refused (live streams)", engine.spotify_score(trk, H("Queen - Bohemian Rhapsody", "Queen", None, "x")), None)
+    check("score: a 77-minute upload is refused", engine.spotify_score(trk, H("Queen - Bohemian Rhapsody (full concert)", "Queen", 4620, "x")), None)
+    check("score: symbol-only title, artist absent from title and channel → refused", engine.spotify_score(sym, H("whatever", "Other Channel", 120, "x")), None)
+    check("score: symbol-only title, artist present but 5 s off → refused", engine.spotify_score(sym, H("someone - x", "Someone", 125, "x")), None)
+    short_hit = H("Queen - Bohemian Rhapsody (Official Video)", "Queen Official", 360, "u-short")   # 6 s off
+    only_short = lambda hits: (lambda q: (hits, []) if q == "Queen bohemian" else ([], []))
+    check("match: the shortened query refuses a hit 6 s off", engine.spotify_match(trk, only_short([short_hit]))[0], None)
+    check("match: the shortened query takes a hit within 3 s", engine.spotify_match(trk, only_short([H("Queen - Bohemian Rhapsody", "Queen Official", 356, "u-short")]))[0], "u-short")
+    saved_yt, calls = engine._yt, []
+    def age_gate(*a):
+        calls.append(a)
+        if "youtube:player_client=android" in a:
+            return 0, json.dumps({"id": "abc", "title": "Queen - Bohemian Rhapsody", "channel": "Queen", "duration": 354, "url": "https://www.youtube.com/watch?v=abc"}) + "\n", ""
+        return 1, "", "ERROR: Sign in to confirm your age"
+    engine._yt, engine._yt_working = age_gate, None
+    try:
+        hits, err = engine._yt_search("q")
+        first = calls[0]
+        check("search: Brave's cookies are the first thing tried", ("--cookies-from-browser", "brave") == (first[first.index("--cookies-from-browser")], first[first.index("--cookies-from-browser") + 1]), True)
+        check("search: an age-gate failure falls through the cookie strategies to one that works", [len(hits), hits[0]["url"], len(calls) > 3], [1, "https://www.youtube.com/watch?v=abc", True])
+        calls.clear(); engine._yt_search("q2")
+        check("search: the strategy that worked goes first next time", "youtube:player_client=android" in calls[0], True)
+    finally:
+        engine._yt, engine._yt_working = saved_yt, None
+    import http.server, threading
+    class Dead(http.server.BaseHTTPRequestHandler):
+        def do_GET(self): self.send_error(404)
+        def log_message(self, *a): pass
+    srv = http.server.HTTPServer(("127.0.0.1", 9361), Dead); threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        check("cover: a 404 link gives no picture instead of an error; no link likewise", [engine._cover_bytes("http://127.0.0.1:9361/gone.jpg"), engine._cover_bytes("")], [None, None])
+    finally:
+        srv.shutdown(); srv.server_close()
+
+    # ---- running a list again: what is there is kept, renumbered to Spotify's current order, nothing deleted
+    sy = os.path.join(d, "sy"); os.makedirs(sy + "/L")
+    T = lambda a, t, n: {"artists": a, "title": t, "number": n}
+    for n, (a, t) in enumerate([("A", "One"), ("B", "Two"), ("C", "Three")], 1):
+        open(f"{sy}/L/{n:02d} - {a} - {t}.m4a", "w").write(t)
+    sync = lambda tracks, **kw: call({"cmd": "sync", "dst": sy, "folder": "L", "tracks": tracks, "total": len(tracks), **kw})
+    r = sync([T("A", "One", 1), T("B", "Two", 2), T("C", "Three", 3)])
+    check("re-run: all three found, nothing renamed, nothing to download", [r["ok"], r["have"], r["renamed"], r["inlib"]], [True, [0, 1, 2], 0, []])
+    r = sync([T("C", "Three", 1), T("A", "One", 2), T("B", "Two", 3)])
+    check("reordered list: the files take the new numbers (a rotation, no collisions)", [r["renamed"], sorted(os.listdir(sy + "/L"))], [3, ["01 - C - Three.m4a", "02 - A - One.m4a", "03 - B - Two.m4a"]])
+    check("...and keep their own content", [open(sy + "/L/01 - C - Three.m4a").read(), open(sy + "/L/02 - A - One.m4a").read()], ["Three", "One"])
+    r = sync([T("C", "Three", 1), T("A", "One", 2), T("D", "Four", 3)])
+    check("a song that left the list: its file stays; the new song is the only one missing", [r["have"], r["renamed"], sorted(os.listdir(sy + "/L"))], [[0, 1], 0, ["01 - C - Three.m4a", "02 - A - One.m4a", "03 - B - Two.m4a"]])
+    os.makedirs(sy + "/M")
+    for n in ("05_b - TWO.mp3", "002_A - One (71 BPM A# D# Cm).flac", "Z - Unrelated.m4a"): open(f"{sy}/M/{n}", "w").write(n)
+    r = call({"cmd": "sync", "dst": sy, "folder": "M", "tracks": [T("A", "One", 1), T("B", "Two", 2)], "total": 2})
+    check("match ignores case, the NN- / NN_ prefix, the extension and a BPM/key suffix; numbers and BPM text are kept right",
+          [r["have"], sorted(os.listdir(sy + "/M"))], [[0, 1], ["01 - A - One (71 BPM A# D# Cm).flac", "02 - B - Two.mp3", "Z - Unrelated.m4a"]])
+    lib = os.path.join(d, "lib"); os.makedirs(lib + "/Hits- Vol 1-")
+    open(lib + "/Hits- Vol 1-/003_Artist - Title One.flac", "w").write("x")
+    r = call({"cmd": "sync", "dst": sy, "folder": "Hits: Vol 1?", "tracks": [T("Artist", "Title One", 1), T("Artist", "Other", 2)], "total": 2, "libs": [lib, d + "/not-mounted"]})
+    check("library folder: found by the library's own folder-name rule and NN_ names; a missing one is a note, not a failure",
+          [r["ok"], r["inlib"], r["have"], [n.startswith("library folder not found") for n in r["notes"]], os.path.exists(sy + "/Hits_ Vol 1_")], [True, [0], [], [True], False])
+
 finally:
     shutil.rmtree(d)
 print("ALL GREEN" if not fails else f"{fails} FAILED")

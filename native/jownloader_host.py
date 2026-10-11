@@ -25,6 +25,16 @@ with the browser session; this side only writes them.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
+     A Spotify track also carries "meta" ({title, artists, album, number, total, duration_ms, cover, url,
+     folder}) and "analyze": true|false (BPM/key into the name): the host matches it to an upload and saves
+     <dst>/<folder>/NN - Artists - Title.m4a (AAC as the upload has it, never re-encoded), tagged.
+  {"cmd": "sync", "id", "dst", "folder", "tracks": [{artists, title, number}], "total", "libs": [paths]}
+     -> {"id", "ok", "have": [i...], "inlib": [i...], "renamed": n, "notes": [...]}
+     before a Spotify list is queued: songs already in <dst>/<folder>/ are matched on "Artists - Title" (not the
+     file's exact name) and renamed in place to the list's current numbering; songs found in
+     <lib>/<folder>/ of an extra library folder count as downloaded. Nothing is deleted or overwritten.
+  {"cmd": "list", "id", "url"} -> {"id", "ok", "name", "kind", "cover", "truncated", "tracks": [...]}
+     a Spotify track / album / playlist / artist link read from its public embed page (own thread).
   {"cmd": "setup", "id"} -> {"id", "ok", "output", "missing": [...], "python": str}
      runs native/deps.sh's ensure_deps (brew installs can take minutes): its own thread, reply when
      done. "output" is the tail of what it printed; "missing" is whichever of the six deps below are
@@ -103,11 +113,24 @@ def fetch_async(msg):
     """The engine (yt-dlp / gallery-dl) can run for minutes: its own thread, reply when done."""
     def run():
         try:
-            r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "")
+            r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "",
+                             msg.get("meta") or None, bool(msg.get("analyze")))
         except Exception as e:
             r = {"ok": False, "output": str(e)}
         r["id"] = msg.get("id")
-        send(finished(r, msg))
+        send(r if msg.get("meta") else finished(r, msg))   # a Spotify song keeps its tags: "strip metadata" would erase them
+    threading.Thread(target=run, daemon=True).start()
+
+
+def list_async(msg):
+    """A Spotify link's track list: one page fetch, in its own thread so the port keeps streaming."""
+    def run():
+        try:
+            r = engine.spotify_list(msg.get("url") or "")
+        except Exception as e:
+            r = {"ok": False, "output": str(e)}
+        r["id"] = msg.get("id")
+        send(r)
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -164,6 +187,7 @@ def check_deps():
                 ver = m.group(1)
         out[name] = {"present": present, "version": ver}
     out["pypdf"] = dict(zip(("present", "version"), _pkg_version("pypdf")))
+    out["mutagen"] = dict(zip(("present", "version"), _pkg_version("mutagen")))
     out["analyzer"] = dict(zip(("present", "version"), _analyzer_version()))
     return out
 
@@ -466,6 +490,15 @@ def serve():
             send(r)
         elif msg.get("cmd") == "fetch":
             fetch_async(msg)
+        elif msg.get("cmd") == "sync":
+            try:
+                r = engine.spotify_sync(msg.get("dst") or "", msg.get("folder") or "", msg.get("tracks") or [], msg.get("libs") or [], msg.get("total"))
+            except Exception as e:
+                r = {"ok": False, "output": str(e)}
+            r["id"] = msg.get("id")
+            send(r)
+        elif msg.get("cmd") == "list":
+            list_async(msg)
         elif msg.get("cmd") == "setup":
             setup_async(msg)
         elif msg.get("cmd") == "finish":

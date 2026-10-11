@@ -2,7 +2,7 @@
 # Jownloader's engine dependencies: check + install. Sourced by install.sh (ensure_deps) and usable on
 # its own: `source native/deps.sh && ensure_deps`. Homebrew installs yt-dlp (YouTube), ffmpeg (streams,
 # remux, transcode), gallery-dl (Instagram, Twitter/X; yt-dlp injected for 1080p Instagram video) and
-# exiftool (strip metadata). The Python side — pypdf and the BPM/key analyzer (essentia-tensorflow or,
+# exiftool (strip metadata). The Python side — pypdf, mutagen (song tags) and the BPM/key analyzer (essentia-tensorflow or,
 # failing a wheel, librosa) — lives in a private venv, native/.venv, never the system/browser Python:
 # Brave launches the host with PATH=/usr/bin:/bin (Xcode CLT python3, no current wheels and no pip
 # access under PEP 668), while this script runs under bash with brew loaded (brew's python3, whose
@@ -85,6 +85,13 @@ ensure_deps() {
         echo "▸ Installing pypdf (PDF merge for Whole-site saves)..."
         "$VENV_PY" -m pip install --prefer-binary --quiet pypdf 2>/dev/null \
             || echo "  (pip failed — pypdf not installed; whole-site PDF pages will be kept separately)"
+    fi
+
+    # mutagen writes the tags (title, artist, album, number, cover) into Spotify-link songs
+    if ! "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('mutagen') else 1)" 2>/dev/null; then
+        echo "▸ Installing mutagen (song tags for Spotify links)..."
+        "$VENV_PY" -m pip install --prefer-binary --quiet mutagen 2>/dev/null \
+            || echo "  (pip failed — mutagen not installed; Spotify-link songs will be saved untagged)"
     fi
 
     # Instagram's best-quality video comes through a DASH manifest that gallery-dl hands to yt-dlp by
