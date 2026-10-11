@@ -21,3 +21,4 @@ native/.venv*/
 
 # local exports for the user, never pushed
 handoff/
+.claude/

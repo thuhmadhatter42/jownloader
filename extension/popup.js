@@ -70,6 +70,11 @@ function showProgress(pr) {
   if (!pr || !pr.total) return;
   $("bar").hidden = false;
   $("fill").style.width = Math.round((pr.done / pr.total) * 100) + "%";
+  if (pr.crawl) {   // a site crawl in flight: page n of m + the page being rendered
+    $("fill").style.width = Math.round((pr.crawl.n / Math.max(pr.crawl.m, pr.crawl.n)) * 100) + "%";
+    $("status").textContent = `page ${pr.crawl.n} of ${Math.max(pr.crawl.m, pr.crawl.n)}\n${pr.crawl.url}`;
+    return;
+  }
   const fails = pr.failed ? ` (${pr.failed} failed)` : "";
   const head = pr.active ? `${pr.done} / ${pr.total}` : `${pr.done - pr.failed}`;
   $("status").textContent = `${head} ${pr.kind}s saved → ${folderName(pr.where)}${fails} · ${MB(pr.bytes)}` + (pr.error ? `\n${pr.error}` : "");
@@ -102,11 +107,14 @@ for (const [id, mode] of [["site", "video"], ["siteAudio", "audio"]]) $(id).oncl
   if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
 };
 
+const crawlFollow = () => document.querySelector("input[name=crawl]:checked").value === "site";
+function showCrawl() { $("sitePages").disabled = !crawlFollow(); }
+for (const r of document.querySelectorAll("input[name=crawl]")) r.onchange = () => { chrome.storage.sync.set({ crawl: r.value }); showCrawl(); };
 // whole-site buttons: crawl same-origin pages breadth-first (capped) and save one merged PDF or Markdown file
 for (const [id, mode] of [["sitePdf", "pdf"], ["siteMd", "md"]]) $(id).onclick = async () => {
-  const maxPages = Math.max(1, parseInt($("sitePages").value, 10) || 50);
-  $("status").textContent = `crawling the site (max ${maxPages} pages)…`;
-  const r = await chrome.runtime.sendMessage({ type: "download", items: [{ url: tab.url, site: true, mode, maxPages }], kind: "site", dest: destPath, prefix: "" });
+  const follow = crawlFollow(), maxPages = Math.max(1, parseInt($("sitePages").value, 10) || 50);
+  $("status").textContent = follow ? `crawling the site (max ${maxPages} pages)…` : "saving this page…";
+  const r = await chrome.runtime.sendMessage({ type: "download", items: [{ url: tab.url, site: true, mode, maxPages, follow }], kind: "site", dest: destPath, prefix: "" });
   if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
 };
 
@@ -121,7 +129,9 @@ $("coll").onclick = async () => {
 };
 $("collClear").onclick = () => chrome.runtime.sendMessage({ type: "clearCollected" });
 
-chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "", sitePages: 50 }, (s) => {
+chrome.storage.sync.get({ autoVideos: false, showButton: true, collect: false, strip: false, webp: "", dest: "", prefix: "", sitePages: 50, crawl: "page" }, (s) => {
+  for (const r of document.querySelectorAll("input[name=crawl]")) r.checked = r.value === s.crawl;
+  showCrawl();
   $("autoVideos").checked = s.autoVideos;
   $("collect").checked = s.collect;
   $("showButton").checked = s.showButton;
@@ -148,14 +158,14 @@ $("webp").onchange = () => chrome.storage.sync.set({ webp: $("webp").value });
 // Selected files live in the background (the popup closes when Finder opens); one Finder window at a time
 // (pickerState above disables both pickers while one is up, and the background refuses a second call).
 let rnDest = "", rnFiles = [];
-const tabs = { tabDl: "paneDl", tabRn: "paneRn" };
+const tabs = { tabDl: "paneDl", tabPdf: "panePdf", tabTools: "paneTools" };
 function showTab(id) {
   for (const [t, pane] of Object.entries(tabs)) { $(t).classList.toggle("on", t === id); $(pane).hidden = t !== id; }
   try { localStorage.setItem("tab", id); } catch {}
   $("status").textContent = ""; $("bar").hidden = true;
 }
 for (const t of Object.keys(tabs)) $(t).onclick = () => showTab(t);
-try { if (localStorage.getItem("tab") === "tabRn") showTab("tabRn"); } catch {}
+try { const t = localStorage.getItem("tab"); if (t in tabs) showTab(t); } catch {}
 function showRename() {
   const n = rnFiles.length, move = $("rnMove").checked;
   $("rnFiles").textContent = n ? `${n} file${n > 1 ? "s" : ""} selected in ${folderName(rnFiles[0].path.slice(0, rnFiles[0].path.lastIndexOf("/")))}/` : "no files selected";
