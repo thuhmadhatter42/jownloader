@@ -30,33 +30,38 @@
   .tabs button.on { color: #fff; border-bottom-color: #2f6fed; }
   .opt { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 0; justify-content: flex-start; }
   .opt input[type=radio] { margin: 0 4px 0 0; }
+  h2 { font-size: 12px; margin: 12px 0 4px; padding-top: 8px; border-top: 1px solid #333; color: #ccc; }
+  #paneTools h2:first-child { border-top: 0; margin-top: 2px; padding-top: 0; }
+  label.field input { width: 64px; flex: none; padding: 5px 6px; font: 12px system-ui; color: #eee; background: #2a2a2d; border: 1px solid #444; border-radius: 6px; }
+  label.field input:disabled { opacity: .45; }
   .files { color: #999; font-size: 12px; margin: 4px 0; }
 </style></head>
 <body>
   <h1>Jownloader <button id="sidebar" title="open Jownloader as a sidebar that stays open while you browse">⧉ sidebar</button></h1>
-  <div class="tabs"><button id="tabDl" class="on">Download</button><button id="tabRn">Batch</button></div>
-  <div id="paneDl">
   <div class="host" id="host">scanning…</div>
   <div class="row"><button id="dest" class="dest" title="Downloads">📁 Downloads</button><button id="destClear" class="x" title="back to Downloads" hidden>×</button></div>
+  <div class="tabs"><button id="tabDl" class="on">Video / Images</button><button id="tabPdf">PDF</button><button id="tabTools">Extra tools</button></div>
+  <div id="paneDl">
   <div class="row"><input id="prefix" placeholder="name → name_1, _2… ([yy-mm-dd] = upload date)"></div>
   <button id="site" hidden>Download from this page</button>
   <button id="siteAudio" hidden title="best audio as MP3, BPM and key detected and put in the name">Audio only → MP3 + BPM/key</button>
-  <div class="row"><input id="sitePages" type="number" min="1" value="50" title="max pages to crawl" style="width:56px;flex:none"><button id="sitePdf" hidden style="flex:1">Save site as PDF</button></div>
-  <button id="siteMd" hidden>Save site as Markdown</button>
   <button id="imgs" disabled>Download all images</button>
   <button id="vids" disabled>Download all videos</button>
-  <button id="docs" disabled>Download all documents</button>
   <div class="row"><button id="coll" disabled>Download collected (0)</button><button id="collClear" class="x" title="forget the collected list" hidden>×</button></div>
-  <label><span>Collect as I scroll<small>every picture shown ≥ 300 px on screen is remembered; thumbnails aren't</small></span><input type="checkbox" id="collect"></label>
+  <label><span>Collect as I scroll<small>every picture shown on screen is remembered; thumbnails ignored</small></span><input type="checkbox" id="collect"></label>
   <label><span>Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos"></label>
   <label><span>Button on videos<small>⬇ overlay top-left of every player, shows the quality it will grab</small></span><input type="checkbox" id="showButton"></label>
-  <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
-  <label><span>Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
-  <div class="files" id="deps">Dependencies: checking…</div>
-  <button id="depsInstall" hidden>Install missing dependencies</button>
-  <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
   </div>
-  <div id="paneRn" hidden>
+  <div id="panePdf" hidden>
+  <div class="opt"><label class="opt"><input type="radio" name="crawl" value="page" checked>This page only</label></div>
+  <div class="opt"><label class="opt"><input type="radio" name="crawl" value="site">Follow links on this site</label></div>
+  <label class="field" for="sitePages"><span>Max pages<small>how many pages to save when following links</small></span><input id="sitePages" type="number" min="1" value="50" disabled></label>
+  <button id="sitePdf" hidden>Save site as PDF</button>
+  <button id="siteMd" hidden>Save site as Markdown</button>
+  <button id="docs" disabled>Download all documents</button>
+  </div>
+  <div id="paneTools" hidden>
+  <h2>Batch rename</h2>
   <div class="row"><input id="rnName" placeholder="name → name_1, _2… ([yy-mm-dd] = file date)"></div>
   <div class="row"><button id="rnPick">Select files…</button><button id="rnClear" class="x" title="forget the selected files" hidden>×</button></div>
   <div class="files" id="rnFiles">no files selected</div>
@@ -64,8 +69,14 @@
   <div class="row"><button id="rnDest" class="dest" disabled title="choose a folder">📁 destination</button><button id="rnDestClear" class="x" title="clear the destination" hidden>×</button></div>
   <div class="opt"><label class="opt"><input type="radio" name="rnMode" value="move" checked disabled>move</label><label class="opt"><input type="radio" name="rnMode" value="copy" disabled>copy</label></div>
   <button id="rnGo" disabled>Rename</button>
+  <h2>Strip metadata and WebP conversion</h2>
   <div class="row"><button id="rnStrip" disabled title="remove all metadata from the selected files, in place">Strip metadata</button><button id="rnWebp" disabled title="convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button><button id="rnPng" disabled title="convert the selected .webp files to .png (originals removed)">WebP → PNG</button></div>
+  <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
+  <label><span>Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
+  <div class="files" id="deps">Dependencies: checking…</div>
+  <button id="depsInstall" hidden>Install missing dependencies</button>
   </div>
+  <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
   <div class="bar" id="bar" hidden><div id="fill"></div></div>
   <div class="status" id="status"></div>
   <script src="popup.js"></script>

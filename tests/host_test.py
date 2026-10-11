@@ -124,6 +124,31 @@ try:
     check("metadata gone after strip", tags, "")
     r = call({"cmd": "finish", "paths": [fin + "/missing.jpg"], "strip": True})
     check("missing file fails on its own", r["results"][0]["ok"], False)
+    # site PDFs are named by page title, never 001.pdf, never overwritten
+    import base64
+    def session(msgs):
+        blob = b"".join(struct.pack("<I", len(json.dumps(m).encode())) + json.dumps(m).encode() for m in msgs)
+        p = subprocess.run([BOOT_PY, HOST], input=blob, capture_output=True, env=BROWSER_ENV)
+        out, i = [], 0
+        while i < len(p.stdout):
+            n = struct.unpack("<I", p.stdout[i:i + 4])[0]; out.append(json.loads(p.stdout[i + 4:i + 4 + n])); i += 4 + n
+        return out
+    def tracks(n):
+        m = []
+        for k in range(n):
+            m += [{"cmd": "open", "id": f"t{k}", "name": f"x.{k}.pdf", "dst": pdfd, "temp": True},
+                  {"cmd": "chunk", "id": f"t{k}", "data": base64.b64encode(b"%PDF-1.4 page" + bytes([48 + k])).decode()},
+                  {"cmd": "close", "id": f"t{k}"}]
+        return m
+    pdfd = os.path.join(d, "pdf"); os.makedirs(pdfd)
+    ids = lambda n: [f"t{k}" for k in range(n)]
+    session(tracks(1) + [{"cmd": "mergepdf", "id": "m", "ids": ids(1), "name": "site", "dst": pdfd, "titles": ["Portal:Current events"], "split": True}])
+    session(tracks(1) + [{"cmd": "mergepdf", "id": "m", "ids": ids(1), "name": "site", "dst": pdfd, "titles": ["Portal:Current events"], "split": True}])
+    check("one page -> <title>.pdf, second run -> (2), no tracks left", sorted(f for f in os.listdir(pdfd)), ["Portal:Current events (2).pdf", "Portal:Current events.pdf"])
+    session(tracks(3) + [{"cmd": "mergepdf", "id": "m", "ids": ids(3), "name": "docs.example.org", "dst": pdfd, "titles": ["Intro / Start", "Guide: Part 1", ""], "split": True}])
+    check("several pages -> one PDF per page named by title (path chars made safe), never 001.pdf",
+          sorted(os.listdir(pdfd + "/docs.example.org")), ["Guide: Part 1.pdf", "Intro - Start.pdf", "docs.example.org page 3.pdf"])
+    check("split page content intact", open(pdfd + "/docs.example.org/Intro - Start.pdf", "rb").read(), b"%PDF-1.4 page0")
 finally:
     shutil.rmtree(d)
 print("ALL GREEN" if not fails else f"{fails} FAILED")

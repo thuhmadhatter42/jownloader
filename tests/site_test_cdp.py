@@ -1,5 +1,5 @@
-# Real Brave + CDP: Whole-site crawl (its own local fixture site) → one merged PDF and one Markdown
-# file. Breadth-first same-origin crawl (external links, #fragments, asset links skipped), maxPages
+# Real Brave + CDP: Whole-site crawl (its own local fixture site) → per-page PDFs named by page title
+# (or one Markdown file). NOTE: the installed native host answers, so install it from this tree first. Breadth-first same-origin crawl (external links, #fragments, asset links skipped), maxPages
 # cap, never-overwrite naming, dedupe by canon(url)+"#site-"+mode regardless of maxPages.
 # Run: python3 tests/site_test_cdp.py   (needs pypdf: python3 -m pip install --user pypdf)
 # Trash tests/test-run after.
@@ -12,10 +12,10 @@ EXT = ROOT + "/extension"
 RUN = HERE + "/test-run"
 PROF, FIX, OUT = RUN + "/prof-site", RUN + "/site", RUN + "/site-out"
 EXT_ID = open(ROOT + "/native/EXTENSION_ID").read().strip()
-PORT = 9339
-CDP_PORT = 9340
+PORT = 9350
+CDP_PORT = 9351
 
-subprocess.run(["pkill", "-f", "test-run/prof"])   # zombie test Braves from a previous run
+subprocess.run(["pkill", "-f", RUN + "/prof"])   # zombie test Braves from a previous run
 
 os.makedirs(FIX, exist_ok=True)
 os.makedirs(OUT, exist_ok=True)
@@ -72,10 +72,10 @@ try:
         ctx.new_cdp_session(pop).send("Browser.setDownloadBehavior", {"behavior": "default"})
         pop.goto(f"chrome-extension://{EXT_ID}/popup.html"); pop.wait_for_timeout(2000)
 
-        def batch(mode, max_pages, forget=False):
+        def batch(mode, max_pages, forget=False, follow=True):
             if forget:
                 pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
-            items = [{"url": start, "site": True, "mode": mode, "maxPages": max_pages}]
+            items = [{"url": start, "site": True, "mode": mode, "maxPages": max_pages, "follow": follow}]
             r = pop.evaluate("async a => await chrome.runtime.sendMessage({type:'download', kind:'site', dest:a.dest, prefix:'', items:a.items})",
                               {"dest": OUT, "items": items})
             for _ in range(600):
@@ -89,15 +89,10 @@ try:
         check("pdf crawl: none failed", pr["failed"], 0)
         if pr["failed"]:
             print("   progress.error:", pr.get("error"))
-        f1 = OUT + "/127.0.0.1.pdf"
-        check("first PDF exists", os.path.exists(f1), True)
-        if not ensure_pypdf():
-            fails += 1
-            print("FAIL pypdf still not importable after install attempt — cannot verify PDF page counts")
-        else:
-            import pypdf
-            if os.path.exists(f1):
-                check("first PDF has 4 pages", len(pypdf.PdfReader(f1).pages), 4)
+        d1 = OUT + "/127.0.0.1"
+        check("follow-links crawl: one PDF per page, named by title (never 001.pdf)",
+              sorted(os.listdir(d1)) if os.path.isdir(d1) else None, ["Docs Home.pdf", "Page A.pdf", "Page B.pdf", "Page C.pdf"])
+        check("a crawl-progress badge never lingers", pr.get("crawl"), None)
 
         # 2. Markdown crawl, maxPages 50 -> one .md with all four titles in crawl order, no leaked external domain
         r2, pr2 = batch("md", 50)
@@ -112,20 +107,23 @@ try:
             check("titles appear in crawl order (index, a, b, c)", offsets, sorted(offsets))
             check("external domain text never leaked into the file", "example.invalid" in md, False)
 
-        # 3. maxPages 2, after forgetSaved -> a NEW file (127.0.0.1.pdf from #1 is still on disk), 2 pages
+        # 3. maxPages 2, after forgetSaved -> a NEW folder (127.0.0.1 is still on disk), 2 pages
         r3, pr3 = batch("pdf", 2, forget=True)
         check("maxPages=2 crawl queued", r3, {"queued": 1, "skipped": 0, "unusable": 0})
         check("maxPages=2 crawl: none failed", pr3["failed"], 0)
-        f2 = OUT + "/127.0.0.1 (2).pdf"
-        check("second PDF exists (never overwrote the first)", os.path.exists(f2), True)
-        if os.path.exists(f2) and "pypdf" in sys.modules:
-            check("second PDF has 2 pages", len(pypdf.PdfReader(f2).pages), 2)
+        d2 = OUT + "/127.0.0.1 (2)"
+        check("second folder (never overwrote the first), 2 pages", sorted(os.listdir(d2)) if os.path.isdir(d2) else None, ["Docs Home.pdf", "Page A.pdf"])
 
-        # 4. rerun of check 1 verbatim, no forgetSaved -> deduped against #3's still-on-disk file, no third file
+        # 4. rerun of check 1 verbatim, no forgetSaved -> deduped against the still-on-disk folder
         r4, pr4 = batch("pdf", 50)
         check("rerun of check 1 is deduped, not a new crawl", r4, {"queued": 0, "skipped": 1, "unusable": 0})
-        check("still only two PDFs on disk", sorted(os.path.basename(f) for f in glob.glob(OUT + "/127.0.0.1*.pdf")),
-              ["127.0.0.1 (2).pdf", "127.0.0.1.pdf"])
+
+        # 5. "This page only" (no follow): exactly the start page, as <title>.pdf; a second run never overwrites
+        r5, pr5 = batch("pdf", 50, forget=True, follow=False)
+        check("this-page-only crawl queued, none failed", [r5, pr5["failed"]], [{"queued": 1, "skipped": 0, "unusable": 0}, 0])
+        check("Docs Home.pdf saved beside the folders", sorted(os.path.basename(f) for f in glob.glob(OUT + "/*.pdf")), ["Docs Home.pdf"])
+        batch("pdf", 50, forget=True, follow=False)
+        check("second page-only run -> (2)", sorted(os.path.basename(f) for f in glob.glob(OUT + "/*.pdf")), ["Docs Home (2).pdf", "Docs Home.pdf"])
 
         b.close()
 finally:
