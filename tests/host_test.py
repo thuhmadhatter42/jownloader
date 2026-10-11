@@ -7,6 +7,8 @@ BROWSER_ENV = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]}   # how Brav
 # the interpreter the browser's PATH resolves (Xcode CLT python3) — proves the host re-execs into the venv itself
 BOOT_PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
 fails = 0
+def engine_audio_args(mp3):   # the literal contract: default = no conversion, mp3 = V0
+    return ["-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"] if mp3 else ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "best"]
 def check(label, got, want):
     global fails
     ok = got == want; fails += not ok
@@ -148,9 +150,16 @@ try:
     DRY = {**BROWSER_ENV, "JOWNLOADER_DRYRUN": "1"}
     meta = {"title": "T", "artists": "A", "number": 7, "total": 12, "duration_ms": 1000, "url": "https://open.spotify.com/track/abc", "folder": "My List"}
     r = call_port({"cmd": "fetch", "id": "f1", "url": meta["url"], "mode": "audio", "dst": d, "meta": meta, "analyze": True}, env=DRY)
-    check("fetch spotify: analyze=true, folder and number reach the engine", r.get("output"), 'dry-run {"analyze": true, "folder": "My List", "number": 7}')
+    check("fetch spotify: analyze=true, folder and number reach the engine", r.get("output"), 'dry-run {"analyze": true, "mp3": false, "args": %s, "folder": "My List", "number": 7}' % json.dumps(engine_audio_args(False)))
     r = call_port({"cmd": "fetch", "id": "f2", "url": meta["url"], "mode": "audio", "dst": d, "meta": meta}, env=DRY)
-    check("fetch spotify: analyze defaults off", r.get("output"), 'dry-run {"analyze": false, "folder": "My List", "number": 7}')
+    check("fetch spotify: analyze defaults off", r.get("output"), 'dry-run {"analyze": false, "mp3": false, "args": %s, "folder": "My List", "number": 7}' % json.dumps(engine_audio_args(False)))
+    r = call_port({"cmd": "fetch", "id": "f2b", "url": meta["url"], "mode": "audio", "dst": d, "meta": meta, "mp3": True}, env=DRY)
+    check("fetch spotify: mp3=true reaches the engine with the conversion args", r.get("output"), 'dry-run {"analyze": false, "mp3": true, "args": %s, "folder": "My List", "number": 7}' % json.dumps(engine_audio_args(True)))
+    yt = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    r = call_port({"cmd": "fetch", "id": "f2c", "url": yt, "mode": "audio", "dst": d}, env=DRY)
+    check("fetch single-link audio: default = AAC as delivered, no conversion args", json.loads(r["output"][len("dry-run "):]), {"mp3": False, "args": engine_audio_args(False)})
+    r = call_port({"cmd": "fetch", "id": "f2d", "url": yt, "mode": "audio", "dst": d, "mp3": True}, env=DRY)
+    check("fetch single-link audio: mp3=true -> MP3 V0 conversion args", json.loads(r["output"][len("dry-run "):]), {"mp3": True, "args": engine_audio_args(True)})
     r = call_port({"cmd": "fetch", "id": "f3", "url": meta["url"], "mode": "audio", "dst": d}, env=DRY)
     check("fetch spotify without a list entry fails loud", [r.get("ok"), "list" in r.get("output", "")], [False, True])
 
@@ -176,6 +185,21 @@ try:
     check("match: queries run full, then audio, then short", engine.spotify_queries({"title": "Song (feat. X) - Remastered", "artists": "A, B"}), ["A, B - song", "A song audio", "A song"])
     check("sites: spotify routes to its engine branch", [engine.site_of("https://open.spotify.com/album/x"), engine.site_of("https://open.spotify.com/intl-es/track/x"), engine.site_of("https://open.spotify.com/user/x")], ["spotify", "spotify", None])
 
+    # the args that reach yt-dlp, both download paths, default and mp3 (yt-dlp itself stubbed)
+    seen = []
+    orig_yt = engine._yt
+    engine._yt = lambda *a: (seen.append(list(a)) or (0, "", ""))
+    for mp3 in (False, True):
+        seen.clear(); engine._yt_download_native("https://example.test/v", d + "/x.%(ext)s", [], mp3)
+        a = seen[0]; has_conv = "mp3" in a or "--audio-quality" in a
+        check(f"_yt_download_native mp3={mp3}: conversion args {'present' if mp3 else 'absent'}", [has_conv, a[a.index("--audio-format") + 1]], [mp3, "mp3" if mp3 else "best"])
+        seen.clear(); engine._yt_download("https://example.test/v", "audio", d + "/x.%(ext)s", [], mp3)
+        a = seen[0]
+        check(f"_yt_download audio mp3={mp3}: conversion args {'present' if mp3 else 'absent'}", [("--audio-quality" in a), a[a.index("--audio-format") + 1], a[a.index("-f") + 1]], [mp3, "mp3" if mp3 else "best", "bestaudio/best" if mp3 else "bestaudio[ext=m4a]/bestaudio"])
+    seen.clear(); engine._yt_download("https://example.test/v", "video", d + "/x.%(ext)s", [], True)
+    check("_yt_download video: the mp3 flag never touches video", "--audio-format" in seen[0], False)
+    engine._yt = orig_yt
+
     # the file side needs mutagen (native/.venv): tags written into a real m4a, never overwritten
     if os.path.exists(venv_py) and subprocess.run([venv_py, "-c", "import mutagen"], capture_output=True).returncode == 0:
         sp = os.path.join(d, "sp"); os.makedirs(sp)
@@ -194,6 +218,25 @@ print(json.dumps([note, f["\\xa9nam"], f["\\xa9ART"], f["\\xa9alb"], f["trkn"], 
         check("tags: title, artist, album, track n/total, year, cover in an m4a, still AAC",
               json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else out.stderr[-300:],
               ["", ["Song"], ["A, B"], ["Alb"], [[3, 12]], ["1975-11-21"], True, "mp4a.40.2"])
+        if shutil.which("ffmpeg"):
+            subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-c:a", "libmp3lame", "-q:a", "0", sp + "/s.mp3"], check=True)
+            probe3 = """
+import sys, json; sys.path.insert(0, sys.argv[1]); import engine
+from mutagen.id3 import ID3
+m = {"title": "Song", "artists": "A, B", "album": "Alb", "number": 3, "total": 12}
+cover = open(sys.argv[2] + "/c.jpg", "rb").read()
+note = engine.spotify_tag(sys.argv[2] + "/s.mp3", m, cover, "1975-11-21")
+f = ID3(sys.argv[2] + "/s.mp3")
+print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["TRCK"]), str(f["TDRC"]), len(f.getall("APIC")[0].data) > 100]))
+"""
+            out = subprocess.run([venv_py, "-c", probe3, os.path.join(os.path.dirname(HERE), "native"), sp], capture_output=True, text=True)
+            check("tags (mp3 switch): ID3 title, artist, album, track n/total, year, cover in an .mp3",
+                  json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else out.stderr[-300:],
+                  ["", "Song", "A, B", "Alb", "3/12", "1975-11-21", True])
+            os.makedirs(sp + "/Mp3 List")
+            open(sp + "/Mp3 List/03 - A, B - Song.mp3", "w").write("x")
+            r = engine.spotify_track({"title": "Song", "artists": "A, B", "number": 3, "total": 12, "folder": "Mp3 List", "url": "https://open.spotify.com/track/x"}, sp, False, True)
+            check("an existing .mp3 counts as the song too (matching ignores the extension), mp3 on or off", [r.get("ok"), r.get("skipped")], [True, 1])
         os.makedirs(sp + "/My List")
         open(sp + "/My List/03 - A, B - Song (71 BPM A# D# Cm).m4a", "w").write("x")
         r = engine.spotify_track({"title": "Song", "artists": "A, B", "number": 3, "total": 12, "folder": "My List", "url": "https://open.spotify.com/track/x"}, sp)
@@ -308,6 +351,23 @@ print(json.dumps([note, f["\\xa9nam"], f["\\xa9ART"], f["\\xa9alb"], f["trkn"], 
     check("no pypdf: one PDF per page named by title, never 001.pdf", sorted(os.listdir(fb + "/docs.example.org")), ["Guide: Part 1.pdf", "Intro - Start.pdf", "docs.example.org page 3.pdf"])
     check("no pypdf: reply says so", "pypdf not installed" in (r[-1].get("output") or ""), True)
     check("no pypdf: page content intact", open(fb + "/docs.example.org/Intro - Start.pdf", "rb").read(), b"%PDF-1.4 page0")
+
+    # a venv built on the SAME interpreter the browser launches (Apple's python3): the venv's python3 then
+    # realpaths to the launching binary, so an executable comparison never re-execs. Fresh venv in a temp
+    # dir + a copy of the host, launched with the browser's env; sys.prefix must land inside the venv.
+    # JOWN_HOST_UNDER_TEST overrides the host file (used to show this FAILS on the old code).
+    ap = os.path.join(d, "applevenv"); os.makedirs(ap)
+    for f in ("jownloader_host.py", "engine.py", "analyze.py", "deps.sh"):
+        shutil.copy(os.path.join(os.path.dirname(HOST), f), ap)
+    if os.environ.get("JOWN_HOST_UNDER_TEST"): shutil.copy(os.environ["JOWN_HOST_UNDER_TEST"], os.path.join(ap, "jownloader_host.py"))
+    mk = subprocess.run([BOOT_PY, "-m", "venv", os.path.join(ap, ".venv")], capture_output=True, text=True, env=BROWSER_ENV)
+    if mk.returncode == 0:
+        cp = subprocess.run([BOOT_PY, os.path.join(ap, "jownloader_host.py"), "--deps"], capture_output=True, text=True, env=BROWSER_ENV, timeout=60)
+        info = json.loads(cp.stdout)
+        check("venv built on the launching python: host re-execs into it (python = venv's)", os.path.realpath(os.path.dirname(info.get("python", "/"))), os.path.realpath(os.path.join(ap, ".venv", "bin")))
+        check("venv built on the launching python: sys.prefix is the venv", os.path.realpath(info.get("prefix") or "/none"), os.path.realpath(os.path.join(ap, ".venv")))
+    else:
+        print("skip same-interpreter venv check (could not build a venv from " + BOOT_PY + ")")
 finally:
     shutil.rmtree(d)
 print("ALL GREEN" if not fails else f"{fails} FAILED")

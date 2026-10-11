@@ -24,9 +24,10 @@ with the browser session; this side only writes them.
      Several pages -> merged with pypdf into one PDF named after the first page's title (else dst/<name>.pdf).
      No pypdf (or "split") -> one PDF per page named by its title in dst/<name>/ (never 001.pdf).
      Never overwrites: name (2).pdf.
-  {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
+  {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?, "mp3"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
-     port keeps streaming other files meanwhile. mode "video" | "audio".
+     port keeps streaming other files meanwhile. mode "video" | "audio". Audio is the upload's AAC saved
+     as delivered (.m4a); "mp3": true converts it to MP3 V0 instead (single links and Spotify songs alike).
      A Spotify track also carries "meta" ({title, artists, album, number, total, duration_ms, cover, url,
      folder}) and "analyze": true|false (BPM/key into the name): the host matches it to an upload and saves
      <dst>/<folder>/NN - Artists - Title.m4a (AAC as the upload has it, never re-encoded), tagged.
@@ -60,16 +61,26 @@ One-shot (sendNativeMessage, own process each):
   {"cmd": "deps"} -> {"ok", "deps": {"yt-dlp"|"ffmpeg"|"gallery-dl"|"exiftool"|"pypdf"|"analyzer":
                                       {"present": bool, "version": str}}, "python": str}
      fast presence + version check of the six things native/deps.sh installs. Never installs anything.
-     "python" is sys.executable, so the popup/tests can see which interpreter answered.
+     "python" is sys.executable and "prefix" is sys.prefix (the venv dir when re-exec worked), so the
+     popup/tests can see which interpreter answered.
 """
 import base64, importlib.metadata, importlib.util, json, os, re, shutil, struct, subprocess, sys, threading
 
 # Re-exec into native/.venv (deps.sh's ensure_venv) before any third-party import or stdin read: the
 # shebang above is only the bootstrap (Brave launches us with PATH=/usr/bin:/bin -> Xcode CLT python3),
-# and library deps (pypdf, the BPM/key analyzer) live only in the venv. Compare realpaths since the
-# venv's python3 is itself a symlink.
-_VENV_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv", "bin", "python3")
-if os.path.exists(_VENV_PY) and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY):
+# and library deps (pypdf, the BPM/key analyzer) live only in the venv. Compare prefixes, never
+# executables: the venv's python3 is a symlink to whatever built it, and when that is the very python3
+# the browser launched us with the executables' realpaths match even though we are outside the venv.
+# Inside a venv sys.prefix is the venv dir, whatever interpreter it links to.
+_VENV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".venv")
+_VENV_PY = os.path.join(_VENV_DIR, "bin", "python3")
+
+
+def _in_venv():
+    return os.path.realpath(sys.prefix) == os.path.realpath(_VENV_DIR)
+
+
+if os.path.exists(_VENV_PY) and not _in_venv():
     os.execv(_VENV_PY, [_VENV_PY, *sys.argv])
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -116,7 +127,7 @@ def fetch_async(msg):
     def run():
         try:
             r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "",
-                             msg.get("meta") or None, bool(msg.get("analyze")))
+                             msg.get("meta") or None, bool(msg.get("analyze")), bool(msg.get("mp3")))
         except Exception as e:
             r = {"ok": False, "output": str(e)}
         r["id"] = msg.get("id")
@@ -212,7 +223,7 @@ def setup_async(msg):
         # Re-check in a fresh venv-interpreter subprocess whenever the venv exists and this process
         # isn't already it; fall back to the in-process check on any error (e.g. venv missing).
         missing, python = None, sys.executable
-        if os.path.exists(_VENV_PY) and os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY):
+        if os.path.exists(_VENV_PY) and not _in_venv():
             try:
                 cp = subprocess.run([_VENV_PY, os.path.abspath(__file__), "--deps"],
                                      capture_output=True, text=True, timeout=60)
@@ -535,7 +546,7 @@ def serve():
         elif msg.get("cmd") == "rename":
             send(rename(msg))
         elif msg.get("cmd") == "deps":
-            send({"ok": True, "deps": check_deps(), "python": sys.executable})
+            send({"ok": True, "deps": check_deps(), "python": sys.executable, "prefix": sys.prefix})
         else:
             send({"ok": False, "output": "unknown cmd"})
 
@@ -546,6 +557,6 @@ if __name__ == "__main__":
         # block above already ran by this point, so this always prints from native/.venv when it
         # exists — even when *this* process itself was launched too early to have re-execed (the
         # port process that received "setup" started before ensure_deps had created the venv).
-        print(json.dumps({"deps": check_deps(), "python": sys.executable}))
+        print(json.dumps({"deps": check_deps(), "python": sys.executable, "prefix": sys.prefix}))
         sys.exit(0)
     main()

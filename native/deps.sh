@@ -60,6 +60,41 @@ numba_imports() {
     "$VENV_PY" -c "import numba" 2>/dev/null
 }
 
+# brew first; when brew cannot install it (e.g. a macOS release brew no longer ships bottles for, where
+# yt-dlp's dependencies want full Xcode) fall back to pipx if there is one. Never dies under `set -e`:
+# a tool that stays missing is reported, and the host's own checks show it in the popup.
+install_tool() {
+    local tool="$1"
+    if brew install "$tool"; then return 0; fi
+    if command -v pipx &>/dev/null && { [ "$tool" = yt-dlp ] || [ "$tool" = gallery-dl ]; }; then
+        echo "  brew could not install $tool — trying pipx..."
+        if pipx install "$tool"; then
+            [ -d "$HOME/.local/bin" ] && export PATH="$HOME/.local/bin:$PATH"
+            return 0
+        fi
+    fi
+    echo "  could not install $tool — install it by hand, then rerun"
+    return 0
+}
+
+# The python that actually runs gallery-dl: its shebang when that is a real interpreter; a pipx shim whose
+# shebang is /bin/sh resolves to the gallery-dl venv's python (pipx's own venv list, else the default paths).
+gallery_dl_interp() {
+    local gdl interp venvs v
+    gdl="$(command -v gallery-dl)" || return 0
+    interp="$(head -1 "$gdl" 2>/dev/null | sed 's|^#!||' | awk '{print $1}')"
+    case "$interp" in
+        /bin/sh|/bin/bash|/usr/bin/env|"")
+            venvs=""
+            command -v pipx &>/dev/null && venvs="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null)"
+            for v in "$venvs" "$HOME/Library/Application Support/pipx/venvs" "$HOME/.local/pipx/venvs"; do
+                if [ -n "$v" ] && [ -x "$v/gallery-dl/bin/python" ]; then echo "$v/gallery-dl/bin/python"; return 0; fi
+            done
+            return 0 ;;
+    esac
+    echo "$interp"
+}
+
 # Installs whatever is missing. Prints nothing when everything is present.
 ensure_deps() {
     ensure_venv
@@ -77,7 +112,7 @@ ensure_deps() {
     for tool in yt-dlp ffmpeg gallery-dl exiftool; do
         if ! command -v "$tool" &>/dev/null; then
             echo "▸ Installing $tool..."
-            brew install "$tool"
+            install_tool "$tool"
         fi
     done
 
@@ -96,13 +131,12 @@ ensure_deps() {
 
     # Instagram's best-quality video comes through a DASH manifest that gallery-dl hands to yt-dlp by
     # IMPORT, not by running the binary; without it videos still download, at the lower 720p copy.
-    local gdl interp
-    gdl="$(command -v gallery-dl)"
-    interp="$(head -1 "$gdl" 2>/dev/null | sed 's|^#!||' | awk '{print $1}')"
+    local interp
+    interp="$(gallery_dl_interp)"
     if [ -n "$interp" ] && [ -x "$interp" ] && ! "$interp" -c "import yt_dlp" &>/dev/null; then
         echo "▸ Adding yt-dlp to gallery-dl for best-quality Instagram video..."
         if command -v pipx &>/dev/null && pipx list 2>/dev/null | grep -q gallery-dl; then
-            pipx inject gallery-dl yt-dlp
+            pipx inject gallery-dl yt-dlp || echo "  (skipped — Instagram videos download at 720p)"
         else
             "$interp" -m pip install --quiet yt-dlp 2>/dev/null || echo "  (skipped — Instagram videos download at 720p)"
         fi

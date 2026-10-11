@@ -44,7 +44,7 @@ async function refresh() {
   if (!scan) { $("host").textContent = "can't read this page"; return; }
   $("host").textContent = scan.host;
   const eng = engineOf(tab.url);
-  $("site").hidden = !eng?.what; $("siteAudio").hidden = eng?.site !== "youtube" || !eng.what;
+  $("site").hidden = !eng?.what; $("siteAudio").hidden = eng?.site !== "youtube" || !eng.what; $("mp3Row").hidden = $("siteAudio").hidden;
   if (eng?.what) $("site").textContent = `Download ${eng.what}`;
   const isHttp = /^https?:\/\//i.test(tab.url || "");
   $("sitePdf").hidden = $("siteMd").hidden = !isHttp;
@@ -153,6 +153,11 @@ $("destClear").onclick = async () => { await chrome.runtime.sendMessage({ type: 
 chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.dest) { destPath = ch.dest.newValue || ""; showDest(); } });
 for (const k of ["autoVideos", "showButton", "collect", "strip"]) $(k).onchange = () => chrome.storage.sync.set({ [k]: $(k).checked });
 $("webp").onchange = () => chrome.storage.sync.set({ webp: $("webp").value });
+// "Download audio as MP3" lives twice (the Spotify block and under Audio only); both are the one `mp3` key
+const mp3Boxes = [...document.querySelectorAll("input.mp3")];
+chrome.storage.sync.get({ mp3: false }, (s) => { for (const b of mp3Boxes) b.checked = !!s.mp3; });
+for (const b of mp3Boxes) b.onchange = () => { for (const o of mp3Boxes) o.checked = b.checked; chrome.storage.sync.set({ mp3: b.checked }); };
+chrome.storage.onChanged.addListener((ch, area) => { if (area === "sync" && ch.mp3) for (const b of mp3Boxes) b.checked = !!ch.mp3.newValue; });
 
 // ---------- batch rename tab ----------
 // Selected files live in the background (the popup closes when Finder opens); one Finder window at a time

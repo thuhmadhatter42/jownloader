@@ -47,12 +47,14 @@
     <div id="spLibs"></div>
     <div class="row"><button id="spLibAdd" class="dest" title="a folder holding one sub-folder per list; songs found there are skipped, never copied">+ add a library folder…</button></div>
     <label><span>BPM + key in the names<small>detected from the saved file (read-only), added to each song's name</small></span><input type="checkbox" id="spBpm"></label>
+    <label><span>Download audio as MP3<small>off = the AAC saved exactly as delivered (.m4a); on = converted to MP3 (V0), tagged</small></span><input type="checkbox" id="spMp3" class="mp3"></label>
   </div>
   <div class="tabs"><button id="tabDl" class="on">Video / Images</button><button id="tabPdf">PDF</button><button id="tabTools">Extra tools</button></div>
   <div id="paneDl">
   <div class="row"><input id="prefix" placeholder="name → name_1, _2… ([yy-mm-dd] = upload date)"></div>
   <button id="site" hidden>Download from this page</button>
-  <button id="siteAudio" hidden title="best audio as MP3, BPM and key detected and put in the name">Audio only → MP3 + BPM/key</button>
+  <button id="siteAudio" hidden title="the audio as delivered (AAC .m4a), BPM and key detected and put in the name">Audio only + BPM/key</button>
+  <label id="mp3Row" hidden><span>Download audio as MP3<small>off = the AAC saved exactly as delivered (.m4a); on = converted to MP3 (V0)</small></span><input type="checkbox" id="siteMp3" class="mp3"></label>
   <button id="imgs" disabled>Download all images</button>
   <button id="vids" disabled>Download all videos</button>
   <div class="row"><button id="coll" disabled>Download collected (0)</button><button id="collClear" class="x" title="forget the collected list" hidden>×</button></div>

@@ -4,18 +4,19 @@
 The extension fetches ordinary files itself. For sites that hide their media behind a player API
 (YouTube, Instagram, Twitter/X) it hands the page URL to this module instead, and the host runs it:
 
-  fetch(url, mode, outdir)   mode "video" (default) or "audio" (MP3 + BPM/key in the name)
+  fetch(url, mode, outdir)   mode "video" (default) or "audio" (AAC as delivered, MP3 V0 with mp3=True; BPM/key in the name)
       youtube.com / youtu.be   -> yt-dlp; video = H.264 + AAC in .mp4 (QuickTime-native — a naive
                                   bestvideo+bestaudio yields VP9/Opus that QuickTime cannot decode);
-                                  audio = best audio -> .mp3, analysed (analyze.py) and renamed
-                                  "Title (BPM key1 key2 key3).mp3", link logged to "(y-m-d) Youtube DL LINKS.txt"
+                                  audio = the upload's own AAC saved as-is (.m4a, never re-encoded; Opus stays
+                                  Opus), or MP3 V0 when mp3=True; analysed (analyze.py) and renamed
+                                  "Title (BPM key1 key2 key3).m4a", link logged to "(y-m-d) Youtube DL LINKS.txt"
       instagram.com            -> gallery-dl (gallery-dl.conf): a post/reel = every photo and video in it,
                                   a profile = posts, reels, highlights, avatar, into <username>/ as
                                   <username>-<mon-dd-yy>-<NN>.<ext>; 1080p DASH video via yt-dlp, VP9 -> H.264
       twitter.com / x.com      -> gallery-dl: a tweet = its media, a profile = its media timeline, into <name>/
       open.spotify.com         -> a track / album / playlist / artist link: spotify_list() reads the public embed page
                                   (no sign-in) into a track list; each track is matched to the best upload by length
-                                  + title (spotify_match), its audio saved as-is (AAC .m4a, never re-encoded) as
+                                  + title (spotify_match), its audio saved as-is (AAC .m4a, never re-encoded; .mp3 when mp3=True) as
                                   <list name>/NN - Artists - Title.m4a and tagged (title, artist, album, number, cover)
   finish(paths, strip, webp)  strip = remove all metadata (images: exiftool -all=; audio/video: ffmpeg -map_metadata -1,
                                streams copied); webp = "jpg" | "png": WebP -> JPEG (quality 100) or PNG (sips)
@@ -23,7 +24,7 @@ The extension fetches ordinary files itself. For sites that hide their media beh
 Sign-in: the browser session is read from the cookie stores on this Mac (Brave first, then Chrome,
 Firefox, Safari …) — nothing is asked for and nothing leaves the machine.
 Every function returns plain dicts and never raises; messages are plain English for the popup.
-Usage from a shell (for tests): python3 engine.py <url> [out-dir] [video|audio]
+Usage from a shell (for tests): python3 engine.py <url> [out-dir] [video|audio] [--mp3]
 """
 
 import json
@@ -116,10 +117,21 @@ def _yt_info(url, extra):
         return None, (out + err).splitlines()
 
 
-def _yt_download(url, mode, outtmpl, extra):
+# Audio, two ways. Default: the upload's own audio exactly as delivered (AAC in .m4a when there is one, else
+# the best stream in its own container, e.g. Opus) - extracted/remuxed only, never re-encoded. mp3 switch on:
+# converted to MP3 V0.
+AUDIO_ARGS = ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "best"]
+AUDIO_ARGS_MP3 = ["-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
+
+
+def audio_args(mp3=False):
+    return list(AUDIO_ARGS_MP3 if mp3 else AUDIO_ARGS)
+
+
+def _yt_download(url, mode, outtmpl, extra, mp3=False):
     """Returns (success, path_or_none, error_lines). Success = yt-dlp exited 0."""
     if mode == "audio":
-        args = ["-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"]
+        args = audio_args(mp3)
     else:
         args = ["-f", YT_VIDEO_FORMAT, "--merge-output-format", "mp4"]
     code, out, err = _yt(*args, "-o", outtmpl, "--no-playlist", "--quiet", "--no-progress",
@@ -171,7 +183,7 @@ def _analyze(path):
     return lines[0], keys
 
 
-def youtube(url, mode, outdir):
+def youtube(url, mode, outdir, mp3=False):
     err = _need("yt-dlp", "ffmpeg")
     if err:
         return {"ok": False, "output": err}
@@ -187,7 +199,7 @@ def youtube(url, mode, outdir):
     outtmpl = str(Path(outdir) / f"{title}.%(ext)s")
     last_err, ok, path = [], False, None
     for extra in [working] + [s for s in YT_STRATEGIES if s != working]:
-        ok, path, last_err = _yt_download(url, mode, outtmpl, extra)
+        ok, path, last_err = _yt_download(url, mode, outtmpl, extra, mp3)
         if ok:
             break
     if not ok:
@@ -408,10 +420,11 @@ def _fetch_bytes(url, limit=15_000_000):
         return resp.read(limit)
 
 
-def _yt_download_native(url, outtmpl, extra):
+def _yt_download_native(url, outtmpl, extra, mp3=False):
     """Audio exactly as the upload carries it: AAC in .m4a when there is one, else the best audio stream
-    in its own container (Opus -> .opus, a stream copy). Never an --audio-format conversion."""
-    code, out, err = _yt("-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "best", "-o", outtmpl,
+    in its own container (Opus -> .opus, a stream copy). Never an --audio-format conversion - unless the
+    mp3 switch is on, which converts to MP3 V0."""
+    code, out, err = _yt(*audio_args(mp3), "-o", outtmpl,
                          "--no-playlist", "--quiet", "--no-progress", "--print", "after_move:filepath", *extra, url)
     if code != 0:
         return False, None, (out + err).splitlines()
@@ -467,6 +480,25 @@ def spotify_tag(path, meta, cover=None, year=""):
                 pic.type, pic.mime, pic.data = 3, "image/png" if is_png else "image/jpeg", cover
                 f["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
             f.save()
+        elif ext == ".mp3":
+            from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TRCK, TDRC, APIC
+            try:
+                f = ID3(str(p))
+            except ID3NoHeaderError:
+                f = ID3()
+            f.delall("TIT2"); f.delall("TPE1")
+            f.add(TIT2(encoding=3, text=meta.get("title") or p.stem))
+            f.add(TPE1(encoding=3, text=meta.get("artists") or ""))
+            if meta.get("album"):
+                f.delall("TALB"); f.add(TALB(encoding=3, text=meta["album"]))
+            if n:
+                f.delall("TRCK"); f.add(TRCK(encoding=3, text=f"{n}/{total}" if total else str(n)))
+            if year:
+                f.delall("TDRC"); f.add(TDRC(encoding=3, text=year))
+            if cover:
+                f.delall("APIC")
+                f.add(APIC(encoding=3, mime="image/png" if is_png else "image/jpeg", type=3, desc="Cover", data=cover))
+            f.save(str(p), v2_version=3)
         else:
             return f"{ext or 'this'} files can't be tagged — saved untagged"
     except Exception as exc:
@@ -594,7 +626,7 @@ def spotify_sync(dst, folder, tracks, libs=(), total=None):
     return {"ok": True, "have": have, "inlib": sorted(inlib), "renamed": renamed, "notes": notes}
 
 
-def spotify_track(meta, outdir, analyze=False):
+def spotify_track(meta, outdir, analyze=False, mp3=False):
     """Download one Spotify track described by meta ({title, artists, album, number, total, duration_ms,
     cover, url, folder}) into outdir/<folder>/NN - Artists - Title.<ext>, tagged. Never overwrites."""
     err = _need("yt-dlp", "ffmpeg")
@@ -621,7 +653,7 @@ def spotify_track(meta, outdir, analyze=False):
     ok, path, last_err = False, None, []
     outtmpl = str(folder / f"{stem}.%(ext)s")
     for extra in _yt_order():
-        ok, path, last_err = _yt_download_native(yt, outtmpl, extra)
+        ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
         if ok:
             _yt_working = extra
             break
@@ -970,21 +1002,23 @@ def finish(paths, strip=False, webp=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════ entry
-def fetch(url, mode="video", outdir="", meta=None, analyze=False):
+def fetch(url, mode="video", outdir="", meta=None, analyze=False, mp3=False):
     outdir = str(Path(outdir or DOWNLOADS).expanduser())
     try:
         os.makedirs(outdir, exist_ok=True)
         site = site_of(url)
         if site == "youtube":
-            return youtube(url, "audio" if mode == "audio" else "video", outdir)
+            if os.environ.get("JOWNLOADER_DRYRUN") and mode == "audio":
+                return {"ok": True, "output": "dry-run " + json.dumps({"mp3": bool(mp3), "args": audio_args(bool(mp3))})}
+            return youtube(url, "audio" if mode == "audio" else "video", outdir, bool(mp3))
         if site in ("instagram", "twitter"):
             return social(site, url, outdir)
         if site == "spotify":
             if not meta:
                 return {"ok": False, "output": "Spotify links go through the list first (spotify_list)"}
             if os.environ.get("JOWNLOADER_DRYRUN"):      # tests: show what reached the engine, touch nothing
-                return {"ok": True, "output": "dry-run " + json.dumps({"analyze": bool(analyze), "folder": meta.get("folder"), "number": meta.get("number")})}
-            return spotify_track(meta, outdir, bool(analyze))
+                return {"ok": True, "output": "dry-run " + json.dumps({"analyze": bool(analyze), "mp3": bool(mp3), "args": audio_args(bool(mp3)), "folder": meta.get("folder"), "number": meta.get("number")})}
+            return spotify_track(meta, outdir, bool(analyze), bool(mp3))
         return {"ok": False, "output": "no engine for this site"}
     except Exception as e:      # never let a site module take the host down
         return {"ok": False, "output": str(e)}
@@ -997,6 +1031,7 @@ if __name__ == "__main__":
     if "--list" in sys.argv:        # engine.py --list <spotify url>  -> the track list as JSON
         print(json.dumps(spotify_list(sys.argv[sys.argv.index("--list") + 1]), indent=1))
         sys.exit(0)
+    MP3 = "--mp3" in sys.argv
     if "--spotify" in sys.argv:     # engine.py --spotify <url> <out-dir> [--bpm]  -> every track of the link
         args = [a for a in sys.argv[1:] if not a.startswith("--")]
         lst = spotify_list(args[0])
@@ -1007,11 +1042,12 @@ if __name__ == "__main__":
         for t in lst["tracks"][: int(os.environ.get("JOWNLOADER_LIMIT", "9999"))]:
             meta = {**t, "total": len(lst["tracks"]), "folder": "" if lst["kind"] == "track" else lst["name"],
                     "album": t["album"] or lst["name"]}
-            res.append(fetch(t["url"], "audio", args[1] if len(args) > 1 else "", meta, "--bpm" in sys.argv))
+            res.append(fetch(t["url"], "audio", args[1] if len(args) > 1 else "", meta, "--bpm" in sys.argv, MP3))
             if len(lst["tracks"]) > 1:
                 time.sleep(SPOTIFY_GAP_S)
         print(json.dumps(res, indent=1))
         sys.exit(0 if all(r.get("ok") for r in res) else 1)
-    r = fetch(sys.argv[1], sys.argv[3] if len(sys.argv) > 3 else "video", sys.argv[2] if len(sys.argv) > 2 else "")
+    pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+    r = fetch(pos[0], pos[2] if len(pos) > 2 else "video", pos[1] if len(pos) > 1 else "", mp3=MP3)
     print(json.dumps(r, indent=1))
     sys.exit(0 if r.get("ok") else 1)

@@ -29,8 +29,10 @@ you already have.
   popup says so). Clear-key AES-128 HLS is handled; DRM is refused.
 - **YouTube, Instagram, Twitter/X** — on those pages the button reads *Download this video / this post /
   everything from @name* and the whole thing comes down through the site's own API with your browser
-  session: YouTube as H.264 + AAC `.mp4` (QuickTime-native), or *Audio only* as `.mp3` with the BPM and
-  top-3 keys detected and written into the name (`Song (128.0 BPM Am C F).mp3`); an Instagram post,
+  session: YouTube as H.264 + AAC `.mp4` (QuickTime-native), or *Audio only*: the upload's AAC
+  saved exactly as delivered (`.m4a`, never re-encoded; Opus stays `.opus`), with the BPM and top-3 keys
+  detected and written into the name (`Song (128.0 BPM Am C F).m4a`) — switch on **Download audio as MP3**
+  (right under the button, and in the Spotify block) to get an MP3 (V0) instead; an Instagram post,
   reel or carousel, or a whole profile (posts, reels, highlights, avatar) into `<username>/`, 1080p
   video converted from VP9 to H.264; a tweet's media or a user's media timeline into `<name>/`.
 - **Strip metadata** switch — EXIF, GPS, XMP and every other tag removed from each file as it is saved
@@ -48,6 +50,8 @@ the upload carries it — AAC in `.m4a`, never re-encoded (if an upload only has
 `.opus`). Files land in one folder per list: `<destination>/<list name>/NN - Artists - Title.m4a`, tagged
 with title, artist, album, track number, release year and the song's own album art. A song nothing
 matches is reported by name and the rest carry on. Songs are fetched one at a time, 20 s apart.
+With **Download audio as MP3** on, songs are converted to MP3 (V0) and tagged with ID3 (title, artist,
+album, track, year, cover) as `.mp3` instead; the switch is shared with the *Audio only* button.
 
 - A playlist longer than the embed page's 100 songs is read off the open page by scrolling it.
 - Run the same list again and only missing songs download; files already in the list's folder are kept
@@ -117,7 +121,7 @@ python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen fo
 python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG / PNG, strip metadata,
                                    # Spotify lists / matching / tags / re-run rules (saved pages in tests/fixtures, no network)
 python3 tests/streams_test_cdp.py  # real Brave: HLS (TS, AES-128, fMP4 + audio group) and DASH joined into .mp4, DRM refused
-python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named .mp3 (network)
+python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named audio file (network)
 python3 tests/site_test_cdp.py     # real Brave: Whole-site crawl (its own local fixture site) → merged PDF and Markdown
 ```
 

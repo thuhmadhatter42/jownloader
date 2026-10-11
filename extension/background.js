@@ -780,7 +780,7 @@ const serial = (fn) => (batchChain = batchChain.then(fn, fn));
 // items: [{url, ctype?, date?}] or plain URLs. onQueued fires with {queued, skipped, unusable} once the
 // batch is deduped, before any bytes move; the popup follows the rest through "progress" messages.
 async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
-  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: "", spotifyBpm: false });
+  const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: "", spotifyBpm: false, mp3: false });
   const dest = opts.dest ?? settings.dest, prefix = opts.prefix ?? settings.prefix;
   const fin = { strip: !!settings.strip, webp: settings.webp === true ? "jpg" : settings.webp || "" };   // finishing steps the host applies to every file
   // dedupe within the batch by canonical URL, and against everything ever saved
@@ -792,7 +792,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
       // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder)
-      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "") : it.engine ? canon(it.url) + "#" + (it.mode || "video") + (it.spotify ? ":" + (it.spotify.folder || "") : "") : canon(it.url);
+      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "") : it.engine ? canon(it.url) + "#" + (it.mode || "video") + (it.spotify ? ":" + (it.spotify.folder || "") : it.mode === "audio" && settings.mp3 ? "-mp3" : "") : canon(it.url);
       if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
       seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
     }
@@ -820,7 +820,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         const j = queue.shift();
         let r;
         try {
-          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; }
