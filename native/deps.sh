@@ -26,6 +26,20 @@ load_brew() {
 # essentia/librosa) over the browser-PATH python3 (Xcode CLT, often years old) — either way, once
 # built, the venv's own interpreter ($VENV_PY) is what every dep install below uses, and what
 # jownloader_host.py re-execs into, so it no longer matters which python3 built it or launched the host.
+APPLE_PY_HINT="BPM/key needs Homebrew Python: brew install python, then Install missing dependencies again"
+
+# True when the venv's base interpreter is Apple's (Xcode CLT / Xcode / /usr/bin): Python 3.9 there.
+venv_is_apple_python() {
+    case "$("$VENV_PY" -c 'import sys; print(getattr(sys, "_base_executable", sys.executable))' 2>/dev/null)" in
+        /Library/Developer/CommandLineTools/*|/Applications/Xcode*|/usr/bin/*) return 0 ;;
+    esac
+    return 1
+}
+
+brew_python_available() {
+    [ -x "$(brew --prefix 2>/dev/null)/bin/python3" ]
+}
+
 ensure_venv() {
     load_brew
     if [ -x "$VENV_PY" ]; then
@@ -33,6 +47,12 @@ ensure_venv() {
         # a venv whose base interpreter was upgraded away (brew python@3.x -> 3.y) is dead: rebuild it
         echo "▸ native/.venv no longer runs (its Python was removed) — rebuilding..."
         [ -n "$DEPS_DIR" ] && mv "$DEPS_DIR/.venv" "$DEPS_DIR/.venv-dead-$(date +%Y%m%d-%H%M%S)"
+    fi
+    # A venv built on Apple's Python (Xcode CLT 3.9) while Homebrew's python3 has since appeared, and no
+    # BPM/key analyzer in it: rebuild on Homebrew's python (the venv's libraries are reinstalled right after).
+    if [ -x "$VENV_PY" ] && venv_is_apple_python && brew_python_available && ! have_essentia && ! have_librosa; then
+        echo "▸ native/.venv was built on Apple's Python and Homebrew's python3 is now available — rebuilding on it..."
+        /usr/bin/trash "$DEPS_DIR/.venv" 2>/dev/null || mv "$DEPS_DIR/.venv" "$DEPS_DIR/.venv-dead-$(date +%Y%m%d-%H%M%S)"
     fi
     local builder
     builder="$(command -v python3 2>/dev/null || true)"
@@ -60,20 +80,92 @@ numba_imports() {
     "$VENV_PY" -c "import numba" 2>/dev/null
 }
 
-# brew first; when brew cannot install it (e.g. a macOS release brew no longer ships bottles for, where
-# yt-dlp's dependencies want full Xcode) fall back to pipx if there is one. Never dies under `set -e`:
-# a tool that stays missing is reported, and the host's own checks show it in the popup.
+# Formulae brew would have to COMPILE to install the given ones (themselves, or any runtime dependency
+# not already installed, that has no bottle for this Mac's macOS). Empty output = everything is a
+# prebuilt download, or brew could not tell (then brew is allowed to try). Source builds are what turned
+# one `brew install yt-dlp` into 31 minutes of llvm on a macOS release Homebrew ships no bottles for
+# (Tier 3), ending in a deno build that needs full Xcode. Uses Homebrew's own bottle tag for this
+# machine (Utils::Bottles.tag) and bottle_specification.tag?, through `brew ruby`
+# (https://docs.brew.sh/Manpage#ruby-options-ruby-file). `brew install --force-bottle` only retries a
+# bottle for the current or newest macOS; brew has no flag that refuses a source build.
+brew_source_builds() {
+    command -v brew &>/dev/null || return 0
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ENV_HINTS=1 brew ruby -e '
+      ARGV.each do |n|
+        begin
+          f = Formulary.factory(n)
+          ([f] + f.recursive_dependencies.map(&:to_formula)).uniq.each do |x|
+            next if x.any_version_installed?
+            puts x.full_name unless x.bottle_specification.tag?(Utils::Bottles.tag, no_older_versions: false)
+          end
+        rescue StandardError
+          next
+        end
+      end' "$@" 2>/dev/null | sort -u | tr '\n' ' '
+}
+
+# One line a person can act on, per tool, when it can't be installed for them.
+manual_install_hint() {
+    case "$1" in
+        yt-dlp|gallery-dl) echo "pipx install $1   (get pipx: python3 -m pip install --user pipx)" ;;
+        ffmpeg)   echo "download a static build from https://ffmpeg.org/download.html, put ffmpeg and ffprobe in /usr/local/bin" ;;
+        exiftool) echo "install the macOS package from https://exiftool.org" ;;
+        *)        echo "see the tool's own website" ;;
+    esac
+}
+
+pipx_install() {
+    pipx install "$1" || return 1
+    [ -d "$HOME/.local/bin" ] && export PATH="$HOME/.local/bin:$PATH"
+    return 0
+}
+
+# yt-dlp and gallery-dl are Python packages: pipx first whenever it exists (prebuilt wheels, nothing to
+# compile, no Xcode); Homebrew only when it does not. Before any brew install, brew_source_builds says
+# whether brew would compile something; if so brew is skipped with a one-line message. Never dies under
+# `set -e`: a tool that stays missing is reported, and the host's own checks show it in the popup.
 install_tool() {
-    local tool="$1"
-    if brew install "$tool"; then return 0; fi
-    if command -v pipx &>/dev/null && { [ "$tool" = yt-dlp ] || [ "$tool" = gallery-dl ]; }; then
-        echo "  brew could not install $tool — trying pipx..."
-        if pipx install "$tool"; then
-            [ -d "$HOME/.local/bin" ] && export PATH="$HOME/.local/bin:$PATH"
+    local tool="$1" py=0 nb
+    { [ "$tool" = yt-dlp ] || [ "$tool" = gallery-dl ]; } && py=1
+    if [ "$py" = 1 ] && command -v pipx &>/dev/null; then
+        if pipx_install "$tool"; then return 0; fi
+        echo "  pipx could not install $tool — trying brew..."
+    fi
+    if command -v brew &>/dev/null; then
+        nb="$(brew_source_builds "$tool")"
+        if [ -n "$nb" ]; then
+            # no pipx and brew would compile: pipx itself is the way in, when it is a prebuilt download
+            if [ "$py" = 1 ] && ! command -v pipx &>/dev/null && [ -z "$(brew_source_builds pipx)" ]; then
+                echo "  no prebuilt $tool for this macOS — installing pipx (prebuilt) to get it..."
+                if brew install pipx && pipx_install "$tool"; then return 0; fi
+            fi
+            echo "  no prebuilt package for this macOS — install $tool by hand: $(manual_install_hint "$tool")"
             return 0
         fi
+        if brew install "$tool"; then return 0; fi
     fi
-    echo "  could not install $tool — install it by hand, then rerun"
+    echo "  could not install $tool — install it by hand: $(manual_install_hint "$tool")"
+    return 0
+}
+
+# Is the tool there the way the host will look for it? Same search path as engine.py: the browser's bare
+# PATH plus Homebrew, /usr/local/bin and ~/.local/bin (pipx).
+tool_present() {
+    PATH="${JOWN_TOOL_PATHS-/opt/homebrew/bin:/usr/local/bin}:$HOME/.local/bin:$PATH" command -v "$1" &>/dev/null
+}
+
+# After installing: what is really there, and how to get what is not. Always returns 0 (the tools are
+# optional); install.sh decides separately whether the host itself can run.
+engine_tools_report() {
+    local have="" miss="" t
+    for t in yt-dlp ffmpeg gallery-dl exiftool; do
+        if tool_present "$t"; then have="${have:+$have, }$t"; else miss="$miss $t"; fi
+    done
+    [ -n "$have" ] && echo "engine tools present: $have"
+    if [ -n "$miss" ]; then
+        echo "engine tools MISSING (what needs them will not work):"
+        for t in $miss; do echo "  $t — $(manual_install_hint "$t")"; done
+    fi
     return 0
 }
 
@@ -151,12 +243,14 @@ ensure_deps() {
            && "$VENV_PY" -c "import essentia.standard" >/dev/null 2>&1; then
             echo "  ✓ essentia (TempoCNN + HPCP)"
         else
-            "$VENV_PY" -m pip uninstall -y essentia-tensorflow >/dev/null 2>&1
+            "$VENV_PY" -m pip uninstall -y essentia-tensorflow >/dev/null 2>&1 || true
             echo "  no essentia build for this Mac — installing librosa instead"
             # --prefer-binary avoids compiling llvmlite from source
-            "$VENV_PY" -m pip install --prefer-binary --quiet librosa >/dev/null 2>&1
+            "$VENV_PY" -m pip install --prefer-binary --quiet librosa >/dev/null 2>&1 || true
             if have_librosa; then
                 echo "  ✓ librosa"
+            elif venv_is_apple_python; then
+                echo "❌ $APPLE_PY_HINT. Downloads still work; no BPM/key tags until then."
             else
                 echo "❌ Neither analyzer installed. Downloads still work; no BPM/key tags."
                 echo "   Try:  brew install llvm   then run native/install.sh again."
@@ -168,7 +262,10 @@ ensure_deps() {
     if ! have_essentia && have_librosa && ! numba_imports; then
         echo "▸ Repairing librosa (numba/numpy mismatch)..."
         "$VENV_PY" -m pip install -U --prefer-binary --quiet numba >/dev/null 2>&1
-        numba_imports || echo "❌ librosa still broken; no BPM/key tags until fixed."
+        if ! numba_imports; then
+            if venv_is_apple_python; then echo "❌ $APPLE_PY_HINT."
+            else echo "❌ librosa still broken; no BPM/key tags until fixed."; fi
+        fi
     fi
 
     chmod +x "$DEPS_DIR"/jownloader_host.py 2>/dev/null
@@ -183,13 +280,16 @@ upgrade_ytdlp() {
     local brew_owned=()
     for t in yt-dlp gallery-dl; do brew list --formula "$t" &>/dev/null && brew_owned+=("$t"); done
     [ "${#brew_owned[@]}" -gt 0 ] && brew upgrade "${brew_owned[@]}" >/dev/null 2>&1
-    command -v pipx &>/dev/null && pipx upgrade --include-injected gallery-dl >/dev/null 2>&1
+    if command -v pipx &>/dev/null; then
+        pipx upgrade yt-dlp >/dev/null 2>&1 || true
+        pipx upgrade --include-injected gallery-dl >/dev/null 2>&1 || true
+    fi
     touch "$STAMP"
 }
 
 # Upgrade if the stamp is missing or older than UPGRADE_EVERY_DAYS.
 maybe_upgrade_ytdlp() {
-    command -v brew &>/dev/null || return
+    command -v brew &>/dev/null || command -v pipx &>/dev/null || return
     if [ ! -f "$STAMP" ] || [ -n "$(find "$STAMP" -mtime +"$UPGRADE_EVERY_DAYS" 2>/dev/null)" ]; then
         upgrade_ytdlp
     fi

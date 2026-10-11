@@ -225,11 +225,13 @@ loadRenameFiles();
 
 // ---------- dependencies ----------
 const DEP_LABEL = { "yt-dlp": "yt-dlp", ffmpeg: "ffmpeg", "gallery-dl": "gallery-dl", exiftool: "exiftool", pypdf: "pypdf", analyzer: "BPM/key analyzer" };
+const hintText = (h) => { const v = Object.values(h || {}); return v.length ? ". " + v.join(". ") : ""; };
 async function showDeps() {
   const r = await chrome.runtime.sendMessage({ type: "deps" }).catch(() => null);
   if (!r?.ok) { $("deps").textContent = "Dependencies: " + (r?.output || "native host not reachable — run native/install.sh"); $("depsInstall").hidden = true; return; }
   const missing = Object.entries(r.deps).filter(([, v]) => !v.present).map(([k]) => k);
   $("deps").textContent = "Dependencies: " + Object.entries(r.deps).map(([k, v]) => (v.present ? "✓ " : "✗ ") + (DEP_LABEL[k] || k)).join("   ");
+  $("deps").title = Object.values(r.hints || {}).join("\n");
   $("depsInstall").hidden = !missing.length;
 }
 $("depsInstall").onclick = async () => {
@@ -238,7 +240,7 @@ $("depsInstall").onclick = async () => {
   const r = await chrome.runtime.sendMessage({ type: "setup" }).catch(() => null);
   $("depsInstall").disabled = false;
   $("status").textContent = r?.ok
-    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}` : "all dependencies installed")
+    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}` : "all dependencies installed")
     : (r?.output || "install failed");
   showDeps();
 };
@@ -247,7 +249,7 @@ showDeps();
 chrome.runtime.sendMessage({ type: "getSetupResult" }).then((r) => {
   if (!r) return;
   $("status").textContent = r.ok
-    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}` : "dependencies installed")
+    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}` : "dependencies installed")
     : (r.output || "dependency install failed");
 }).catch(() => {});
 

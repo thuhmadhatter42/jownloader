@@ -88,7 +88,7 @@ That is what makes "any folder, no dialog" possible; Chrome's own download API c
 
 1. Clone this repo somewhere it can stay (the browser calls the host by absolute path).
 2. `bash native/install.sh` — registers the host with Brave, Chrome and Chromium and installs the
-   engine's tools through Homebrew: `yt-dlp`, `ffmpeg`, `gallery-dl`, `exiftool` and the BPM/key
+   engine's tools: `yt-dlp`, `ffmpeg`, `gallery-dl`, `exiftool` and the BPM/key
    analyzer (`essentia-tensorflow`, or `librosa` where no wheel exists). `--no-deps` skips that part.
    Needs `python3` on the system path; macOS provides it with the Xcode Command Line Tools
    (`xcode-select --install`).
@@ -99,7 +99,20 @@ That is what makes "any folder, no dialog" possible; Chrome's own download API c
 If you move the folder, run `native/install.sh` again. If the host isn't reachable, every file in a
 batch fails with a message saying so; nothing is saved silently anywhere else.
 
-`native/install.sh` registers the host and installs the tools above through Homebrew. After that,
+How the tools are installed: `yt-dlp` and `gallery-dl` through `pipx` when it is installed (prebuilt,
+nothing to compile), otherwise Homebrew. Before any Homebrew install the script asks Homebrew whether
+the formula or one of its dependencies has no prebuilt bottle for your macOS (newer and older macOS
+releases outside Homebrew's support tiers have none, and Homebrew would then compile for a long time
+and may need full Xcode). If so it skips Homebrew and prints a one-line "install it by hand" instruction
+instead (for `yt-dlp` / `gallery-dl` it installs `pipx` first when that is a prebuilt download). The
+last lines of the install list which tools are actually present and which are missing; only a host
+that cannot run (no `native/.venv`) makes the script fail, a missing tool does not. The Python libraries
+and the BPM/key analyzer live in `native/.venv`. If Homebrew's Python is not installed that venv is
+built on Apple's Python 3.9, which works for the PDF and tag libraries and, where wheels exist, the
+analyzer; if the analyzer cannot install there, run `brew install python` and then **Install missing
+dependencies** again (the venv is rebuilt on Homebrew's Python).
+
+`native/install.sh` registers the host and installs the tools above. After that,
 the extension keeps them current on its own: it checks on every install/update and installs anything
 missing automatically (a badge on the icon shows while that runs), and the popup has its own
 "Dependencies" row with a ✓/✗ per tool and an **Install missing dependencies** button for whenever

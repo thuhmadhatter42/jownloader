@@ -205,6 +205,20 @@ def check_deps():
     return out
 
 
+APPLE_PY_HINT = "BPM/key needs Homebrew Python: brew install python, then Install missing dependencies again"
+
+
+def deps_hints(deps):
+    """Why a dependency is missing, when we know. The one known case: the venv runs on Apple's Python 3.9
+    (Xcode Command Line Tools) and has no BPM/key analyzer; the same text deps.sh prints."""
+    hints = {}
+    base = getattr(sys, "_base_executable", sys.executable) or ""
+    apple = base.startswith(("/Library/Developer/CommandLineTools/", "/usr/bin/")) or base.startswith("/Applications/Xcode")
+    if not deps.get("analyzer", {}).get("present") and apple:
+        hints["analyzer"] = APPLE_PY_HINT
+    return hints
+
+
 def setup_async(msg):
     """native/deps.sh's ensure_deps, sourced the way install.sh sources it. brew installs can take
     minutes: its own thread, reply when done (never blocks the port)."""
@@ -222,7 +236,7 @@ def setup_async(msg):
         # in-process check_deps() would see none of what ensure_deps just installed into the venv.
         # Re-check in a fresh venv-interpreter subprocess whenever the venv exists and this process
         # isn't already it; fall back to the in-process check on any error (e.g. venv missing).
-        missing, python = None, sys.executable
+        missing, python, hints = None, sys.executable, {}
         if os.path.exists(_VENV_PY) and not _in_venv():
             try:
                 cp = subprocess.run([_VENV_PY, os.path.abspath(__file__), "--deps"],
@@ -230,11 +244,13 @@ def setup_async(msg):
                 info = json.loads(cp.stdout)
                 missing = [name for name, v in info["deps"].items() if not v["present"]]
                 python = info["python"]
+                hints = info.get("hints", {})
             except Exception:
                 missing = None
         if missing is None:
-            missing = [name for name, info in check_deps().items() if not info["present"]]
-        send({"id": msg.get("id"), "ok": ok, "output": output, "missing": missing, "python": python})
+            cd = check_deps()
+            missing, hints = [name for name, info in cd.items() if not info["present"]], deps_hints(cd)
+        send({"id": msg.get("id"), "ok": ok, "output": output, "missing": missing, "python": python, "hints": hints})
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -546,7 +562,8 @@ def serve():
         elif msg.get("cmd") == "rename":
             send(rename(msg))
         elif msg.get("cmd") == "deps":
-            send({"ok": True, "deps": check_deps(), "python": sys.executable, "prefix": sys.prefix})
+            cd = check_deps()
+            send({"ok": True, "deps": cd, "hints": deps_hints(cd), "python": sys.executable, "prefix": sys.prefix})
         else:
             send({"ok": False, "output": "unknown cmd"})
 
@@ -557,6 +574,7 @@ if __name__ == "__main__":
         # block above already ran by this point, so this always prints from native/.venv when it
         # exists — even when *this* process itself was launched too early to have re-execed (the
         # port process that received "setup" started before ensure_deps had created the venv).
-        print(json.dumps({"deps": check_deps(), "python": sys.executable, "prefix": sys.prefix}))
+        cd = check_deps()
+        print(json.dumps({"deps": cd, "hints": deps_hints(cd), "python": sys.executable, "prefix": sys.prefix}))
         sys.exit(0)
     main()

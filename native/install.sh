@@ -1,6 +1,6 @@
 #!/bin/bash
 # Registers the Jownloader native host with Brave, Chrome and Chromium, and installs the engine's tools
-# (yt-dlp, ffmpeg, gallery-dl, exiftool) through Homebrew — `--no-deps` skips those brew installs (and
+# (yt-dlp, ffmpeg, gallery-dl, exiftool) via pipx / Homebrew (deps.sh) — `--no-deps` skips those installs (and
 # the yt-dlp/gallery-dl upgrade). Rerun if this folder moves.
 # The host is a stdio Python script; the browser launches it with the login PATH (/usr/bin:/bin:…), so
 # python3 must resolve there — macOS provides it with the Xcode Command Line Tools (xcode-select
@@ -36,7 +36,12 @@ source "$HERE/deps.sh"
 if [ "$1" != "--no-deps" ]; then
   ensure_deps
   maybe_upgrade_ytdlp
-  echo "engine tools ready: yt-dlp, ffmpeg, gallery-dl, exiftool"
+  engine_tools_report
 else
   ensure_venv
+fi
+# The only hard failure: the host cannot run without its venv. The engine tools are optional (reported above).
+if [ ! -x "$VENV_PY" ]; then
+  echo "error: native/.venv could not be created — the host cannot run. Check python3 (xcode-select --install) and rerun." >&2
+  exit 1
 fi

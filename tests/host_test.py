@@ -74,6 +74,7 @@ try:
     r = call({"cmd": "deps"})
     names = ["yt-dlp", "ffmpeg", "gallery-dl", "exiftool", "pypdf", "analyzer"]
     check("deps reply ok", r["ok"], True)
+    check("deps reply carries a hints dict (empty unless a known cause)", isinstance(r.get("hints"), dict), True)
     check("deps reply has all six names, each a bool",
           [n in r.get("deps", {}) and isinstance(r["deps"][n].get("present"), bool) for n in names], [True] * 6)
 
