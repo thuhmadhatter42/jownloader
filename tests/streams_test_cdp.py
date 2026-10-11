@@ -2,7 +2,7 @@
 # best variant's segments are fetched (plain TS, AES-128 TS, fMP4 with a separate audio rendition, DASH
 # video+audio), the host joins them with ffmpeg into one .mp4 each, and the saved-URL memory skips a rerun.
 # Run: python3 tests/streams_test_cdp.py     (needs ffmpeg + ffprobe)   Trash tests/test-run after.
-import os, sys, time, json, subprocess, urllib.request, glob, http.server, threading, functools
+import re, os, sys, time, json, subprocess, urllib.request, glob, http.server, threading, functools
 from playwright.sync_api import sync_playwright
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -10,17 +10,30 @@ EXT = ROOT + "/extension"
 RUN = HERE + "/test-run"
 PROF, FIX, OUT = RUN + "/prof-streams", RUN + "/streams", RUN + "/streams-out"
 EXT_ID = open(ROOT + "/native/EXTENSION_ID").read().strip()
-PORT = 9336
+PORT = int(os.environ.get("JOWN_HTTP_PORT", 9336))     # fixture server
+CDP = int(os.environ.get("JOWN_CDP_PORT", 9337))        # Brave's debugging port
 subprocess.run([HERE + "/make_streams.sh", FIX], check=True)
 os.makedirs(OUT, exist_ok=True)
 open(FIX + "/page.html", "w").write("""<!doctype html><title>Stream Page - Test Site</title><video id=v></video><script>
 (async () => { for (const u of ["hls_fmp4/master.m3u8", "hls_fmp4/v1.m3u8", "hls_fmp4/v10.m4s", "dash/stream.mpd", "dash/init-stream0.m4s"]) await fetch(u);
 document.title = "loaded " + document.title; })();</script>""")
-srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), functools.partial(http.server.SimpleHTTPRequestHandler, directory=FIX))
-srv.log_message = lambda *a: None; http.server.SimpleHTTPRequestHandler.log_message = lambda *a: None
+# oneshot*/ playlists (.m3u8/.mpd) are signed-URL style: the first GET of a URL is answered, every later one
+# (whatever its headers, from whoever) is a 403. hits[path] = [answered, refused].
+hits = {}
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/oneshot") and re.search(r"\.(m3u8|mpd)$", path):
+            h = hits.setdefault(path, [0, 0])
+            if h[0]:
+                h[1] += 1; self.send_error(403, "token already used"); return
+            h[0] += 1
+        super().do_GET()
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), functools.partial(Handler, directory=FIX))
 threading.Thread(target=srv.serve_forever, daemon=True).start()
-proc = subprocess.Popen(["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", f"--user-data-dir={PROF}", "--remote-debugging-port=9337",
-    f"--load-extension={EXT}", "--no-first-run", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
+proc = subprocess.Popen(["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", f"--user-data-dir={PROF}", f"--remote-debugging-port={CDP}",
+    f"--load-extension={EXT}", "--block-new-web-contents", "--no-first-run", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 fails = 0
 def check(label, got, want):
@@ -34,14 +47,20 @@ def probe(path):
 base = f"http://127.0.0.1:{PORT}/"
 try:
     for _ in range(60):
-        try: urllib.request.urlopen("http://127.0.0.1:9337/json/version"); break
+        try: urllib.request.urlopen(f"http://127.0.0.1:{CDP}/json/version"); break
         except Exception: time.sleep(0.5)
     with sync_playwright() as p:
-        b = p.chromium.connect_over_cdp("http://127.0.0.1:9337"); ctx = b.contexts[0]
-        pop = ctx.new_page()
+        b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP}"); ctx = b.contexts[0]
+        mine = [0]   # 1 while this harness opens a page itself; any other new target (a pop-up) is closed at once
+        def closer(pg):
+            if not mine[0]:
+                try: pg.close()
+                except Exception: pass
+        ctx.on("page", closer)
+        mine[0] = 1; pop = ctx.new_page(); mine[0] = 0
         ctx.new_cdp_session(pop).send("Browser.setDownloadBehavior", {"behavior": "default"})
         pop.goto(f"chrome-extension://{EXT_ID}/popup.html"); pop.wait_for_timeout(2000)
-        page = ctx.new_page(); page.goto(base + "page.html"); page.wait_for_function("document.title.startsWith('loaded')"); page.wait_for_timeout(800)
+        mine[0] = 1; page = ctx.new_page(); mine[0] = 0; page.goto(base + "page.html"); page.wait_for_function("document.title.startsWith('loaded')"); page.wait_for_timeout(800)
         tab_id = pop.evaluate("async () => (await chrome.tabs.query({url: '*://127.0.0.1/*'}))[0].id")
         cands = pop.evaluate("async id => await chrome.runtime.sendMessage({type:'streamCandidates', tabId:id})", tab_id)
         check("tab's streams = the masters only (variant playlist dropped, segments ignored)", sorted(c["url"].split("/")[-2] + "/" + c["url"].split("/")[-1] for c in cands), ["dash/stream.mpd", "hls_fmp4/master.m3u8"])
@@ -75,6 +94,30 @@ try:
         items = [{"url": base + "drm/index.m3u8", "stream": True}, {"url": base + "drm/stream.mpd", "stream": True}]
         r4, pr4 = batch("jdrm")
         check("DRM streams refused, nothing written", [r4["queued"], pr4["failed"], "DRM" in pr4["error"], glob.glob(OUT + "/jdrm*")], [2, 2, True, []])
+        # one-shot manifests: the page's own player takes the only answer (a fetch() master + its playlists, and an
+        # XHR arraybuffer media playlist, as hls.js does); the extension must save from the copy of what the page
+        # received and never ask the server again (a second GET would be a 403 and a failed save)
+        open(FIX + "/oneshot.html", "w").write("""<!doctype html><title>One Shot</title><script>
+        (async () => { const m = await (await fetch("oneshot_fmp4/master.m3u8")).text();
+          for (const u of m.match(/[\\w.\\/-]+\\.m3u8/g)) await (await fetch("oneshot_fmp4/" + u)).text();
+          await new Promise((ok) => { const x = new XMLHttpRequest(); x.open("GET", "oneshot_ts/index.m3u8"); x.responseType = "arraybuffer"; x.onload = ok; x.send(); });
+          document.title = "loaded " + document.title; })();</script>""")
+        mine[0] = 1; page2 = ctx.new_page(); mine[0] = 0
+        page2.goto(base + "oneshot.html"); page2.wait_for_function("document.title.startsWith('loaded')"); page2.wait_for_timeout(800)
+        check("player took every one-shot playlist once", [len(hits) >= 3, all(v == [1, 0] for v in hits.values())], [True, True])
+        tab2 = pop.evaluate("async () => (await chrome.tabs.query({url: '*://127.0.0.1/oneshot.html'}))[0].id")
+        c2 = pop.evaluate("async id => await chrome.runtime.sendMessage({type:'streamCandidates', tabId:id})", tab2)
+        check("one-shot streams classified (masters offered)", sorted(c["url"].split("/")[-2] for c in c2 if c["url"].endswith("master.m3u8")), ["oneshot_fmp4"])
+        items = [{"url": base + "oneshot_fmp4/master.m3u8", "stream": True}, {"url": base + "oneshot_ts/index.m3u8", "stream": True}]
+        pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+        r5, pr5 = batch("joneshot")
+        check("one-shot batch queued", r5, {"queued": 2, "skipped": 0, "unusable": 0})
+        check("one-shot: both saved, none failed", [pr5["done"], pr5["failed"], pr5["error"]], [2, 0, ""])
+        check("one-shot files named", sorted(os.path.basename(f) for f in glob.glob(OUT + "/joneshot_*")), ["joneshot_1.mp4", "joneshot_2.mp4"])
+        for f in sorted(glob.glob(OUT + "/joneshot_*")):
+            d, st = probe(f)
+            check(f"{os.path.basename(f)}: ~4 s, video + audio", [3.8 <= d <= 4.3, st], [True, ["audio", "video"]])
+        check("extension never asked the server again (0 refused GETs)", sum(v[1] for v in hits.values()), 0)
         b.close()
 finally:
     proc.terminate()

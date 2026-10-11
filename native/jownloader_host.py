@@ -19,9 +19,11 @@ with the browser session; this side only writes them.
      ffmpeg -c copy over the tracks (video, or video + audio) into name.mp4 and removes the temps.
      No ffmpeg on this Mac: one track is kept raw (name.ts / name.mp4), two are saved as
      name.video.* and name.audio.* with "output" saying so.
-  {"cmd": "mergepdf", "id", "ids": [...], "name", "dst"} -> {"id", "ok", "path", "bytes"?, "output"?}
-     merges closed temp-track PDFs (from "open" with "temp": true) in order into dst/name.pdf with
-     pypdf; no pypdf → the per-page PDFs are kept as dst/<name>/001.pdf … and "output" says so.
+  {"cmd": "mergepdf", "id", "ids": [...], "name", "dst", "titles"?: [...], "split"?} -> {"id", "ok", "path", "bytes"?, "output"?}
+     finishes closed temp-track PDFs (from "open" with "temp": true), in order. One page -> dst/<title>.pdf.
+     Several pages -> merged with pypdf into one PDF named after the first page's title (else dst/<name>.pdf).
+     No pypdf (or "split") -> one PDF per page named by its title in dst/<name>/ (never 001.pdf).
+     Never overwrites: name (2).pdf.
   {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio".
@@ -357,48 +359,71 @@ def join(msg):
             "output": note + " — video and audio saved as separate files: " + ", ".join(os.path.basename(o) for o in outs)}
 
 
+def safe_name(title, fallback):
+    """A page title as a filename: path separators and control characters become '-', no leading dot,
+    capped. Colons stay (Portal:Current events)."""
+    t = re.sub(r"[\x00-\x1f\x7f]+", " ", title or "")
+    t = re.sub(r"[/\\]+", "-", t)
+    t = re.sub(r"\s+", " ", t).strip().lstrip(".").strip()[:150].strip()
+    return t or fallback
+
+
 def mergepdf(msg):
-    """Merge the closed temp-track PDFs of a whole-site PDF crawl, in order, into dst/name.pdf."""
+    """Finish a whole-site PDF crawl from its closed temp-track PDFs, in page order.
+    One page -> dst/<title>.pdf. Several pages -> merged into one PDF named after the first page's title
+    (else <name>.pdf); with no pypdf (or "split") one PDF per page, named by title, in dst/<name>/
+    (never 001.pdf). Nothing is overwritten."""
     sid, ids = msg.get("id"), msg.get("ids") or []
     dst = msg.get("dst") or os.path.expanduser("~/Downloads")
     name = os.path.basename(msg.get("name") or "site") or "site"
+    titles = msg.get("titles") or []
     tracks = [TEMP.pop(i) for i in ids if i in TEMP]
     if len(tracks) != len(ids) or not tracks:
         for t in tracks:
             try: os.remove(t)
             except OSError: pass
         return {"id": sid, "ok": False, "output": "track missing"}
-    try:
-        from pypdf import PdfReader, PdfWriter
-    except ImportError:
-        folder = os.path.join(dst, name); i = 2; base = folder
-        while os.path.exists(folder):
-            folder = f"{base} ({i})"; i += 1
-        os.makedirs(folder, exist_ok=True)
-        outs = []
-        for i, t in enumerate(tracks, 1):
-            out = os.path.join(folder, f"{i:03d}.pdf")
-            os.replace(t, out); outs.append(out)
-        return {"id": sid, "ok": True, "path": folder,
-                "output": "pypdf not installed — pages kept separately; run native/install.sh"}
-    out = unique_path(dst, name + ".pdf")
+    title_of = lambda i: safe_name(titles[i] if i < len(titles) else "", f"{name} page {i + 1}")
     try:
         os.makedirs(dst, exist_ok=True)
-        writer = PdfWriter()
-        for t in tracks:
-            reader = PdfReader(t)
-            for page in reader.pages:
-                writer.add_page(page)
-        with open(out + ".jownloading", "wb") as f:
-            writer.write(f)
-        for t in tracks:
-            try: os.remove(t)
+        if len(tracks) == 1:
+            out = unique_path(dst, title_of(0) + ".pdf")
+            os.replace(tracks[0], out)
+            return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
+        try:
+            from pypdf import PdfReader, PdfWriter
+        except ImportError:
+            PdfReader = None
+        if msg.get("split") or PdfReader is None:
+            folder = os.path.join(dst, name); k = 2
+            while os.path.exists(folder):
+                folder = os.path.join(dst, f"{name} ({k})"); k += 1
+            os.makedirs(folder)
+            for i, t in enumerate(tracks):
+                os.replace(t, unique_path(folder, title_of(i) + ".pdf"))
+            r = {"id": sid, "ok": True, "path": folder}
+            if PdfReader is None and not msg.get("split"):
+                r["output"] = "pypdf not installed — pages kept separately; run native/install.sh"
+            return r
+        first = safe_name(titles[0] if titles else "", "")
+        out = unique_path(dst, (first or name) + ".pdf")
+        try:
+            writer = PdfWriter()
+            for t in tracks:
+                for page in PdfReader(t).pages:
+                    writer.add_page(page)
+            with open(out + ".jownloading", "wb") as f:
+                writer.write(f)
+            for t in tracks:
+                try: os.remove(t)
+                except OSError: pass
+            os.replace(out + ".jownloading", out)
+            return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
+        except Exception:
+            try: os.remove(out + ".jownloading")
             except OSError: pass
-        os.replace(out + ".jownloading", out)
-        return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
+            raise
     except Exception as e:
-        try: os.remove(out + ".jownloading")
-        except OSError: pass
         return {"id": sid, "ok": False, "output": str(e)}
 
 

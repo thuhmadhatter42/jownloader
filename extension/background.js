@@ -321,9 +321,29 @@ async function fetchText(url) {
 // the body per exact URL so only the first caller ever hits the network; the second reuses it. A
 // failed fetch is never cached, so a real retry still gets a real attempt.
 const manifestCache = new Map();   // url -> Promise<string>
+// A site that spends the one-shot URL in the page's own player leaves nothing to fetch: the first request
+// we make is already the second one. hook.js (page world) copies the manifest text the page itself got,
+// hookbridge.js forwards it here, and it is kept (session storage: survives a worker restart) keyed by the
+// exact URL. A copy is always preferred to a request; the network is only the fallback.
+const MT_KEY = "manifestTexts", MT_MAX = 40, MT_AGE = 30 * 60 * 1000;
+let mtChain = Promise.resolve();
+function storeManifestText(url, text) {
+  const step = async () => {
+    const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {}, now = Date.now();
+    all[url] = { text, ts: now };
+    for (const [k] of Object.entries(all).sort((a, b) => b[1].ts - a[1].ts).filter(([, v], i) => i >= MT_MAX || now - v.ts > MT_AGE)) delete all[k];
+    await chrome.storage.session.set({ [MT_KEY]: all });
+  };
+  return (mtChain = mtChain.then(step, step));
+}
+async function pageManifestText(url) {
+  await mtChain.catch(() => {});
+  const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {};
+  return (all[url] || all[normalizeMediaUrl(url)])?.text || null;
+}
 function fetchManifestOnce(url) {
   if (!manifestCache.has(url)) {
-    manifestCache.set(url, fetchText(url).catch((e) => { manifestCache.delete(url); throw e; }));
+    manifestCache.set(url, pageManifestText(url).then((t) => t ?? fetchText(url)).catch((e) => { manifestCache.delete(url); throw e; }));
   }
   return manifestCache.get(url);
 }
@@ -381,7 +401,7 @@ async function hlsTracks(url, text) {
     if (a) tracks.push({ kind: "audio", url: a.url });   // a rendition with a URI is a separate playlist (muxed audio has none)
   } else tracks.push({ kind: "video", url, parsed: m });
   for (const t of tracks) {
-    const p = t.parsed || parseHls(await fetchText(t.url), t.url);
+    const p = t.parsed || parseHls(await fetchManifestOnce(t.url), t.url);
     if (p.master) throw new Error("nested master playlist");
     if (p.live) throw new Error("live stream — it has no end to save yet");
     if (!p.segs.length) throw new Error("empty playlist");
@@ -596,7 +616,7 @@ async function siteMarkdownOf(tabId) {
 }
 // Crawls breadth-first from url (same origin only), rendering each page to a PDF (merged by the host) or
 // collecting its readable text into one Markdown file. Resolves {ok, path, ...} or {ok:false, output}.
-async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
+async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = false) {
   const port = hostConnect();
   const origin = new URL(url).origin;
   const start = siteNorm(url, origin) || url.replace(/\/$/, "") || origin;
@@ -606,8 +626,9 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
   const tab = await chrome.tabs.create({ url: start, active: false });
   const tabId = tab.id;
   let attached = false;
-  const ids = [], mdParts = [];
+  const ids = [], titles = [], mdParts = [];
   let n = 0, first = true;
+  if (!follow) maxPages = 1;   // "This page only"
   try {
     if (mode === "pdf") { await chrome.debugger.attach({ tabId }, "1.3"); attached = true; }
     while (queue.length && n < maxPages) {
@@ -616,13 +637,15 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
       await waitTabLoad(tabId);
       first = false;
       n++;
+      crawlProgress(n, Math.min(maxPages, n + queue.length), pageUrl);
+      let pageTitle = ""; try { pageTitle = (await chrome.tabs.get(tabId)).title || ""; } catch {}
       if (mode === "pdf") {
         const r = await chrome.debugger.sendCommand({ tabId }, "Page.printToPDF", { printBackground: true });
         const bytes = unb64(r.data);
         const id = "s" + (++hostSeq);
         const opened = await hostAsk(port, { cmd: "open", id, name: `${name}.${n}.pdf`, dst: dest || "", temp: true });
         if (!opened.ok) throw new Error(hostError(opened.output));
-        ids.push(id);
+        ids.push(id); titles.push(pageTitle);
         for (let o = 0; o < bytes.length; o += CHUNK) {
           const r2 = await hostAsk(port, { cmd: "chunk", id, data: b64(bytes.subarray(o, o + CHUNK)) });
           if (!r2.ok) throw new Error(hostError(r2.output));
@@ -632,9 +655,11 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
         if (!closed.ok) throw new Error(hostError(closed.output));
       } else {
         const { title, text } = await siteMarkdownOf(tabId);
+        titles.push(title || pageTitle);
         mdParts.push(`# ${title}\n\n${pageUrl}\n\n${text}\n\n---\n\n`);
         progress.bytes += text.length; pushProgress(false);
       }
+      if (!follow) break;
       const links = await siteLinksOf(tabId, origin);
       for (const l of links) if (!visited.has(l)) { visited.add(l); queue.push(l); }
     }
@@ -642,17 +667,19 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}) {
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
     return { ok: false, output: String(e?.message || e) };
   } finally {
+    crawlProgress(0);
     if (attached) try { await chrome.debugger.detach({ tabId }); } catch {}
     if (tabId != null) try { await chrome.tabs.remove(tabId); } catch {}
   }
   if (mode === "pdf") {
-    const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
+    const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, titles, dst: dest || "", ...fin });
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   }
   const md = mdParts.join("");
   const bytes = new TextEncoder().encode(md);
   const id = "s" + (++hostSeq);
-  const opened = await hostAsk(port, { cmd: "open", id, name: name + ".md", dst: dest || "", ...fin });
+  const mdName = titles.length === 1 ? (titles[0].replace(/[\/\\\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 150) || name) : name;   // one page = named by its title
+  const opened = await hostAsk(port, { cmd: "open", id, name: mdName + ".md", dst: dest || "", ...fin });
   if (!opened.ok) return { ok: false, output: hostError(opened.output) };
   try {
     for (let o = 0; o < bytes.length; o += CHUNK) {
@@ -701,7 +728,16 @@ async function spotifyList(url) {
 }
 
 // ---------- progress (the popup's bar) ----------
-const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "" };
+const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", crawl: null };
+// site crawl: page n of m (m = the pages known so far, capped by "Max pages") + the URL being rendered; n = 0 clears it
+function crawlProgress(n, m, url) {
+  progress.crawl = n ? { n, m, url } : null;
+  try {
+    if (n) { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: String(n) }); }
+    else chrome.action.setBadgeText({ text: "" });
+  } catch {}
+  pushProgress(true);
+}
 let progTimer = 0;
 function pushProgress(force) {
   if (progTimer && !force) return;
@@ -756,9 +792,9 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
       // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder)
-      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") : it.engine ? canon(it.url) + "#" + (it.mode || "video") + (it.spotify ? ":" + (it.spotify.folder || "") : "") : canon(it.url);
+      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "") : it.engine ? canon(it.url) + "#" + (it.mode || "video") + (it.spotify ? ":" + (it.spotify.folder || "") : "") : canon(it.url);
       if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
-      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
+      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
@@ -784,7 +820,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         const j = queue.shift();
         let r;
         try {
-          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; }
@@ -917,6 +953,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       reply((await savedKeys()).length);
     } else if (msg.type === "getMedia") {
       reply(await mediaList(tabId));
+    } else if (msg.type === "manifestText") {
+      if (typeof msg.url === "string" && typeof msg.text === "string") await storeManifestText(msg.url, msg.text);
+      reply({ ok: true });
     } else if (msg.type === "streamCandidates") {
       reply(await streamsFor(tabId));
     } else if (msg.type === "scan") {

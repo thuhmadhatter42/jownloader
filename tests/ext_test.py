@@ -37,8 +37,42 @@ with sync_playwright() as p:
     check("same-file '2160p' variant → real pixels of what plays", any(l.startswith("⬇ Download ") and "×" in l and "label" not in l for l in labels), True)
     pop = ctx.new_page(); pop.goto(f"chrome-extension://{ext_id}/popup.html"); pop.wait_for_timeout(1500)
     # (the popup opened as a tab scans itself, so counts are 0 here; the scan is checked against the test page below)
-    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:11],
-          ["⧉ sidebar", "Download", "Batch", "📁 Downloads", "×", "Download from this page", "Audio only → MP3 + BPM/key", "Save site as PDF", "Save site as Markdown", "Download all images", "Download all videos"])   # (+ ×, forget saved, rename tab…)
+    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:13],
+          ["⧉ sidebar", "📁 Downloads", "×", "Download this list as audio", "+ add a library folder…", "Video / Images", "PDF", "Extra tools", "Download from this page", "Audio only → MP3 + BPM/key", "Download all images", "Download all videos", "Download collected"])
+    # tabs: every control lives on its own tab
+    SHOT = os.environ.get("JOWNLOADER_SHOTS") or SP
+    os.makedirs(SHOT, exist_ok=True)
+    pop.set_viewport_size({"width": 320, "height": 720})
+    where = lambda ids: pop.evaluate("ids => ids.map(id => { let e = document.getElementById(id); while (e && !/^pane/.test(e.id)) e = e.parentElement; return e ? e.id : null; })", ids)
+    check("tab 1 Video / Images holds only video + image controls", where(["site", "siteAudio", "imgs", "vids", "coll", "collect", "autoVideos", "showButton", "prefix"]), ["paneDl"] * 9)
+    check("tab 2 PDF holds the site/document controls", where(["sitePdf", "siteMd", "docs", "sitePages"]), ["panePdf"] * 4)
+    check("tab 3 Extra tools holds rename + strip + WebP", where(["rnName", "rnPick", "rnGo", "rnStrip", "rnWebp", "rnPng", "strip", "webp"]), ["paneTools"] * 8)
+    check("tab labels", [pop.text_content(i) for i in ("#tabDl", "#tabPdf", "#tabTools")], ["Video / Images", "PDF", "Extra tools"])
+    check("only the Video / Images pane shows first", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [False, True, True])
+    check("tab bar fits on one line at 300px", pop.evaluate("() => [...document.querySelectorAll('.tabs button')].map(b => Math.round(b.getBoundingClientRect().height) < 30)"), [True, True, True])
+    pop.screenshot(path=SHOT + "/popup-tab1-video-images.png")
+    pop.click("#tabPdf"); pop.wait_for_timeout(200)
+    check("PDF tab shown, others hidden", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [True, False, True])
+    check("Max pages has a visible label", pop.evaluate("""() => { const l = document.querySelector('label[for=sitePages]'); const r = l.getBoundingClientRect();
+      return [l.textContent.trim().startsWith('Max pages'), r.width > 0 && r.height > 0 && getComputedStyle(l).visibility === 'visible']; }"""), [True, True])
+    check("crawl toggle: This page only is the default", pop.evaluate("""() => [[...document.querySelectorAll('input[name=crawl]')].map(r => r.parentElement.textContent.trim()),
+      document.querySelector('input[name=crawl]:checked').value, document.getElementById('sitePages').disabled]"""),
+          [["This page only", "Follow links on this site"], "page", True])
+    pop.click("input[name=crawl][value=site]"); pop.wait_for_timeout(200)
+    check("Follow links enables Max pages", pop.evaluate("() => document.getElementById('sitePages').disabled"), False)
+    pop.screenshot(path=SHOT + "/popup-tab2-pdf.png")
+    pop.click("input[name=crawl][value=page]")
+    pop.click("#tabTools"); pop.wait_for_timeout(200)
+    check("Extra tools: Batch rename heading", pop.evaluate("() => [...document.querySelectorAll('#paneTools h2')].map(h => h.textContent)"), ["Batch rename", "Strip metadata and WebP conversion"])
+    pop.screenshot(path=SHOT + "/popup-tab3-extra-tools.png")
+    pop.click("#tabDl"); pop.wait_for_timeout(200)
+    check("Collect switch wording", pop.evaluate("() => document.querySelector('#collect').closest('label').querySelector('small').textContent"), "every picture shown on screen is remembered; thumbnails ignored")
+    check("hidden attribute still wins over button display", pop.evaluate("() => { const b = document.getElementById('site'); return [b.hidden, getComputedStyle(b).display]; }"), [True, "none"])
+    # crawl progress: a crawl in flight shows page N of M + the URL
+    pop.evaluate("() => showProgress({total:1, done:0, failed:0, bytes:0, active:1, where:'Downloads', kind:'site', error:'', crawl:{n:3, m:12, url:'https://example.test/a/b'}})")
+    check("crawl progress text", pop.evaluate("() => document.getElementById('status').textContent"), "page 3 of 12\nhttps://example.test/a/b")
+    check("crawl progress bar", pop.evaluate("() => document.getElementById('fill').style.width"), "25%")
+    pop.evaluate("() => { document.getElementById('status').textContent = ''; document.getElementById('bar').hidden = true; }")
 
     # the popup's first message must answer (a throw here hung the popup at "scanning…" once)
     first = pop.evaluate("""async () => Promise.race([new Promise(r => setTimeout(() => r('TIMEOUT'), 3000)),
@@ -131,7 +165,7 @@ with sync_playwright() as p:
       const ra = await a; return [b.output, ra.ok, await chrome.runtime.sendMessage({type:'pickerOpen'})]; }""")
     check("file picker: a second Finder call while one is up is refused, not queued", pk2, ["picker already open", False, False])
     check("rename with nothing selected fails loud", pop.evaluate("async () => (await chrome.runtime.sendMessage({type:'rename', name:'x', dest:'', mode:'rename'})).output"), "no files selected")
-    check("rename tab present", pop.evaluate("() => [!!document.getElementById('tabRn'), document.getElementById('rnGo').disabled, document.getElementById('rnDest').disabled]"), [True, True, True])
+    check("rename controls present", pop.evaluate("() => [!!document.getElementById('tabTools'), document.getElementById('rnGo').disabled, document.getElementById('rnDest').disabled]"), [True, True, True])
     check("YouTube tracks are never whole files", sw.evaluate("() => [isWhole('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=18', 'video/mp4'), isWhole('https://cdn.x/a.mp4', 'video/mp4')]"), [False, True])
     check("sniffed extensions", sw.evaluate("() => [sniffExt(new Uint8Array([0,0,0,0x18,0x66,0x74,0x79,0x70,0x69,0x73,0x6f,0x6d,0,0])), sniffExt(new Uint8Array([0xff,0xd8,0xff,0xe0,0,0,0,0,0,0,0,0,0])), sniffExt(new Uint8Array([0x1a,0x45,0xdf,0xa3,0,0,0,0,0,0,0,0,0])), sniffExt(new Uint8Array(13))]"), ["mp4", "jpg", "webm", ""])
     # Spotify links: the BPM/key checkbox (present, off by default, persists in sync storage), the song items

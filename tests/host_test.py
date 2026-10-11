@@ -262,6 +262,52 @@ print(json.dumps([note, f["\\xa9nam"], f["\\xa9ART"], f["\\xa9alb"], f["trkn"], 
     check("library folder: found by the library's own folder-name rule and NN_ names; a missing one is a note, not a failure",
           [r["ok"], r["inlib"], r["have"], [n.startswith("library folder not found") for n in r["notes"]], os.path.exists(sy + "/Hits_ Vol 1_")], [True, [0], [], [True], False])
 
+    # site PDFs are named by page title, never 001.pdf, never overwritten
+    import base64
+    def session(msgs, host=HOST):
+        blob = b"".join(struct.pack("<I", len(json.dumps(m).encode())) + json.dumps(m).encode() for m in msgs)
+        p = subprocess.run([BOOT_PY, host], input=blob, capture_output=True, env=BROWSER_ENV)
+        out, i = [], 0
+        while i < len(p.stdout):
+            n = struct.unpack("<I", p.stdout[i:i + 4])[0]; out.append(json.loads(p.stdout[i + 4:i + 4 + n])); i += 4 + n
+        return out
+    VENV_PY = os.path.join(os.path.dirname(HERE), "native", ".venv", "bin", "python3")
+    def tracks(n, pdfd, real=False):
+        m = []
+        for k in range(n):
+            data = b"%PDF-1.4 page" + bytes([48 + k])
+            if real:   # a genuine one-page PDF, made by the venv's pypdf
+                data = subprocess.run([VENV_PY, "-c", "import sys,io;from pypdf import PdfWriter;w=PdfWriter();w.add_blank_page(100,100);b=io.BytesIO();w.write(b);sys.stdout.buffer.write(b.getvalue())"], capture_output=True).stdout
+            m += [{"cmd": "open", "id": f"t{k}", "name": f"x.{k}.pdf", "dst": pdfd, "temp": True},
+                  {"cmd": "chunk", "id": f"t{k}", "data": base64.b64encode(data).decode()},
+                  {"cmd": "close", "id": f"t{k}"}]
+        return m
+    pdfd = os.path.join(d, "pdf"); os.makedirs(pdfd)
+    ids = lambda n: [f"t{k}" for k in range(n)]
+    merge = lambda n, name, titles, dst: {"cmd": "mergepdf", "id": "m", "ids": ids(n), "name": name, "dst": dst, "titles": titles}
+    session(tracks(1, pdfd) + [merge(1, "site", ["Portal:Current events"], pdfd)])
+    session(tracks(1, pdfd) + [merge(1, "site", ["Portal:Current events"], pdfd)])
+    check("one page -> <title>.pdf, second run -> (2), no tracks left", sorted(os.listdir(pdfd)), ["Portal:Current events (2).pdf", "Portal:Current events.pdf"])
+    # several pages, pypdf present -> ONE merged PDF named after the first page's title (else the host name)
+    if os.path.exists(VENV_PY):
+        mp = os.path.join(d, "merged"); os.makedirs(mp)
+        session(tracks(3, mp, real=True) + [merge(3, "docs.example.org", ["Intro / Start", "Guide", ""], mp)])
+        check("several pages -> one merged PDF named by the first title", sorted(os.listdir(mp)), ["Intro - Start.pdf"])
+        n = subprocess.run([VENV_PY, "-c", "import sys;from pypdf import PdfReader;print(len(PdfReader(sys.argv[1]).pages))", mp + "/Intro - Start.pdf"], capture_output=True, text=True).stdout.strip()
+        check("merged PDF has all 3 pages", n, "3")
+        mp2 = os.path.join(d, "merged2"); os.makedirs(mp2)
+        session(tracks(2, mp2, real=True) + [merge(2, "docs.example.org", ["", "B"], mp2)])
+        check("no first title -> <host>.pdf", sorted(os.listdir(mp2)), ["docs.example.org.pdf"])
+    else:
+        print("skip merged-PDF checks (no native/.venv with pypdf)")
+    # no pypdf (a copy of the host with no venv, run by the browser's bare python) -> per-page title-named PDFs, never 001.pdf
+    nov = os.path.join(d, "novenv"); os.makedirs(nov)
+    for f in ("jownloader_host.py", "engine.py", "analyze.py"): shutil.copy(os.path.join(os.path.dirname(HOST), f), nov)
+    fb = os.path.join(d, "fallback"); os.makedirs(fb)
+    r = session(tracks(3, fb) + [merge(3, "docs.example.org", ["Intro / Start", "Guide: Part 1", ""], fb)], host=nov + "/jownloader_host.py")
+    check("no pypdf: one PDF per page named by title, never 001.pdf", sorted(os.listdir(fb + "/docs.example.org")), ["Guide: Part 1.pdf", "Intro - Start.pdf", "docs.example.org page 3.pdf"])
+    check("no pypdf: reply says so", "pypdf not installed" in (r[-1].get("output") or ""), True)
+    check("no pypdf: page content intact", open(fb + "/docs.example.org/Intro - Start.pdf", "rb").read(), b"%PDF-1.4 page0")
 finally:
     shutil.rmtree(d)
 print("ALL GREEN" if not fails else f"{fails} FAILED")
