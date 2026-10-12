@@ -96,7 +96,7 @@ pollProgress();
 const batches = { imgs: ["image", () => scan.images], vids: ["video", () => vi.items], docs: ["doc", () => scan.docs.map((d) => ({ url: d.url }))] };
 for (const [id, [kind, items]] of Object.entries(batches)) $(id).onclick = async () => {
   $("status").textContent = `queuing ${kind}s → ${folderName(destPath)} …`;
-  const r = await chrome.runtime.sendMessage({ type: "download", items: items(), kind, dest: destPath, prefix: $("prefix").value.trim() });
+  const r = await chrome.runtime.sendMessage({ type: "download", items: items(), kind, tabId: tab?.id, dest: destPath, prefix: $("prefix").value.trim() });
   if (!r?.queued) $("status").textContent = "nothing new to save" + (r?.skipped ? ` (${r.skipped} already saved before)` : "");
 };
 
