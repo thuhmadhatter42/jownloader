@@ -13,7 +13,7 @@ EXT_ID = open(ROOT + "/native/EXTENSION_ID").read().strip()
 URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 os.makedirs(OUT, exist_ok=True)
 proc = subprocess.Popen(["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", f"--user-data-dir={PROF}", "--remote-debugging-port=9338",
-    f"--load-extension={EXT}", "--no-first-run", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
+    f"--load-extension={EXT}", "--no-first-run", "--block-new-web-contents", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 fails = 0
 def check(label, got, want):

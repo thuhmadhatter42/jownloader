@@ -175,6 +175,44 @@ async function nextCounter(dest, prefix, count) {
 
 // canonical identity of a media URL: no query, no fragment (chunked/signed variants collapse)
 function canon(url) { try { const u = new URL(url); return u.origin + u.pathname; } catch { return url; } }
+// Dedupe identity of an engine link: the VIDEO, not the page path. YouTube: the id out of watch?v= / youtu.be /
+// shorts / embed / live; any other engine site keeps its query (minus tracking noise), so ?id= style links differ.
+const TRACKING_PARAM = /^(utm_.*|fbclid|gclid|igshid|igsh|si|feature|pp|ref_src|ref_url|s|t)$/i;
+function ytId(u) {
+  const h = u.hostname.replace(/^(www|m|music)\./, "");
+  if (h === "youtu.be") return u.pathname.split("/")[1] || "";
+  if (h === "youtube.com" || h === "youtube-nocookie.com") {
+    if (u.pathname === "/watch") return u.searchParams.get("v") || "";
+    return (/^\/(?:shorts|embed|live|v)\/([\w-]+)/.exec(u.pathname) || [])[1] || "";
+  }
+  return "";
+}
+function sortedQuery(u, dropTracking) {
+  const kept = [...u.searchParams].filter(([k]) => !(dropTracking && TRACKING_PARAM.test(k))).sort((a, b) => (a[0] + "=" + a[1]).localeCompare(b[0] + "=" + b[1]));
+  return kept.length ? "?" + kept.map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&") : "";
+}
+function engineCanon(url) {
+  try {
+    const u = new URL(url), id = ytId(u);
+    if (id) return "https://www.youtube.com/watch?v=" + id;
+    return u.origin + u.pathname + sortedQuery(u, true);
+  } catch { return url; }
+}
+// a page saved as a site job: the query is part of the page's identity (viewtopic.php?t=, index.php?title=)
+function siteCanon(url) { try { const u = new URL(url); return u.origin + u.pathname + sortedQuery(u, false); } catch { return url; } }
+// Older spellings of an engine key. A record under one counts as saved (mp3: only when its file is an .mp3).
+// Pre-0.1.43 keys were canon(url)+"#mode": right for youtu.be/<id>, shorts and embed links, wrong for watch?v=
+// (every video shared one key), so that one is never an alias.
+function engineAlts(url, mode, mp3, key) {
+  const alts = [], legacy = canon(url) + "#" + mode + (mode === "audio" && mp3 ? "-mp3" : "");
+  const watchPath = /^https?:\/\/[^/]*youtube\.com\/watch$/.test(canon(url));
+  if (!watchPath && legacy !== key) alts.push({ k: legacy });
+  if (mode === "audio" && mp3) {   // saved as MP3 before 0.1.41 (when MP3 was the only audio): '<url>#audio' with an .mp3 file
+    alts.push({ k: engineCanon(url) + "#audio", mp3: true });
+    if (!watchPath) alts.push({ k: canon(url) + "#audio", mp3: true });
+  }
+  return alts;
+}
 
 // ---------- native host ----------
 // One persistent port streams file bytes (open / chunk… / close per file, several files interleaved);
@@ -628,15 +666,47 @@ const streamError = (msg) => /^HTTP 40[13] \([^)]*\.(m3u8|mpd)\)/.test(msg || ""
 // Node, no headless browser of its own. Link discovery and text extraction go through the existing
 // content script (siteLinks / siteMarkdown), same as every other scan in this file.
 const SITE_ASSET_EXT = /\.(png|jpe?g|gif|webp|svg|ico|bmp|tiff?|pdf|zip|rar|tar|gz|7z|mp4|webm|mov|avi|mkv|mp3|wav|ogg|flac|css|js|mjs|json|xml|woff2?|ttf|eot|otf|exe|dmg|pkg|apk)(\?.*)?$/i;
-// same-origin, no fragment, no asset link, no trailing slash — null if it should not be crawled
-function siteNorm(href, origin) {
+// Links that change state when merely fetched (GET): a crawl runs with the user's logged-in session, so it never
+// follows them. Words are matched as whole path pieces (/logout, /user/delete, /remove_item.php) and as parts of
+// query-parameter names (?action=, ?token=, ?_wpnonce=, ?logout=).
+const SITE_UNSAFE_WORDS = ["logout", "log-out", "log_out", "logoff", "log-off", "signout", "sign-out", "sign_out", "signoff",
+  "delete", "remove", "destroy", "unsubscribe", "unfollow", "cancel", "revoke", "disconnect", "checkout",
+  "add-to-cart", "add_to_cart", "addtocart", "cart-add", "empty-cart", "purchase"];
+const SITE_UNSAFE_PARAMS = ["action", "token", "nonce", "csrf", "logout", "signout", "delete", "remove", "unsubscribe", "unfollow", "destroy"];
+const SITE_UNSAFE_PATH = new RegExp("(^|[/_.\\-])(" + SITE_UNSAFE_WORDS.join("|") + ")($|[/_.\\-])", "i");
+const SITE_UNSAFE_PARAM = new RegExp(SITE_UNSAFE_PARAMS.join("|"), "i");
+function siteUnsafe(u) {
+  if (SITE_UNSAFE_PATH.test(u.pathname)) return true;
+  for (const k of u.searchParams.keys()) if (SITE_UNSAFE_PARAM.test(k)) return true;
+  return false;
+}
+// same-origin, no fragment, no asset link — null if it should not be crawled. The trailing slash stays (/docs/ and
+// /docs can be different pages); safe=true also drops state-changing links.
+function siteNorm(href, origin, safe) {
   try {
     const u = new URL(href, origin);
     if (u.origin !== origin) return null;
     u.hash = "";
     if (SITE_ASSET_EXT.test(u.pathname)) return null;
-    return u.href.replace(/\/$/, "") || u.origin;
+    if (safe && siteUnsafe(u)) return null;
+    return u.href;
   } catch { return null; }
+}
+// What the server answers for a page, asked BEFORE the tab navigates (service-worker fetch with the user's session;
+// the body is never read). Skips what must not become a page: HTTP >= 400, redirect loops/failures, anything
+// that is not HTML (a download link would stall the tab and fire the browser's own download path).
+async function siteProbe(url) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(url, { credentials: "include", redirect: "follow", signal: ctl.signal });
+    const ctype = (r.headers.get("content-type") || "").toLowerCase(), disp = r.headers.get("content-disposition") || "";
+    ctl.abort();
+    if (r.status >= 400) return { skip: `HTTP ${r.status}` };
+    if (/^\s*attachment/i.test(disp)) return { skip: "download link" };
+    if (ctype && !/^(text\/html|application\/xhtml)/.test(ctype)) return { skip: `not a page (${ctype.split(";")[0]})` };
+    return { final: r.url || url };
+  } catch (e) { return { skip: String(e?.message || e) }; }
+  finally { clearTimeout(timer); }
 }
 function unb64(s) {
   const bin = atob(s);
@@ -657,7 +727,7 @@ function waitTabLoad(tabId, timeoutMs = 30000) {
 }
 async function siteLinksOf(tabId, origin) {
   let hrefs; try { hrefs = await chrome.tabs.sendMessage(tabId, { type: "siteLinks" }, { frameId: 0 }); } catch { hrefs = []; }
-  const out = []; for (const h of hrefs || []) { const n = siteNorm(h, origin); if (n) out.push(n); } return out;
+  const out = []; for (const h of hrefs || []) { const n = siteNorm(h, origin, true); if (n) out.push(n); } return out;
 }
 async function siteMarkdownOf(tabId) {
   try { return await chrome.tabs.sendMessage(tabId, { type: "siteMarkdown" }, { frameId: 0 }) || { title: "", text: "" }; }
@@ -668,26 +738,43 @@ async function siteMarkdownOf(tabId) {
 async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = false) {
   const port = hostConnect();
   const origin = new URL(url).origin;
-  const start = siteNorm(url, origin) || url.replace(/\/$/, "") || origin;
+  const start = siteNorm(url, origin) || url;
   const visited = new Set([start]), queue = [start];
   const hostname = new URL(url).hostname.replace(/^www\./, "");
   const name = sanitize(hostname) || "site";
-  const tab = await chrome.tabs.create({ url: start, active: false });
+  const crawlId = ++crawlSeq;
+  if (mode !== "pdf") {   // Markdown writes one file at the very end: find out now that the host or the folder is unusable, not after every page
+    const pid = "s" + (++hostSeq);
+    const probe = await hostAsk(port, { cmd: "open", id: pid, name: ".jownloader-check.md", dst: dest || "", temp: true });
+    if (!probe.ok) return { ok: false, output: hostError(probe.output) };
+    try { port.postMessage({ cmd: "abort", id: pid }); } catch {}
+  }
+  const tab = await chrome.tabs.create({ url: "about:blank", active: false });
   const tabId = tab.id;
   let attached = false;
   const ids = [], titles = [], mdParts = [];
-  let n = 0, first = true;
+  let n = 0;
   if (!follow) maxPages = 1;   // "This page only"
   try {
     if (mode === "pdf") { await chrome.debugger.attach({ tabId }, "1.3"); attached = true; }
     while (queue.length && n < maxPages) {
-      const pageUrl = queue.shift();
-      if (!first) await chrome.tabs.update(tabId, { url: pageUrl });
+      const pageUrl = queue.shift(), isStart = pageUrl === start && !n;
+      // ask the server first: error pages, downloads and redirect targets already seen never become pages
+      const probe = await siteProbe(pageUrl);
+      if (probe.skip) { if (isStart) throw new Error(`${pageUrl} was not saved: ${probe.skip}`); continue; }
+      const final = siteNorm(probe.final, origin);
+      if (!final || (final !== pageUrl && visited.has(final))) { if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
+      visited.add(final);
+      await chrome.tabs.update(tabId, { url: pageUrl });
       await waitTabLoad(tabId);
-      first = false;
+      let pageTitle = "", landedUrl = "";
+      try { const t = await chrome.tabs.get(tabId); pageTitle = t.title || ""; landedUrl = t.url || ""; } catch {}
+      if (/^chrome-error:/.test(landedUrl)) { if (isStart) throw new Error(`${pageUrl} was not saved: the page did not load`); continue; }
+      const landed = siteNorm(landedUrl, origin);   // a script/meta redirect after load
+      if (!landed || (landed !== final && visited.has(landed))) { if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
+      visited.add(landed);
       n++;
-      crawlProgress(n, Math.min(maxPages, n + queue.length), pageUrl);
-      let pageTitle = ""; try { pageTitle = (await chrome.tabs.get(tabId)).title || ""; } catch {}
+      crawlProgress(crawlId, n, Math.min(maxPages, n + queue.length), pageUrl);
       if (mode === "pdf") {
         const r = await chrome.debugger.sendCommand({ tabId }, "Page.printToPDF", { printBackground: true });
         const bytes = unb64(r.data);
@@ -705,7 +792,7 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
       } else {
         const { title, text } = await siteMarkdownOf(tabId);
         titles.push(title || pageTitle);
-        mdParts.push(`# ${title}\n\n${pageUrl}\n\n${text}\n\n---\n\n`);
+        mdParts.push(`# ${title || pageTitle}\n\n${pageUrl}\n\n${text}\n\n---\n\n`);
         progress.bytes += text.length; pushProgress(false);
       }
       if (!follow) break;
@@ -716,7 +803,7 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
     return { ok: false, output: String(e?.message || e) };
   } finally {
-    crawlProgress(0);
+    crawlProgress(crawlId, 0);
     if (attached) try { await chrome.debugger.detach({ tabId }); } catch {}
     if (tabId != null) try { await chrome.tabs.remove(tabId); } catch {}
   }
@@ -727,7 +814,7 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
   const md = mdParts.join("");
   const bytes = new TextEncoder().encode(md);
   const id = "s" + (++hostSeq);
-  const mdName = titles.length === 1 ? (titles[0].replace(/[\/\\\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 150).replace(/[\ud800-\udbff]$/, "") || name) : name;   // one page = named by its title
+  const mdName = (titles[0] || "").replace(/[\/\\\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 150).replace(/[\ud800-\udbff]$/, "") || name;   // named by the first page's title, like the PDF
   const opened = await hostAsk(port, { cmd: "open", id, name: mdName + ".md", dst: dest || "", ...fin });
   if (!opened.ok) return { ok: false, output: hostError(opened.output) };
   try {
@@ -779,10 +866,22 @@ async function spotifyList(url) {
 // ---------- progress (the popup's bar) ----------
 const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", crawl: null };
 // site crawl: page n of m (m = the pages known so far, capped by "Max pages") + the URL being rendered; n = 0 clears it
-function crawlProgress(n, m, url) {
-  progress.crawl = n ? { n, m, url } : null;
+// Every crawl has its own entry (id -> {n, m, url}); the bar and badge show the sum of the crawls running, and
+// are only cleared when the last one ends. m only grows, and the bar never steps back (m is raised to hold it).
+let crawlSeq = 0, crawlFrac = 0;
+const crawls = new Map();
+function crawlProgress(id, n, m, url) {
+  if (n) { const prev = crawls.get(id); crawls.set(id, { n, m: Math.max(m, n, prev ? prev.m : 0), url }); }
+  else crawls.delete(id);
+  if (!crawls.size) { crawlFrac = 0; progress.crawl = null; }
+  else {
+    let sn = 0, sm = 0; for (const c of crawls.values()) { sn += c.n; sm += c.m; }
+    if (sn / sm < crawlFrac) sm = Math.ceil(sn / crawlFrac);
+    crawlFrac = Math.max(crawlFrac, sn / sm);
+    progress.crawl = { n: sn, m: sm, url: url || [...crawls.values()].pop().url };
+  }
   try {
-    if (n) { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: String(n) }); }
+    if (progress.crawl) { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: String(progress.crawl.n) }); }
     else chrome.action.setBadgeText({ text: "" });
   } catch {}
   pushProgress(true);
@@ -843,12 +942,18 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
       // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder)
-      const c = it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "") : it.engine ? canon(it.url) + "#" + (it.mode || "video") + (it.spotify ? ":" + (it.spotify.folder || "") : it.mode === "audio" && settings.mp3 ? "-mp3" : "") : canon(it.url);
+      const mode = it.mode || "video";
+      const c = it.site ? siteCanon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "")
+        : it.engine ? engineCanon(it.url) + "#" + mode + (it.spotify ? ":" + (it.spotify.folder || "") : mode === "audio" && settings.mp3 ? "-mp3" : "")
+        : canon(it.url);
+      const alts = it.engine && !it.spotify ? engineAlts(it.url, mode, settings.mp3, c) : [];
       if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
-      seen.add(c); cands.push({ url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
+      seen.add(c); cands.push({ alts, url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
+    const altRecs = await getSaved(cands.flatMap((j) => j.alts.map((a) => a.k)));
+    for (const j of cands) if (!saved[j.c]) for (const a of j.alts) if (altRecs[a.k] && (!a.mp3 || /\.mp3$/i.test(altRecs[a.k].path || ""))) { saved[j.c] = altRecs[a.k]; break; }
     const prior = cands.filter((j) => saved[j.c]);
     const there = await stillOnDisk(prior.map((j) => saved[j.c].path || ""));
     const keep = new Set(prior.filter((j, i) => there[i] || !saved[j.c].path).map((j) => j.c));

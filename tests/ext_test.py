@@ -4,7 +4,7 @@
 import os, json
 from playwright.sync_api import sync_playwright
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXT = os.path.join(os.path.dirname(HERE), "extension")
+EXT = os.environ.get("JOWNLOADER_EXT") or os.path.join(os.path.dirname(HERE), "extension")
 SP = os.environ.get("JOWNLOADER_TEST_DIR") or HERE + "/test-run"
 os.makedirs(SP + "/prof", exist_ok=True)
 fails = 0
@@ -241,6 +241,37 @@ with sync_playwright() as p:
     pop.evaluate("async () => await chrome.runtime.sendMessage({type:'download', kind:'video', dest:'/d', prefix:'', items:[{url:'https://www.youtube.com/watch?v=mp3off', engine:true, mode:'audio'}]})")
     pop.wait_for_timeout(500)
     check("mp3 off (default): single-link audio job carries mp3=false", [a[4]["mp3"] for a in sw.evaluate("() => __sent")], [False])
+    # ---- dedupe keys (findings 2, 24, 64): the video / page identity, not origin+path
+    dl = lambda items, kind="video": pop.evaluate("async a => await chrome.runtime.sendMessage({type:'download', kind:a.kind, dest:'/d', prefix:'', items:a.items})", {"items": items, "kind": kind})
+    yt = lambda i: "https://www.youtube.com/watch?v=" + i
+    eng = lambda url, mode="video": {"url": url, "engine": True, "mode": mode}
+    sw.evaluate("() => { globalThis.__origSite = saveSiteViaHost; saveSiteViaHost = async () => ({ ok: true, path: '' }); globalThis.__origDisk = stillOnDisk; }")
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+    check("#2 two different watch?v= videos in one batch are two jobs", dl([eng(yt("aaaaaaaaaaa")), eng(yt("bbbbbbbbbbb"))]), {"queued": 2, "skipped": 0, "unusable": 0})
+    pop.wait_for_timeout(500)
+    check("#2 a third video after those were saved is queued", dl([eng(yt("ccccccccccc"))]), {"queued": 1, "skipped": 0, "unusable": 0})
+    pop.wait_for_timeout(500)
+    check("#2 the same video again (also as youtu.be / shorts / tracking params) is skipped",
+          dl([eng(yt("aaaaaaaaaaa")), eng("https://youtu.be/bbbbbbbbbbb?si=zzz"), eng("https://www.youtube.com/shorts/ccccccccccc"), eng(yt("aaaaaaaaaaa") + "&feature=share&t=9")]), {"queued": 0, "skipped": 4, "unusable": 0})
+    check("#2 the same video as audio is its own job", dl([eng(yt("aaaaaaaaaaa"), "audio")]), {"queued": 1, "skipped": 0, "unusable": 0})
+    pop.wait_for_timeout(500)
+    check("#2 another engine site keeps its identifying query (?id=1 vs ?id=2), drops tracking",
+          dl([eng("https://video.example/watch?id=1"), eng("https://video.example/watch?id=2"), eng("https://video.example/watch?id=2&utm_source=x")]), {"queued": 2, "skipped": 1, "unusable": 0})
+    pop.wait_for_timeout(500)
+    site = lambda url, extra={}: {"url": url, "site": True, "mode": "pdf", "maxPages": 1, "follow": False, **extra}
+    check("#24 site jobs for /trap?i=3 and /trap?i=9 are two jobs", dl([site("https://forum.example/trap?i=3"), site("https://forum.example/trap?i=9")], "site"), {"queued": 2, "skipped": 0, "unusable": 0})
+    pop.wait_for_timeout(500)
+    check("#24 ...and the same page again is skipped", dl([site("https://forum.example/trap?i=3")], "site"), {"queued": 0, "skipped": 1, "unusable": 0})
+    # #64: a record from before 0.1.41 ('<url>#audio', an .mp3 file) satisfies the MP3-switch key; an .m4a one does not
+    sw.evaluate("() => { stillOnDisk = async (p) => p.map(() => true); }")
+    pop.evaluate("""async () => { await chrome.storage.sync.set({mp3: true});
+      await chrome.storage.local.set({'saved:https://youtu.be/oldmp3aaaaa#audio': {ts: 1, path: '/d/Old (120 BPM Am).mp3'}, 'saved:https://youtu.be/oldm4aaaaa#audio': {ts: 1, path: '/d/Old.m4a'}}); }""")
+    pop.wait_for_timeout(300)
+    check("#64 MP3 switch on: link saved as .mp3 before 0.1.41 is skipped, one saved as .m4a is queued",
+          dl([eng("https://youtu.be/oldmp3aaaaa", "audio"), eng("https://youtu.be/oldm4aaaaa", "audio")]), {"queued": 1, "skipped": 1, "unusable": 0})
+    pop.wait_for_timeout(500)
+    pop.evaluate("async () => { await chrome.storage.sync.set({mp3: false}); await chrome.runtime.sendMessage({type:'forgetSaved'}); }")
+    sw.evaluate("() => { stillOnDisk = __origDisk; saveSiteViaHost = __origSite; }")
     sw.evaluate("() => { saveEngineViaHost = __orig; }")
     ctx.close()
 print("ALL GREEN" if not fails else f"{fails} FAILED")

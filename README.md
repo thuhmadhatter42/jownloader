@@ -66,8 +66,12 @@ album, track, year, cover) as `.mp3` instead; the switch is shared with the *Aud
 
 ## Whole site → PDF / Markdown
 
-Crawls every same-origin page reachable from the page you're on (breadth-first, capped at the max-pages
-number you set, default 50) and saves the whole thing as one merged PDF or one Markdown file. No
+By default (**This page only**) saves just the page you're on. Choose **Follow links on this site** and it
+crawls every same-origin page reachable from there (breadth-first, capped at the max-pages number you set,
+default 50). Either way the result is one merged PDF or one Markdown file, named by the first page's title.
+A crawl skips links that download a file, pages that answer with an error (HTTP 400 and up), a redirect
+target it already has, and links that change something just by being opened (log out, delete, remove,
+unsubscribe, cart actions, or a link with an action/token query parameter). No
 external tools do the crawling — the extension drives it itself with `chrome.tabs` (navigate, wait for
 load, follow same-origin links) and, for PDF, `chrome.tabs`'s DevTools debugger to render each page
 exactly as Brave does. While a PDF crawl runs, Brave shows a "Jownloader started debugging this
