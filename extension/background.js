@@ -100,7 +100,7 @@ chrome.webNavigation.onHistoryStateUpdated.addListener((d) => { if (d.frameId ==
 chrome.tabs.onRemoved.addListener(clearMedia);
 
 // ---------- filenames ----------
-function sanitize(s) { return s.replace(/[^\w.\-]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 120); }
+function sanitize(s) { return s.replace(/[^\w.\-]+/g, "_").replace(/^[_.]+|_+$/g, "").slice(0, 120); }   // never a leading dot (/.zshrc)
 // typed by the user: keep spaces, strip only what a filename can't hold
 function typed(s) { return s.replace(/[\/\\:*?"<>|]+/g, "").trim().slice(0, 80); }
 const hasExt = (name) => /\.[a-z0-9]{2,5}$/i.test(name);
@@ -678,7 +678,7 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
   const md = mdParts.join("");
   const bytes = new TextEncoder().encode(md);
   const id = "s" + (++hostSeq);
-  const mdName = titles.length === 1 ? (titles[0].replace(/[\/\\\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 150) || name) : name;   // one page = named by its title
+  const mdName = titles.length === 1 ? (titles[0].replace(/[\/\\\x00-\x1f]+/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 150).replace(/[\ud800-\udbff]$/, "") || name) : name;   // one page = named by its title
   const opened = await hostAsk(port, { cmd: "open", id, name: mdName + ".md", dst: dest || "", ...fin });
   if (!opened.ok) return { ok: false, output: hostError(opened.output) };
   try {
