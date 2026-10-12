@@ -182,7 +182,7 @@ try:
     live_trk = {"title": "Live Forever", "artists": "Oasis", "duration_ms": 276000}
     check("match: 'live' in the track's own title is not a penalty", engine.spotify_match(live_trk, fake([H("Oasis - Live Forever", "Oasis", 277, "u1")]))[0], "u1")
     sym = {"title": "\u22c6.\u2729 \u02da", "artists": "Someone", "duration_ms": 120000}
-    check("match: a symbol-only title still matches on length", engine.spotify_match(sym, fake([H("someone - whatever", "Someone", 121, "u2")]))[0], "u2")
+    check("match: a symbol-only title matches on its symbols + length (0.1.43: another song of the artist no longer does)", [engine.spotify_match(sym, fake([H("someone - \u22c6.\u2729 \u02da", "Someone", 121, "u2")]))[0], engine.spotify_match(sym, fake([H("someone - whatever", "Someone", 121, "u2")]))[0]], ["u2", None])
     check("match: queries run full, then audio, then short", engine.spotify_queries({"title": "Song (feat. X) - Remastered", "artists": "A, B"}), ["A, B - song", "A song audio", "A song"])
     check("sites: spotify routes to its engine branch", [engine.site_of("https://open.spotify.com/album/x"), engine.site_of("https://open.spotify.com/intl-es/track/x"), engine.site_of("https://open.spotify.com/user/x")], ["spotify", "spotify", None])
 

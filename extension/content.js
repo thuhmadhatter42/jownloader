@@ -248,8 +248,20 @@
     scroller = scroller && scroller !== document.documentElement ? scroller : document.scrollingElement;
     const seen = new Map();
     const read = () => {
-      for (const row of document.querySelectorAll(rowSel)) {
-        const idx = parseInt(row.getAttribute("aria-rowindex") || "", 10) || 0;
+      // a row without aria-rowindex keeps its place in the page: just after the row above it that has one
+      // (else just before the first row below it that has one)
+      const all = [...document.querySelectorAll(rowSel)];
+      const idxs = all.map((r) => parseInt(r.getAttribute("aria-rowindex") || "", 10) || 0);
+      const orderOf = (i) => {
+        if (idxs[i]) return idxs[i];
+        let j = i - 1; while (j >= 0 && !idxs[j]) j--;
+        if (j >= 0) return idxs[j] + (i - j) * 0.001;
+        j = i + 1; while (j < idxs.length && !idxs[j]) j++;
+        if (j < idxs.length) return idxs[j] - (j - i) * 0.001;
+        return seen.size + i + 0.5;     // no row on the page has an index: page order
+      };
+      for (const [n, row] of all.entries()) {
+        const idx = idxs[n];
         const link = row.querySelector('a[href*="/track/"]');
         const id = (link?.getAttribute("href") || "").match(/\/track\/([A-Za-z0-9]+)/)?.[1];
         if (!id) continue;
@@ -257,7 +269,7 @@
         if (seen.has(key)) continue;
         const arts = [...row.querySelectorAll('a[href*="/artist/"]')].map((a) => a.textContent.trim()).filter(Boolean);
         const len = ([...row.querySelectorAll("div")].map((d) => d.children.length ? "" : d.textContent.trim()).filter((t) => /^\d+:\d{2}(:\d{2})?$/.test(t)).pop() || "").split(":").reduce((a, n) => a * 60 + (+n || 0), 0);
-        seen.set(key, { order: idx, title: (link.textContent || "").trim(), artists: [...new Set(arts)].join(", "), album: row.querySelector('a[href*="/album/"]')?.textContent.trim() || "", duration_ms: len * 1000, url: "https://open.spotify.com/track/" + id });
+        seen.set(key, { order: orderOf(n), title: (link.textContent || "").trim(), artists: [...new Set(arts)].join(", "), album: row.querySelector('a[href*="/album/"]')?.textContent.trim() || "", duration_ms: len * 1000, url: "https://open.spotify.com/track/" + id });
       }
     };
     const start = scroller.scrollTop;
@@ -276,11 +288,21 @@
     return [...seen.values()].sort((a, b) => a.order - b.order).map(({ order, ...t }) => t);
   }
 
+  // How many songs the open playlist page says it has (the grid's aria-rowcount, less its header row), or null.
+  // The popup uses it to tell a playlist of exactly 100 from one the embed page cut short.
+  function spotifyCount() {
+    const grid = document.querySelector('[data-testid="tracklist-row"]')?.closest("[aria-rowcount]");
+    const n = parseInt(grid?.getAttribute("aria-rowcount") || "", 10);
+    if (!(n > 0)) return null;
+    return grid.querySelector('[role="columnheader"]') ? n - 1 : n;
+  }
+
   chrome.runtime.onMessage.addListener((msg, _s, reply) => {
     if (msg.type === "scanFrame") reply({ host: host(), images: scanImages(), videos: scanVideos(), docs: scanDocs() });
     else if (msg.type === "pageChanged") { autoDone.clear(); collected.clear(); }   // load or pushState: a new page
     else if (msg.type === "siteLinks") reply(Array.from(document.querySelectorAll("a[href]")).map((a) => a.href));
     else if (msg.type === "siteMarkdown") reply(siteMarkdown());
+    else if (msg.type === "spotifyCount" && top === window) reply(spotifyCount());
     else if (msg.type === "spotifyRows" && top === window) { spotifyRows().then(reply, () => reply(null)); return true; }
     else if (msg.type === "saveResult") {
       const btn = pending.get(msg.c);
