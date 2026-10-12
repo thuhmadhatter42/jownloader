@@ -98,6 +98,7 @@ chrome.webNavigation.onCommitted.addListener((d) => { if (d.frameId === 0) clear
 // single-page apps swap content without a load: a pushState is a new page for our purposes too
 chrome.webNavigation.onHistoryStateUpdated.addListener((d) => { if (d.frameId === 0) clearMedia(d.tabId); });
 chrome.tabs.onRemoved.addListener(clearMedia);
+chrome.tabs.onRemoved.addListener((id) => { dropManifestTexts(id).catch(() => {}); });
 
 // ---------- filenames ----------
 function sanitize(s) { return s.replace(/[^\w.\-]+/g, "_").replace(/^[_.]+|_+$/g, "").slice(0, 120); }   // never a leading dot (/.zshrc)
@@ -325,35 +326,83 @@ const manifestCache = new Map();   // url -> Promise<string>
 // we make is already the second one. hook.js (page world) copies the manifest text the page itself got,
 // hookbridge.js forwards it here, and it is kept (session storage: survives a worker restart) keyed by the
 // exact URL. A copy is always preferred to a request; the network is only the fallback.
-const MT_KEY = "manifestTexts", MT_MAX = 40, MT_AGE = 30 * 60 * 1000;
+const MT_KEY = "manifestTexts", MT_BYTES = 2 * 1024 * 1024, MT_AGE = 30 * 60 * 1000;
+// A page can say anything, so a copy is trusted only as far as it can be bound: it is stored under
+// (tab id, frame origin, URL) taken from the message sender — never from the message — and used only by a
+// save that starts from that same tab, and only while the tab has itself requested something from the URL's
+// origin (webRequest capture). The whole cache is capped at MT_BYTES (oldest out first), so it can never
+// crowd the other session-storage users out of their quota.
+const mtLooksLikeManifest = (t) => /^\s*#EXTM3U/.test(t) || /<MPD[\s>]/i.test(t.slice(0, 4096));
 let mtChain = Promise.resolve();
-function storeManifestText(url, text) {
+function mtPrune(all, now) {
+  let bytes = 0;
+  for (const [k, v] of Object.entries(all).sort((a, b) => b[1].ts - a[1].ts)) {
+    if (now - v.ts > MT_AGE || bytes + v.text.length > MT_BYTES) delete all[k]; else bytes += v.text.length;
+  }
+}
+function storeManifestText(sender, url, text) {
+  const tabId = sender?.tab?.id;
+  if (tabId == null || tabId < 0 || typeof url !== "string" || typeof text !== "string" || text.length > MT_BYTES || !mtLooksLikeManifest(text)) return Promise.resolve();
+  const key = `${tabId}|${sender.origin || ""}|${url}`;
   const step = async () => {
     const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {}, now = Date.now();
-    all[url] = { text, ts: now };
-    for (const [k] of Object.entries(all).sort((a, b) => b[1].ts - a[1].ts).filter(([, v], i) => i >= MT_MAX || now - v.ts > MT_AGE)) delete all[k];
+    all[key] = { tabId, url, text, ts: now };
+    mtPrune(all, now);
+    try { await chrome.storage.session.set({ [MT_KEY]: all }); } catch (e) { console.warn("manifest copy not kept", e?.message || e); }
+  };
+  return (mtChain = mtChain.then(step, step));
+}
+function dropManifestTexts(tabId) {
+  const step = async () => {
+    const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {};
+    for (const [k, v] of Object.entries(all)) if (v.tabId === tabId) delete all[k];
     await chrome.storage.session.set({ [MT_KEY]: all });
   };
   return (mtChain = mtChain.then(step, step));
 }
-async function pageManifestText(url) {
+async function pageManifestText(url, tabId) {
+  if (tabId == null) return null;
   await mtChain.catch(() => {});
+  let origin; try { origin = new URL(url).origin; } catch { return null; }
   const all = (await chrome.storage.session.get(MT_KEY))[MT_KEY] || {};
-  return (all[url] || all[normalizeMediaUrl(url)])?.text || null;
+  const norm = normalizeMediaUrl(url);
+  const mine = Object.values(all).filter((e) => e.tabId === tabId && (e.url === url || e.url === norm || normalizeMediaUrl(e.url) === norm)).sort((a, b) => b.ts - a.ts);
+  if (!mine.length) return null;
+  const requested = Object.keys(await getMedia(tabId)).some((u) => { try { return new URL(u).origin === origin; } catch { return false; } });
+  return requested ? mine[0].text : null;
 }
-function fetchManifestOnce(url) {
-  if (!manifestCache.has(url)) {
-    manifestCache.set(url, pageManifestText(url).then((t) => t ?? fetchText(url)).catch((e) => { manifestCache.delete(url); throw e; }));
+function fetchManifestOnce(url, tabId = null) {
+  const k = tabId + "|" + url;
+  if (!manifestCache.has(k)) {
+    manifestCache.set(k, pageManifestText(url, tabId).then((t) => t ?? fetchText(url)).catch((e) => { manifestCache.delete(k); throw e; }));
   }
-  return manifestCache.get(url);
+  return manifestCache.get(k);
 }
 // one segment (or a byte range of one); a fetch silent for STALL_MS fails the file
 async function fetchBytes(url, range) {
-  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), STALL_MS);
+  // 2 retries (0.5 s, then 1.5 s) on a network error or a 5xx; a stall (STALL_MS of silence), a 4xx or a DRM refusal fails at once
+  for (let attempt = 0; ; attempt++) {
+    try { return await fetchBytesOnce(url, range); }
+    catch (e) {
+      if (e?.retry !== true) throw e;
+      if (attempt >= 2) throw e.cause;
+      await new Promise((r) => setTimeout(r, attempt ? 1500 : 500));
+    }
+  }
+}
+async function fetchBytesOnce(url, range) {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), STALL_MS), again = (e) => ctl.signal.aborted ? e : Object.assign(new Error("retry"), { retry: true, cause: e });
   try {
-    const res = await fetch(url, { credentials: "include", signal: ctl.signal, headers: range ? { Range: `bytes=${range.start}-${range.end}` } : {} });
-    if (!res.ok) throw new Error(`HTTP ${res.status} (${url.split("/").pop().split("?")[0].slice(0, 40)})`);
-    const b = new Uint8Array(await res.arrayBuffer());
+    let res;
+    try { res = await fetch(url, { credentials: "include", signal: ctl.signal, headers: range ? { Range: `bytes=${range.start}-${range.end}` } : {} }); }
+    catch (e) { throw again(e); }
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status} (${url.split("/").pop().split("?")[0].slice(0, 40)})`);
+      throw res.status >= 500 ? again(err) : err;
+    }
+    let b;
+    try { b = new Uint8Array(await res.arrayBuffer()); }
+    catch (e) { throw again(e); }
     return range && res.status === 200 ? b.subarray(range.start, range.end + 1) : b;   // server ignored the range
   } finally { clearTimeout(t); }
 }
@@ -390,7 +439,7 @@ function parseHls(text, base) {
 }
 const DRM_MSG = "protected video (DRM) — encrypted stream, not saved";
 // tracks to fetch for an HLS URL: [{kind, ext, init, segs, label}]
-async function hlsTracks(url, text) {
+async function hlsTracks(url, text, tabId) {
   const m = parseHls(text, url), tracks = [];
   if (m.master) {
     if (!m.variants.length) throw new Error("empty master playlist");
@@ -401,7 +450,7 @@ async function hlsTracks(url, text) {
     if (a) tracks.push({ kind: "audio", url: a.url });   // a rendition with a URI is a separate playlist (muxed audio has none)
   } else tracks.push({ kind: "video", url, parsed: m });
   for (const t of tracks) {
-    const p = t.parsed || parseHls(await fetchManifestOnce(t.url), t.url);
+    const p = t.parsed || parseHls(await fetchManifestOnce(t.url, tabId), t.url);
     if (p.master) throw new Error("nested master playlist");
     if (p.live) throw new Error("live stream — it has no end to save yet");
     if (!p.segs.length) throw new Error("empty playlist");
@@ -508,7 +557,7 @@ async function streamsFor(tabId) {
   const found = [], children = new Set(), failed = [];
   for (const c of cap) {
     let text;
-    try { text = await fetchManifestOnce(c.url); }
+    try { text = await fetchManifestOnce(c.url, tabId); }
     catch (e) { failed.push({ url: c.url, output: String(e?.message || e) }); continue; }
     if (text.trimStart().startsWith("#EXTM3U")) {
       const m = parseHls(text, c.url);
@@ -536,11 +585,11 @@ function streamName(url, title) {
 }
 // Fetch every segment of the stream's best tracks, stream them to the host as temp files, then have the
 // host join them into name.mp4 in dest. Resolves {ok, path} or {ok:false, output}. Never throws.
-async function saveStreamViaHost(url, name, dest, fin = {}) {
+async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null) {
   const port = hostConnect(), ids = [];
   try {
-    const text = await fetchManifestOnce(url);
-    const tracks = text.trimStart().startsWith("#EXTM3U") ? await hlsTracks(url, text) : dashTracks(text, url);
+    const text = await fetchManifestOnce(url, tabId);
+    const tracks = text.trimStart().startsWith("#EXTM3U") ? await hlsTracks(url, text, tabId) : dashTracks(text, url);
     for (const t of tracks) {
       const id = "s" + (++hostSeq);
       const opened = await hostAsk(port, { cmd: "open", id, name: `${name}.${t.kind}.${t.ext}`, dst: dest || "", temp: true });
@@ -786,6 +835,8 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
   // dedupe within the batch by canonical URL, and against everything ever saved
   const jobs = [], seen = new Set();
   let skipped = 0, unusable = 0;
+  // the tab a save starts from (the popup's active tab when the message names none): only that tab's page-copied manifests are used
+  const srcTab = opts.tabId ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0]?.id ?? null;
   await serial(async () => {
     const cands = [];
     for (const raw of items) {
@@ -820,7 +871,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         const j = queue.shift();
         let r;
         try {
-          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin, srcTab) : await saveViaHost(j.url, j.filename, dest, kind, fin);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; }
@@ -954,7 +1005,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     } else if (msg.type === "getMedia") {
       reply(await mediaList(tabId));
     } else if (msg.type === "manifestText") {
-      if (typeof msg.url === "string" && typeof msg.text === "string") await storeManifestText(msg.url, msg.text);
+      await storeManifestText(sender, msg.url, msg.text);
       reply({ ok: true });
     } else if (msg.type === "streamCandidates") {
       reply(await streamsFor(tabId));
