@@ -217,21 +217,35 @@
     const root = document.querySelector("main") || document.querySelector("article") || document.body;
     const clone = root.cloneNode(true);
     for (const el of clone.querySelectorAll("script, style, noscript, nav, header, footer")) el.remove();
+    // Inline elements (links, bold, code ...) stay inside their paragraph; only block elements start a new one.
+    const INLINE = /^(a|abbr|b|bdi|bdo|big|cite|code|data|del|dfn|em|font|i|ins|kbd|label|mark|q|s|samp|small|span|strike|strong|sub|sup|time|tt|u|var|wbr)$/i;
     const lines = [];
+    let buf = "";
+    const flush = () => { const t = buf.replace(/\s+/g, " ").trim(); if (t && t !== "-") lines.push(t); buf = ""; };
     (function walk(node) {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const t = node.textContent.trim();
-        if (t) lines.push(t);
-        return;
-      }
+      if (node.nodeType === Node.TEXT_NODE) { buf += node.textContent; return; }
       if (node.nodeType !== Node.ELEMENT_NODE) return;
-      const m = /^h([1-6])$/i.exec(node.tagName);
+      const tag = node.tagName.toLowerCase();
+      const m = /^h([1-6])$/.exec(tag);
       if (m) {
-        const t = node.textContent.trim();
+        flush();
+        const t = node.textContent.replace(/\s+/g, " ").trim();
         if (t) lines.push("#".repeat(+m[1]) + " " + t);
         return;
       }
+      if (tag === "br") { buf += " "; return; }
+      if (tag === "tr") {   // a table row = one line, cells separated by " | "
+        flush();
+        const cells = [...node.children].map((c) => c.textContent.replace(/\s+/g, " ").trim()).filter(Boolean);
+        if (cells.length) lines.push(cells.join(" | "));
+        return;
+      }
+      if (tag === "pre") { flush(); const t = node.textContent.replace(/\s+$/, ""); if (t.trim()) lines.push(t); return; }
+      if (INLINE.test(tag)) { for (const child of node.childNodes) walk(child); return; }
+      flush();
+      if (tag === "li") buf = "- ";
       for (const child of node.childNodes) walk(child);
+      flush();
     })(clone);
     return { title: document.title || "", text: lines.join("\n\n") };
   }
