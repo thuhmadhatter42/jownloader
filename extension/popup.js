@@ -225,13 +225,20 @@ loadRenameFiles();
 
 // ---------- dependencies ----------
 const DEP_LABEL = { "yt-dlp": "yt-dlp", ffmpeg: "ffmpeg", "gallery-dl": "gallery-dl", exiftool: "exiftool", pypdf: "pypdf", analyzer: "BPM/key analyzer" };
-const hintText = (h) => { const v = Object.values(h || {}); return v.length ? ". " + v.join(". ") : ""; };
+const hintText = (h) => { const v = Object.values(h || {}); return v.length ? "\n" + v.join("\n") : ""; };
+// the installer's own "no prebuilt package for this macOS - install X by hand: ..." lines travel in the setup output
+const byHand = (out) => { const l = String(out || "").split("\n").filter((x) => /by hand|Homebrew could not|⚠|❌/.test(x)); return l.length ? "\n" + l.join("\n") : ""; };
+// one line per missing tool: why it is not there and how to get it by hand (the tooltip alone is never seen)
+const depsWhyText = (deps, hints) => Object.entries(deps || {}).filter(([, v]) => !v.present)
+  .map(([k]) => (hints?.[k] ? `✗ ${DEP_LABEL[k] || k}: ${hints[k]}` : "")).concat(hints?.venv ? [hints.venv] : []).filter(Boolean).join("\n");
 async function showDeps() {
   const r = await chrome.runtime.sendMessage({ type: "deps" }).catch(() => null);
   if (!r?.ok) { $("deps").textContent = "Dependencies: " + (r?.output || "native host not reachable — run native/install.sh"); $("depsInstall").hidden = true; return; }
   const missing = Object.entries(r.deps).filter(([, v]) => !v.present).map(([k]) => k);
   $("deps").textContent = "Dependencies: " + Object.entries(r.deps).map(([k, v]) => (v.present ? "✓ " : "✗ ") + (DEP_LABEL[k] || k)).join("   ");
   $("deps").title = Object.values(r.hints || {}).join("\n");
+  const why = depsWhyText(r.deps, r.hints);
+  $("depsWhy").textContent = why; $("depsWhy").hidden = !why;
   $("depsInstall").hidden = !missing.length;
 }
 $("depsInstall").onclick = async () => {
@@ -240,7 +247,7 @@ $("depsInstall").onclick = async () => {
   const r = await chrome.runtime.sendMessage({ type: "setup" }).catch(() => null);
   $("depsInstall").disabled = false;
   $("status").textContent = r?.ok
-    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}` : "all dependencies installed")
+    ? (r.missing?.length ? `installed what it could — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}${byHand(r.output)}` : "all dependencies installed")
     : (r?.output || "install failed");
   showDeps();
 };
@@ -249,7 +256,7 @@ showDeps();
 chrome.runtime.sendMessage({ type: "getSetupResult" }).then((r) => {
   if (!r) return;
   $("status").textContent = r.ok
-    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}` : "dependencies installed")
+    ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}${byHand(r.output)}` : "dependencies installed")
     : (r.output || "dependency install failed");
 }).catch(() => {});
 
