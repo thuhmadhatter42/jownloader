@@ -80,8 +80,21 @@ def _in_venv():
     return os.path.realpath(sys.prefix) == os.path.realpath(_VENV_DIR)
 
 
+# The exec happens at most once: a marker in the environment (inherited by the exec'd process) stops a venv
+# that does not report itself as one (pyvenv.cfg gone, python3 a shim for the bootstrap python) from being
+# re-exec'd forever, and an exec that fails (not executable, wrong format) falls through. Either way the host
+# keeps running in this interpreter, and _VENV_UNUSABLE makes the deps reply say what to do.
+_REEXEC_MARK = "JOWNLOADER_HOST_REEXEC"
+_VENV_UNUSABLE = os.path.lexists(_VENV_PY) and not os.path.exists(_VENV_PY)   # dangling python3 symlink
 if os.path.exists(_VENV_PY) and not _in_venv():
-    os.execv(_VENV_PY, [_VENV_PY, *sys.argv])
+    if os.environ.get(_REEXEC_MARK):
+        _VENV_UNUSABLE = True
+    else:
+        os.environ[_REEXEC_MARK] = "1"
+        try:
+            os.execv(_VENV_PY, [_VENV_PY, *sys.argv])
+        except OSError:
+            _VENV_UNUSABLE = True
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine
@@ -208,14 +221,45 @@ def check_deps():
 APPLE_PY_HINT = "BPM/key needs Homebrew Python: brew install python, then Install missing dependencies again"
 
 
+VENV_UNUSABLE_HINT = ("native/.venv is unusable (its Python is gone or pyvenv.cfg is missing): the host runs on the system "
+                      "Python without the libraries. Delete the native/.venv folder, then click Install missing dependencies")
+# for the popup and the host's own errors: how to get each tool when the installer cannot (same advice as deps.sh)
+TOOL_HOWTO = engine.TOOL_HOWTO
+
+
+def _is_apple_path(p):
+    p = p or ""
+    return p == "/usr/bin" or p.startswith(("/Library/Developer/CommandLineTools/", "/Applications/Xcode",
+                                             "/usr/bin/", "/System/Library/Frameworks/"))
+
+
+def python_is_apple():
+    """Is the interpreter this one is built on Apple's? Inside a venv sys._base_executable is the venv's own
+    python3, so read pyvenv.cfg (`home`, `base-executable`) and sys.base_prefix, which name the real base."""
+    cfg = {}
+    try:
+        with open(os.path.join(sys.prefix, "pyvenv.cfg")) as f:
+            for line in f:
+                k, _, v = line.partition("=")
+                cfg[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return any(_is_apple_path(p) for p in (cfg.get("home"), cfg.get("base-executable"), sys.base_prefix,
+                                           getattr(sys, "_base_executable", "")))
+
+
 def deps_hints(deps):
-    """Why a dependency is missing, when we know. The one known case: the venv runs on Apple's Python 3.9
-    (Xcode Command Line Tools) and has no BPM/key analyzer; the same text deps.sh prints."""
+    """Why a dependency is missing, when we know, and how to get it by hand: the venv runs on Apple's Python
+    3.9 (Xcode Command Line Tools) and has no BPM/key analyzer (the text deps.sh prints), the venv itself is
+    unusable, or an engine tool the installer could not or would not provide (no prebuilt package here)."""
     hints = {}
-    base = getattr(sys, "_base_executable", sys.executable) or ""
-    apple = base.startswith(("/Library/Developer/CommandLineTools/", "/usr/bin/")) or base.startswith("/Applications/Xcode")
-    if not deps.get("analyzer", {}).get("present") and apple:
+    if not deps.get("analyzer", {}).get("present") and python_is_apple():
         hints["analyzer"] = APPLE_PY_HINT
+    if _VENV_UNUSABLE:
+        hints["venv"] = VENV_UNUSABLE_HINT
+    for tool in ("yt-dlp", "ffmpeg", "gallery-dl", "exiftool"):
+        if tool in deps and not deps[tool].get("present"):
+            hints[tool] = f"not installed: click Install missing dependencies, or by hand: {TOOL_HOWTO[tool]}"
     return hints
 
 
@@ -225,7 +269,8 @@ def setup_async(msg):
     def run():
         deps_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deps.sh")
         try:
-            p = subprocess.run(["/bin/bash", "-c", f'source "{deps_sh}" && ensure_deps'],
+            # the path is an argument, never spliced into the script: `"`, `$`, backticks in it are harmless
+            p = subprocess.run(["/bin/bash", "-c", 'source "$1" && ensure_deps', "_", deps_sh],
                                 capture_output=True, text=True, timeout=1800)
             lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip()]
             output, ok = "\n".join(lines[-20:]), p.returncode == 0
@@ -371,7 +416,7 @@ def join(msg):
         except OSError: pass
         note = "ffmpeg could not join the tracks (" + err + ")"
     else:
-        note = "ffmpeg not found (brew install ffmpeg)"
+        note = "ffmpeg not found (" + TOOL_HOWTO["ffmpeg"] + ")"
     # no ffmpeg / it failed: keep what was fetched, say so
     if len(tracks) == 1:
         out = unique_path(dst, name + raw_ext(tracks[0]))

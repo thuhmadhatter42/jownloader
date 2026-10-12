@@ -369,6 +369,67 @@ print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["T
         check("venv built on the launching python: sys.prefix is the venv", os.path.realpath(info.get("prefix") or "/none"), os.path.realpath(os.path.join(ap, ".venv")))
     else:
         print("skip same-interpreter venv check (could not build a venv from " + BOOT_PY + ")")
+    # ---- 0.1.43: a venv the host cannot use never hangs it; Apple-Python venvs get their hint; odd install paths ----
+    def host_copy(name, stub_deps=False):
+        h = os.path.join(d, name); os.makedirs(h)
+        for f in ("jownloader_host.py", "engine.py", "analyze.py", "deps.sh"):
+            shutil.copy(os.path.join(os.path.dirname(HOST), f), h)
+        if os.environ.get("JOWN_HOST_UNDER_TEST"): shutil.copy(os.environ["JOWN_HOST_UNDER_TEST"], os.path.join(h, "jownloader_host.py"))
+        if stub_deps:
+            with open(os.path.join(h, "deps.sh"), "w") as f: f.write('ensure_deps() { echo STUB-ENSURE-DEPS-RAN; }\n')
+        return h
+    def ask_host(h, msg, timeout=15):
+        # one request on a persistent port; a hung host (exec loop) shows up as None, never as a stuck test
+        data = json.dumps(msg).encode()
+        p = subprocess.Popen([BOOT_PY, os.path.join(h, "jownloader_host.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, env=BROWSER_ENV)
+        try:
+            p.stdin.write(struct.pack("<I", len(data)) + data); p.stdin.flush()
+            dl = time.time() + timeout
+            n = struct.unpack("<I", _read_n(p.stdout, 4, dl))[0]
+            return json.loads(_read_n(p.stdout, n, dl))
+        except (TimeoutError, EOFError):
+            return None
+        finally:
+            p.kill(); p.wait()
+    def venv_host(name, mutate):
+        h = host_copy(name)
+        if subprocess.run([BOOT_PY, "-m", "venv", os.path.join(h, ".venv")], capture_output=True, env=BROWSER_ENV).returncode != 0:
+            return None
+        mutate(os.path.join(h, ".venv"))
+        return h
+    def no_cfg(v): os.remove(os.path.join(v, "pyvenv.cfg"))
+    def garbage_py(v):
+        py = os.path.join(v, "bin", "python3"); os.remove(py)
+        with open(py, "wb") as f: f.write(b"\x00\x01garbage-not-a-binary")
+        os.chmod(py, 0o755)
+    def not_exec_py(v):
+        py = os.path.join(v, "bin", "python3"); os.remove(py)
+        with open(py, "w") as f: f.write("not executable")
+        os.chmod(py, 0o644)
+    def dangling_py(v):
+        py = os.path.join(v, "bin", "python3"); os.remove(py); os.symlink("/nonexistent/python3", py)
+    for label, mut in (("no pyvenv.cfg", no_cfg), ("garbage binary as python3", garbage_py),
+                       ("python3 not executable", not_exec_py), ("python3 dangling symlink", dangling_py)):
+        h = venv_host("bad-" + label.replace(" ", "-"), mut)
+        if h is None:
+            print("skip unusable-venv check '" + label + "' (could not build a venv)"); continue
+        r = ask_host(h, {"cmd": "deps"})
+        check(f"unusable venv ({label}): host still answers", bool(r and r.get("ok")), True)
+        check(f"unusable venv ({label}): reply says what to do", "venv" in ((r or {}).get("hints") or {}), True)
+    # an Apple-Python venv without the analyzer: the hint shows (inside a venv sys._base_executable is the venv's own python3)
+    h = venv_host("apple-hint", lambda v: None)
+    if h and any(l.split("=", 1)[1].strip().startswith(("/Library/Developer/CommandLineTools/", "/Applications/Xcode", "/usr/bin"))
+                 for l in open(os.path.join(h, ".venv", "pyvenv.cfg")) if l.startswith("home")):
+        r = ask_host(h, {"cmd": "deps"})
+        check("Apple-Python venv, no analyzer: hint present", (r or {}).get("hints", {}).get("analyzer"),
+              "BPM/key needs Homebrew Python: brew install python, then Install missing dependencies again")
+    else:
+        print("skip Apple-venv hint check (launching python3 is not Apple's)")
+    # setup with an install path containing a double quote, $ and a backtick (the path is an argument, not spliced into bash)
+    h = host_copy('has"quote$dollar`tick', stub_deps=True)
+    r = ask_host(h, {"cmd": "setup", "id": "s1"}, timeout=60)
+    check("setup in a path with \" $ ` : ensure_deps ran", [bool(r and r.get("ok")), "STUB-ENSURE-DEPS-RAN" in ((r or {}).get("output") or "")], [True, True])
 finally:
     shutil.rmtree(d)
 print("ALL GREEN" if not fails else f"{fails} FAILED")

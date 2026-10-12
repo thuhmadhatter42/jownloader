@@ -77,9 +77,26 @@ def _missing(*tools):
     return [t for t in tools if not shutil.which(t)]
 
 
+# How a person gets each tool when the installer cannot (same advice native/deps.sh prints). Homebrew is only
+# one way in, and on a macOS without prebuilt packages the installer deliberately refuses to build from source.
+TOOL_HOWTO = {
+    "yt-dlp": "pipx install yt-dlp (no pipx: python3 -m pip install --user pipx && python3 -m pipx install yt-dlp)",
+    "gallery-dl": "pipx install gallery-dl (no pipx: python3 -m pip install --user pipx && python3 -m pipx install gallery-dl)",
+    "ffmpeg": "download a static build from https://ffmpeg.org/download.html, put ffmpeg and ffprobe in /usr/local/bin",
+    "exiftool": "install the macOS package from https://exiftool.org",
+}
+
+
+def tool_howto(tool):
+    return TOOL_HOWTO.get(tool, "see the tool's own website")
+
+
 def _need(*tools):
     m = _missing(*tools)
-    return f"{' and '.join(m)} not installed — run native/install.sh (brew install {' '.join(m)})" if m else None
+    if not m:
+        return None
+    return (f"{' and '.join(m)} not installed — click Install missing dependencies in the popup or run native/install.sh; by hand: "
+            + "; ".join(f"{t}: {tool_howto(t)}" for t in m))
 
 
 def safe_name(text):
@@ -944,12 +961,12 @@ def strip_metadata(path):
     ext = p.suffix.lower()
     if ext in IMAGE_META:
         if not shutil.which("exiftool"):
-            return False, "exiftool not installed — run native/install.sh (brew install exiftool)"
+            return False, "exiftool not installed — click Install missing dependencies or run native/install.sh; by hand: " + tool_howto("exiftool")
         code, out, err = _run(["exiftool", "-all=", "-overwrite_original", "-q", str(p)], timeout=300)
         return (True, "") if code == 0 else (False, (err or out).strip().splitlines()[-1] if (err or out).strip() else "exiftool failed")
     if ext in VIDEO_META:
         if not shutil.which("ffmpeg"):
-            return False, "ffmpeg not installed — run native/install.sh (brew install ffmpeg)"
+            return False, "ffmpeg not installed — click Install missing dependencies or run native/install.sh; by hand: " + tool_howto("ffmpeg")
         tmp = p.with_name(p.stem + ".strip-tmp" + p.suffix)
         code, _, err = _run(["ffmpeg", "-v", "error", "-y", "-i", str(p), "-map", "0", "-map_metadata", "-1", "-map_chapters", "-1",
                              "-c", "copy", "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact", *(["-movflags", "+faststart"] if ext in (".mp4", ".m4v", ".mov", ".m4a") else []), str(tmp)], timeout=1800)

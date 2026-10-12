@@ -213,6 +213,18 @@ with sync_playwright() as p:
     pop2 = ctx.new_page(); pop2.goto(f"chrome-extension://{ext_id}/popup.html"); pop2.wait_for_timeout(800)
     check("mp3 switch: a reopened popup shows it on in both places", pop2.evaluate("() => [...document.querySelectorAll('input.mp3')].map(b => b.checked)"), [True, True])
     pop2.close()
+    # Dependencies row: a missing tool shows WHY and the by-hand how-to in the page (a tooltip alone is never seen)
+    shown = pop.evaluate("""async () => {
+      const real = chrome.runtime.sendMessage.bind(chrome.runtime);
+      chrome.runtime.sendMessage = async (m) => m && m.type === "deps" ? { ok: true,
+        deps: { "yt-dlp": { present: false }, ffmpeg: { present: true }, analyzer: { present: false } },
+        hints: { "yt-dlp": "not installed: click Install missing dependencies, or by hand: pipx install yt-dlp", analyzer: "BPM/key needs Homebrew Python: brew install python, then Install missing dependencies again", venv: "native/.venv is unusable" } } : real(m);
+      await showDeps();
+      chrome.runtime.sendMessage = real;
+      const w = document.getElementById("depsWhy");
+      return [w.hidden, w.textContent, getComputedStyle(w).display];
+    }""")
+    check("deps row: per-tool reason + by-hand how-to are visible text, not a tooltip", [shown[0], shown[2] != "none", "✗ yt-dlp: not installed: click Install missing dependencies, or by hand: pipx install yt-dlp" in shown[1], "✗ BPM/key analyzer: BPM/key needs Homebrew Python" in shown[1], "native/.venv is unusable" in shown[1]], [False, True, True, True, True])
     sw.evaluate("() => { __sent.length = 0; }")
     pop.evaluate("async () => await chrome.runtime.sendMessage({type:'download', kind:'video', dest:'/d', prefix:'', items:[{url:'https://www.youtube.com/watch?v=mp3on', engine:true, mode:'audio'}, {url:'https://www.youtube.com/watch?v=mp3vid', engine:true, mode:'video'}]})")
     pop.wait_for_timeout(500)

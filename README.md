@@ -81,6 +81,24 @@ separately instead of merged.
   refused before a file is written. There is no circumvention here and none is planned.
 - **Live streams** have no end to save; they are refused until the site publishes the recording.
 
+## Permissions and privacy
+
+What the extension asks for, and why:
+
+- **All sites (`<all_urls>`)**: it reads the page you are on to find images, videos and documents, and
+  injects a small script into every page (in the page's own context) that watches the page's own
+  `fetch` / XHR traffic for stream manifests (HLS / DASH). Nothing it reads is sent anywhere by the
+  extension; the files it saves are fetched with your browser's own session, straight to disk.
+- **`debugger`**: to read stream traffic and print pages to PDF on demand.
+- **`nativeMessaging`**: to talk to the local host that writes files. The host runs only on your Mac.
+- **`tabs`, `webNavigation`, `webRequest`, `storage`, `sidePanel`, `notifications`**: following the
+  active tab, remembering what was already saved, the side panel and the finish notification.
+- **Cookies**: for pages that need a login, the download tools (`yt-dlp`, `gallery-dl`) may read your
+  browser's cookies for that site, locally, on your Mac, and only to make that one request. They are not
+  copied, stored or sent anywhere else.
+- **Install missing dependencies** can run Homebrew's official installer (the `curl | bash` line in
+  `native/deps.sh`) when Homebrew is absent; read the script before pressing it.
+
 ## Install (macOS)
 
 Files are written by a small native-messaging host, a Python script the browser launches on demand.
@@ -111,6 +129,14 @@ and the BPM/key analyzer live in `native/.venv`. If Homebrew's Python is not ins
 built on Apple's Python 3.9, which works for the PDF and tag libraries and, where wheels exist, the
 analyzer; if the analyzer cannot install there, run `brew install python` and then **Install missing
 dependencies** again (the venv is rebuilt on Homebrew's Python).
+
+With neither Homebrew nor `pipx` (for example a Mac whose user is not an administrator) the script does
+not stop: it prints which tools are present and which are missing, with the exact command for each, and the
+popup's Dependencies row shows the same. Without pipx: `python3 -m pip install --user pipx && python3 -m pipx install yt-dlp`
+(pip's `--user` scripts are not on `PATH`, hence `python3 -m pipx`). On Apple's Python 3.9 alone, pip stops
+at an old `yt-dlp`; the installer warns, and a newer Python (python.org or Homebrew) then
+`pipx reinstall --python python3 yt-dlp` fixes it. A `native/.venv` whose Python was removed or whose
+`pyvenv.cfg` is missing is rebuilt automatically.
 
 `native/install.sh` registers the host and installs the tools above. After that,
 the extension keeps them current on its own: it checks on every install/update and installs anything
