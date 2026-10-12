@@ -315,12 +315,77 @@ def rename(msg):
     return {"ok": True, "results": results}
 
 
-def unique_path(dst_dir, name):
+NAME_LIMIT = 200      # bytes of UTF-8 in a name we build or accept: leaves room for " (99)" and ".jownloading" under 255
+NAME_LOCK = threading.Lock()
+
+
+def fit_bytes(s, limit):
+    """s cut to at most `limit` bytes of UTF-8 at a character boundary; a lone surrogate is dropped."""
+    s = s.encode("utf-8", "ignore").decode("utf-8")
+    if len(s.encode("utf-8")) <= limit:
+        return s
+    return s.encode("utf-8")[:limit].decode("utf-8", "ignore")
+
+
+def clean_name(name, fallback="download"):
+    """A page-supplied file name: last path part, no leading dots, <= NAME_LIMIT bytes (extension kept)."""
+    name = os.path.basename((name or "").replace("\\", "/")).strip().lstrip(".").strip()
+    name = name.encode("utf-8", "ignore").decode("utf-8")
+    if len(name.encode("utf-8")) > NAME_LIMIT:
+        base, ext = os.path.splitext(name)
+        if len(ext.encode("utf-8")) > 16:
+            base, ext = name, ""
+        name = fit_bytes(base, NAME_LIMIT - len(ext.encode("utf-8"))).rstrip() + ext
+    return name or fallback
+
+
+def _taken(out):
+    return os.path.lexists(out) or os.path.lexists(out + ".jownloading")
+
+
+def unique_path(dst_dir, name, reserve=False):
+    """A free name in dst_dir: neither the file nor its .jownloading exists. reserve=True also creates the
+    empty name.jownloading atomically (O_EXCL) so a concurrent caller can never pick the same name;
+    the caller then owns that temp (write into it, rename or remove it)."""
     base, ext = os.path.splitext(name)
-    out, n = os.path.join(dst_dir, name), 2
-    while os.path.exists(out):
-        out = os.path.join(dst_dir, f"{base} ({n}){ext}"); n += 1
-    return out
+    with NAME_LOCK:
+        out, n = os.path.join(dst_dir, name), 2
+        while True:
+            if not _taken(out):
+                if not reserve:
+                    return out
+                try:
+                    os.close(os.open(out + ".jownloading", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644))
+                    return out
+                except FileExistsError:
+                    pass
+            out = os.path.join(dst_dir, f"{base} ({n}){ext}"); n += 1
+
+
+def final_for(temp, dst, name):
+    """The final name for a temp track that already holds its own reservation: the temp's own name minus
+    .jownloading when that is `name` and still free, else the next free name."""
+    own = os.path.join(dst, name)
+    if own + ".jownloading" == temp and not os.path.lexists(own):
+        return own
+    return unique_path(dst, name)
+
+
+def commit(temp, path):
+    """Move a finished temp onto its reserved final name, never replacing a file that appeared there
+    meanwhile (then the next free name is used). Returns the path actually written."""
+    while True:
+        try:
+            os.link(temp, path)
+        except FileExistsError:
+            path = unique_path(os.path.dirname(path), os.path.basename(path))
+            continue
+        except OSError:                                  # filesystem without hard links
+            if os.path.lexists(path):
+                path = unique_path(os.path.dirname(path), os.path.basename(path)); continue
+            os.replace(temp, path); return path
+        os.remove(temp)
+        return path
 
 
 OPEN = {}   # id -> {"f": file, "path": str, "bytes": int, "temp": bool}
@@ -339,7 +404,7 @@ def join(msg):
     """Join the temp tracks of one stream into dst/name.mp4 (ffmpeg -c copy); temps are removed."""
     sid, ids = msg.get("id"), msg.get("ids") or []
     dst = msg.get("dst") or os.path.expanduser("~/Downloads")
-    name = os.path.basename(msg.get("name") or "video") or "video"
+    name = clean_name(msg.get("name"), "video")
     tracks = [TEMP.pop(i) for i in ids if i in TEMP]
     if len(tracks) != len(ids) or not tracks:
         for t in tracks:
@@ -349,7 +414,7 @@ def join(msg):
     raw_ext = lambda t: os.path.splitext(t[:-len(".jownloading")])[1] or ".mp4"
     ff = ffmpeg_path()
     if ff:
-        out = unique_path(dst, name + ".mp4")
+        out = unique_path(dst, name + ".mp4", reserve=True)
         cmd = [ff, "-nostdin", "-y", "-loglevel", "error"]
         for t in tracks:
             cmd += ["-i", t]
@@ -365,7 +430,7 @@ def join(msg):
             for t in tracks:
                 try: os.remove(t)
                 except OSError: pass
-            os.replace(out + ".jownloading", out)
+            out = commit(out + ".jownloading", out)
             return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
         try: os.remove(out + ".jownloading")
         except OSError: pass
@@ -374,14 +439,12 @@ def join(msg):
         note = "ffmpeg not found (brew install ffmpeg)"
     # no ffmpeg / it failed: keep what was fetched, say so
     if len(tracks) == 1:
-        out = unique_path(dst, name + raw_ext(tracks[0]))
-        os.replace(tracks[0], out)
+        out = commit(tracks[0], final_for(tracks[0], dst, name + raw_ext(tracks[0])))
         return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out), "output": note + " — saved raw as " + os.path.basename(out)}
     outs = []
     for t in tracks:
         base = os.path.basename(t[:-len(".jownloading")])          # name.video.mp4 / name.audio.mp4 (+ (2) suffix)
-        out = unique_path(dst, base)
-        os.replace(t, out); outs.append(out)
+        out = commit(t, final_for(t, dst, base)); outs.append(out)
     return {"id": sid, "ok": True, "path": outs[0], "bytes": sum(os.path.getsize(o) for o in outs),
             "output": note + " — video and audio saved as separate files: " + ", ".join(os.path.basename(o) for o in outs)}
 
@@ -391,7 +454,8 @@ def safe_name(title, fallback):
     capped. Colons stay (Portal:Current events)."""
     t = re.sub(r"[\x00-\x1f\x7f]+", " ", title or "")
     t = re.sub(r"[/\\]+", "-", t)
-    t = re.sub(r"\s+", " ", t).strip().lstrip(".").strip()[:150].strip()
+    t = re.sub(r"\s+", " ", t).strip().lstrip(".").strip()
+    t = fit_bytes(t, 150).strip()                # bytes, not characters: 150 emoji are 600 bytes and APFS stops at 255
     return t or fallback
 
 
@@ -402,7 +466,7 @@ def mergepdf(msg):
     (never 001.pdf). Nothing is overwritten."""
     sid, ids = msg.get("id"), msg.get("ids") or []
     dst = msg.get("dst") or os.path.expanduser("~/Downloads")
-    name = os.path.basename(msg.get("name") or "site") or "site"
+    name = clean_name(msg.get("name"), "site")
     titles = msg.get("titles") or []
     tracks = [TEMP.pop(i) for i in ids if i in TEMP]
     if len(tracks) != len(ids) or not tracks:
@@ -414,8 +478,7 @@ def mergepdf(msg):
     try:
         os.makedirs(dst, exist_ok=True)
         if len(tracks) == 1:
-            out = unique_path(dst, title_of(0) + ".pdf")
-            os.replace(tracks[0], out)
+            out = commit(tracks[0], unique_path(dst, title_of(0) + ".pdf"))
             return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
         try:
             from pypdf import PdfReader, PdfWriter
@@ -426,14 +489,15 @@ def mergepdf(msg):
             while os.path.exists(folder):
                 folder = os.path.join(dst, f"{name} ({k})"); k += 1
             os.makedirs(folder)
+            pages = []
             for i, t in enumerate(tracks):
-                os.replace(t, unique_path(folder, title_of(i) + ".pdf"))
-            r = {"id": sid, "ok": True, "path": folder}
+                pages.append(commit(t, unique_path(folder, title_of(i) + ".pdf")))
+            r = {"id": sid, "ok": True, "path": folder, "files": pages}      # "files": strip/webp reach every page
             if PdfReader is None and not msg.get("split"):
                 r["output"] = "pypdf not installed — pages kept separately; run native/install.sh"
             return r
         first = safe_name(titles[0] if titles else "", "")
-        out = unique_path(dst, (first or name) + ".pdf")
+        out = unique_path(dst, (first or name) + ".pdf", reserve=True)
         try:
             writer = PdfWriter()
             for t in tracks:
@@ -444,13 +508,16 @@ def mergepdf(msg):
             for t in tracks:
                 try: os.remove(t)
                 except OSError: pass
-            os.replace(out + ".jownloading", out)
+            out = commit(out + ".jownloading", out)
             return {"id": sid, "ok": True, "path": out, "bytes": os.path.getsize(out)}
         except Exception:
             try: os.remove(out + ".jownloading")
             except OSError: pass
             raise
     except Exception as e:
+        for t in tracks:                                # a failed merge / rename leaves no temp page in dst
+            try: os.remove(t)
+            except OSError: pass
         return {"id": sid, "ok": False, "output": str(e)}
 
 
@@ -459,10 +526,10 @@ def stream(msg):
     cmd, sid = msg.get("cmd"), msg.get("id")
     if cmd == "open":
         dst = msg.get("dst") or os.path.expanduser("~/Downloads")
-        name = os.path.basename(msg.get("name") or "download") or "download"
+        name = clean_name(msg.get("name"))
         try:
             os.makedirs(dst, exist_ok=True)
-            path = unique_path(dst, name)
+            path = unique_path(dst, name, reserve=True)           # the name is ours from here: no other open can pick it
             OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "temp": bool(msg.get("temp")),
                          "strip": bool(msg.get("strip")), "webp": msg.get("webp") or False}
             return {"id": sid, "ok": True, "path": path}
@@ -488,7 +555,7 @@ def stream(msg):
         TEMP[sid] = st["path"] + ".jownloading"
         return {"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}
     try:
-        os.replace(st["path"] + ".jownloading", st["path"])
+        st["path"] = commit(st["path"] + ".jownloading", st["path"])
         return finished({"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}, st)
     except Exception as e:
         return {"id": sid, "ok": False, "output": str(e)}

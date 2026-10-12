@@ -131,9 +131,11 @@ with sync_playwright() as p:
       filenameFor('https://x.com/a/b.jpg','image','',{prefix:'[yy-january-dd]', n:1, date:'2025-03-07'}),
       filenameFor('https://x.com/a/b.jpg','image','',{prefix:'[Jan D YYYY]', n:1, date:'2025-03-07T12:00:00Z'}),
       filenameFor('https://x.com/a/b.jpg','image','',{prefix:'[yyyy]', n:1, date:''}) === (new Date().getFullYear() + '_1.jpg'),
+      filenameFor('https://evil.example/.zshrc','doc',''),
+      filenameFor('https://evil.example/..%2F..%2F.netrc','doc',''),
     ]""")
     check("filenames", names, ['300.jpg', 'clip.mp4', 'manual.pdf', 'clip_2.mp4',
-          'shoot-25-03-07_3.jpg', '03-7-2025_1.jpg', 'mar-7-2025_1.jpg', '25-march-07_1.jpg', 'Mar 7 2025_1.jpg', True])
+          'shoot-25-03-07_3.jpg', '03-7-2025_1.jpg', 'mar-7-2025_1.jpg', '25-march-07_1.jpg', 'Mar 7 2025_1.jpg', True, 'zshrc', 'netrc'])
 
     # a batch with no reachable host: queued, then every file fails with the install hint — never silent
     r = pop.evaluate("""async () => await chrome.runtime.sendMessage({type:'download', kind:'image', prefix:'beat', items:[
