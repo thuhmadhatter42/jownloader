@@ -27,13 +27,18 @@ Every function returns plain dicts and never raises; messages are plain English 
 Usage from a shell (for tests): python3 engine.py <url> [out-dir] [video|audio] [--mp3]
 """
 
+import contextlib
+import fcntl
+import glob
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.request
 from pathlib import Path
 
@@ -86,6 +91,16 @@ def safe_name(text):
     for ch in r'\/:*?"<>|[]':
         text = text.replace(ch, "_")
     return text.strip(". ") or "download"
+
+
+def tmpl_escape(text):
+    """Text that goes into a yt-dlp output template as itself. yt-dlp reads '%(field)s' and expands '$VAR' / '${VAR}'
+    in -o: '%' is doubled, and a '$' gets an empty field behind it ('$%(x|)s' -> '$') so no variable can follow it."""
+    return str(text).replace("%", "%%").replace("$", "$%(zz|)s")
+
+
+def tmpl_unescape(text):
+    return str(text).replace("$%(zz|)s", "$").replace("%%", "%")
 
 
 # ══════════════════════════════════════════════════════════════════════════════ YouTube
@@ -142,8 +157,9 @@ def _yt_download(url, mode, outtmpl, extra, mp3=False):
     path = Path(lines[0].strip()) if lines and lines[0].strip() else None
     if not (path and path.exists()):
         # --print sometimes doesn't fire (already-cached, some extractors): newest file with the title stem
-        base, stem = Path(outtmpl).parent, Path(outtmpl).name.replace(".%(ext)s", "")
-        matches = sorted(base.glob(f"{stem}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
+        plain = tmpl_unescape(outtmpl)
+        base, stem = Path(plain).parent, Path(plain).name.replace(".%(ext)s", "")
+        matches = sorted(base.glob(f"{glob.escape(stem)}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
         path = matches[0] if matches else None
     return True, path, []
 
@@ -183,6 +199,19 @@ def _analyze(path):
     return lines[0], keys
 
 
+def _bpm_named(folder, title, mp3=False):
+    """An audio file 'title (NNN BPM keys).ext' already in folder (an .mp3 only when the mp3 switch is on), else None."""
+    try:
+        for e in sorted(os.scandir(folder), key=lambda e: e.name):
+            p = Path(e.name)
+            if e.is_file() and p.suffix.lower() in AUDIO_EXT and (p.suffix.lower() == ".mp3") == bool(mp3) \
+                    and p.stem.startswith(title + " (") and _BPM_SUFFIX.search(p.stem) and _BPM_SUFFIX.sub("", p.stem) == title:
+                return Path(e.path)
+    except OSError:
+        pass
+    return None
+
+
 def youtube(url, mode, outdir, mp3=False):
     err = _need("yt-dlp", "ffmpeg")
     if err:
@@ -196,7 +225,11 @@ def youtube(url, mode, outdir, mp3=False):
     if not info:
         return {"ok": False, "output": _yt_explain(meta_err, url)}
     title = safe_name(info.get("title") or ("audio" if mode == "audio" else "video"))
-    outtmpl = str(Path(outdir) / f"{title}.%(ext)s")
+    if mode == "audio":      # a re-download of a song whose BPM-named file is already there: that file is the song
+        there = _bpm_named(Path(outdir), title, mp3)
+        if there:
+            return {"ok": True, "path": str(there), "files": [], "skipped": 1, "output": ""}
+    outtmpl = tmpl_escape(Path(outdir) / title) + ".%(ext)s"
     last_err, ok, path = [], False, None
     for extra in [working] + [s for s in YT_STRATEGIES if s != working]:
         ok, path, last_err = _yt_download(url, mode, outtmpl, extra, mp3)
@@ -264,10 +297,19 @@ def _best_image(entity):
     return imgs[0]["url"] if imgs else ""
 
 
+def _embed_album(e):
+    """The album name an embed entity / row names, else '' (the embed of a plain track usually names none)."""
+    a = (e or {}).get("album") or (e or {}).get("albumName")
+    if isinstance(a, dict):
+        a = a.get("name") or a.get("title")
+    return a.strip() if isinstance(a, str) else ""
+
+
 def spotify_list(url):
-    """Spotify link -> {ok, name, kind, cover, truncated, tracks:[{title, artists, album, number, duration_ms, cover, url}]}.
+    """Spotify link -> {ok, name, kind, cover, truncated, skipped, note, tracks:[{title, artists, album, number, duration_ms, cover, url}]}.
     truncated = the embed page may have cut the list short (a playlist at the cap) — the extension then
-    collects the rest from the open page. Never raises."""
+    collects the rest from the open page. Rows that are not songs (podcast episodes, local files) are left out
+    and named in `skipped`. Never raises."""
     kind, sid = spotify_parse(url)
     if not kind:
         return {"ok": False, "output": "That isn't a Spotify track, album, playlist or artist link."}
@@ -279,59 +321,137 @@ def spotify_list(url):
     cover = _best_image(e)
     if kind == "track":
         rows = [{"uri": e.get("uri") or f"spotify:track:{sid}", "title": e.get("name") or e.get("title"),
-                 "subtitle": ", ".join(a.get("name", "") for a in e.get("artists") or []), "duration": e.get("duration")}]
+                 "subtitle": ", ".join(a.get("name", "") for a in e.get("artists") or []), "duration": e.get("duration"),
+                 "album": _embed_album(e)}]
     else:
         rows = e.get("trackList") or []
-    tracks = []
+    tracks, skipped = [], []
     for r in rows:
-        tid = (r.get("uri") or "").rsplit(":", 1)[-1]
-        if not tid or not r.get("title"):
+        uri = r.get("uri") or ""
+        title = r.get("title")
+        if not uri.startswith("spotify:track:") or r.get("entityType") not in (None, "track"):
+            if title or uri:      # a podcast episode or a local file is not a song YouTube can have
+                what = "podcast episode" if ":episode:" in uri or r.get("entityType") == "episode" else "local file" if ":local:" in uri else "not a song"
+                skipped.append(f"{title or uri} ({what})")
             continue
-        tracks.append({"title": r["title"], "artists": r.get("subtitle") or "", "album": name if kind == "album" else "",
+        tid = uri.rsplit(":", 1)[-1]
+        if not tid or not title:
+            continue
+        tracks.append({"title": title, "artists": r.get("subtitle") or "",
+                       "album": name if kind == "album" else _embed_album(r),
                        "number": len(tracks) + 1, "duration_ms": r.get("duration") or 0,
                        "cover": cover, "url": f"https://open.spotify.com/track/{tid}"})
     if not tracks:
-        return {"ok": False, "output": "No songs found in that Spotify link."}
-    return {"ok": True, "name": name, "kind": kind, "id": sid, "cover": cover, "tracks": tracks,
-            "truncated": kind == "playlist" and len(tracks) >= SPOTIFY_EMBED_CAP,
-            "note": "an artist link lists the artist's top tracks only" if kind == "artist" else ""}
+        return {"ok": False, "output": "No songs found in that Spotify link." + (f" Skipped (not songs): {'; '.join(skipped)}." if skipped else "")}
+    notes = []
+    if kind == "artist":
+        notes.append("an artist link lists the artist's top tracks only")
+    if skipped:
+        notes.append(f"skipped {len(skipped)} that can't be saved as songs: " + "; ".join(skipped[:5]) + (f" and {len(skipped) - 5} more" if len(skipped) > 5 else ""))
+    return {"ok": True, "name": name, "kind": kind, "id": sid, "cover": cover, "tracks": tracks, "skipped": skipped,
+            "truncated": kind == "playlist" and len(rows) >= SPOTIFY_EMBED_CAP,
+            "note": " · ".join(notes)}
 
 
 # ---- matching a track to an upload
 _BAD_WORDS = ("live", "remix", "cover", "sped up", "slowed", "karaoke", "instrumental", "nightcore", "reverb",
               "8d", "bass boosted", "mashup", "reaction", "tutorial", "acoustic")
+_QUOTES = str.maketrans({"‘": "'", "’": "'", "‚": "'", "‛": "'", "′": "'", "ʼ": "'", "´": "'", "`": "'",
+                         "“": '"', "”": '"', "„": '"', "″": '"', "–": "-", "—": "-", "−": "-"})
+_LETTERS = {"ø": "o", "ł": "l", "đ": "d", "ß": "ss", "æ": "ae", "œ": "oe", "ð": "d", "þ": "th"}
+
+
+def _fold_accents(text):
+    """e-acute -> e, but only on Latin letters: kana / hangul / accents on other scripts keep their marks."""
+    out = []
+    for ch in text:
+        d = unicodedata.normalize("NFD", ch)
+        if len(d) > 1 and d[0].isascii() and d[0].isalpha():
+            out.append(d[0])
+        else:
+            out.append(_LETTERS.get(ch, ch))
+    return "".join(out)
 
 
 def _norm(text):
-    import unicodedata
-    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text or "").lower()).strip()
+    """Lower case, curly quotes / long dashes straight, accents folded, '&' = 'and', 'Pt.' = 'Part', spaces single."""
+    t = _fold_accents(unicodedata.normalize("NFKC", text or "").translate(_QUOTES).lower())
+    t = re.sub(r"\s*&\s*", " and ", t)
+    t = re.sub(r"\bpt\b\.?", "part", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _loose(text):
+    """_norm without apostrophes: "don't" = "dont" (uploads drop them as often as Spotify keeps them)."""
+    return _norm(text).replace("'", "")
+
+
+def _strip_feat(title):
+    return re.sub(r"\s*[(\[](?:feat|ft|with)\b[^)\]]*[)\]]", "", title or "", flags=re.I)
 
 
 def _core_title(title):
     """Track title without '(feat. x)', '- Remastered 2011', '- Single Version' and the like."""
-    t = re.sub(r"\s*[(\[](?:feat|ft|with)\b[^)\]]*[)\]]", "", title or "", flags=re.I)
-    t = re.sub(r"\s+-\s+.*$", "", t)
-    return _norm(t)
+    return _norm(re.sub(r"\s+-\s+.*$", "", _strip_feat(title)))
 
 
-def spotify_score(track, cand, strict=False):
+def _has_word(needle, hay):
+    return bool(needle) and bool(re.search(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", hay))
+
+
+def _words(text):
+    """Only the words: punctuation and brackets become single spaces ('song (part 1)' = 'song part 1')."""
+    return re.sub(r"[^\w']+", " ", text).strip()
+
+
+def _title_segments(ctitle):
+    """The pieces of an upload's title: 'Artist - Title (Official Audio)' -> ['artist', 'title']."""
+    segs = re.split(r"\s+[-|:•·]\s+|\s*[|•·]\s*", ctitle)
+    return [s for s in (re.sub(r"[(\[][^)\]]*[)\]]", "", s).strip(" '\"") for s in segs) if s]
+
+
+def _title_ok(want, ctitle):
+    """The upload's title carries the track's title: as whole words, and for a title of three letters or fewer
+    ('i', 'Her', 'Up') as a whole piece of the upload's title - never inside another song's name."""
+    w = _words(want)
+    if len(_alnum(want)) <= 3:
+        return any(_words(s) == w for s in _title_segments(ctitle))
+    return _has_word(w, _words(ctitle))
+
+
+def _artist_agrees(track, ctitle, channel):
+    """Some listed artist is named in the upload's title or channel ('X - Topic' channels included)."""
+    names = [_loose(a) for a in (track.get("artists") or "").split(",") if a.strip()]
+    if not names:
+        return True
+    return any(_has_word(n, channel) or _has_word(n, ctitle) for n in names)
+
+
+def spotify_score(track, cand, strict=False, artist_required=True):
     """Score one search hit for a track (higher is better); None = never acceptable.
     cand = {title, channel, duration (s)}. Length is the main signal (+4 within 3 s, +2 within 8 s, hard
-    reject beyond SPOTIFY_MAX_GAP_S); the upload's title must contain the track's title (symbol-only
-    titles excepted); 'Artist - Topic' channels and 'official audio' score up; live / remix / cover /
-    sped up / slowed / karaoke / instrumental score down unless the track's own title says so.
-    A hit with no length is never accepted (live streams, 77-minute sets). A symbol-only title has no words to
-    match, so it needs length within 3 s AND the artist's name in the upload's title or channel. strict (the
-    shortened last-resort query) also needs length within 3 s: never a blind first hit."""
-    ctitle, want = _norm(cand.get("title")), _core_title(track.get("title"))
-    channel = _norm(cand.get("channel"))
+    reject beyond SPOTIFY_MAX_GAP_S); the upload's title must contain the track's title as whole words (a title
+    of three letters or fewer must BE a piece of it); a listed artist must be named in the upload's title or channel
+    (artist_required; spotify_match drops it only when none of the hits carries any channel at all);
+    'Artist - Topic' channels and 'official audio' score up; live / remix / cover / sped up / slowed / karaoke /
+    instrumental score down unless the track's own title says so. A hit with no length is never accepted (live
+    streams, 77-minute sets). A symbol-only title has no words to match, so the symbols themselves must be in the
+    upload's title and the length within 3 s. strict (the shortened last-resort query) also needs length within 3 s:
+    never a blind first hit."""
+    ctitle, want = _loose(cand.get("title")), _loose(_core_title(track.get("title")))
+    channel = _loose(cand.get("channel"))
     symbols_only = not re.search(r"\w", want)
-    if not symbols_only and want not in ctitle:
+    if symbols_only:
+        if re.sub(r"\s+", "", want) not in re.sub(r"\s+", "", ctitle):
+            return None
+    elif not _title_ok(want, ctitle):
+        return None
+    if artist_required and not _artist_agrees(track, ctitle, channel):
         return None
     score = 0
     want_s = (track.get("duration_ms") or 0) / 1000
     got_s = cand.get("duration")
-    main_artist = _norm((track.get("artists") or "").split(",")[0])
+    main_artist = _loose((track.get("artists") or "").split(",")[0])
     if want_s:
         if not got_s:
             return None
@@ -339,8 +459,6 @@ def spotify_score(track, cand, strict=False):
         if gap > SPOTIFY_MAX_GAP_S or ((strict or symbols_only) and gap > 3):
             return None
         score += 4 if gap <= 3 else 2 if gap <= 8 else 0
-    if symbols_only and not (main_artist and (main_artist in channel or main_artist in ctitle)):
-        return None
     if main_artist and main_artist in channel:
         score += 1
     if channel.endswith("- topic"):
@@ -356,15 +474,52 @@ def spotify_score(track, cand, strict=False):
     return score
 
 
+# yt-dlp runs are the scarce thing (YouTube's bot gate, the cookie stores): one track may start this many in all,
+# searches and downloads together. spotify_track opens the budget; a bare call of the helpers is unlimited.
+YT_RUNS_PER_TRACK = 10
+_budget = None
+
+
+def _budget_take():
+    if _budget is None:
+        return True
+    if _budget["left"] <= 0:
+        return False
+    _budget["left"] -= 1
+    return True
+
+
+@contextlib.contextmanager
+def _track_budget():
+    global _budget
+    mine = _budget is None
+    if mine:
+        _budget = {"left": YT_RUNS_PER_TRACK}
+    try:
+        yield
+    finally:
+        if mine:
+            _budget = None
+
+
+def _network_down(lines):
+    return _yt_explain(lines).startswith("Network error")
+
+
 def _yt_order():
     return ([_yt_working] if _yt_working is not None else []) + [s for s in YT_STRATEGIES if s != _yt_working]
 
 
 def _yt_search(query, n=5):
-    """Top n hits as [{title, channel, duration, url}] via yt-dlp (cookie strategies, last good one first)."""
+    """Top n hits as [{title, channel, duration, url}] via yt-dlp (cookie strategies, last good one first).
+    A search that ran and found nothing, an offline machine and a spent run budget all end the loop: another
+    cookie store would not change the answer."""
     global _yt_working
     err = []
     for extra in _yt_order():
+        if not _budget_take():
+            err = err or ["yt-dlp run budget for this track used up"]
+            break
         code, out, e = _yt("--dump-json", "--flat-playlist", "--no-warnings", *extra, f"ytsearch{n}:{query}")
         hits = []
         for line in out.splitlines():
@@ -378,7 +533,11 @@ def _yt_search(query, n=5):
         if code == 0 and hits:
             _yt_working = extra
             return hits, []
+        if code == 0:
+            return [], []
         err = (out + e).splitlines()
+        if _network_down(err):
+            break
     return [], err
 
 
@@ -394,23 +553,38 @@ GOOD_ENOUGH = 6      # stop searching once a hit scores this well (length within
 MIN_SCORE = 3        # below this nothing is saved: a wrong upload is worse than a listed failure
 
 
-def spotify_match(track, search=None):
-    """(url or None, message). search(query) -> (hits, err); default = yt-dlp. Up to three searches."""
+def spotify_candidates(track, search=None, limit=3):
+    """([urls, best first], message). Every acceptable upload (score >= MIN_SCORE) of up to three searches,
+    at most `limit` of them. search(query) -> (hits, err); default = yt-dlp."""
     search = search or _yt_search
-    best, last_err = None, []
-    for i, q in enumerate(spotify_queries(track)):
-        hits, last_err = search(q)
-        for h in hits:
-            s = spotify_score(track, h, strict=(i == 2))
-            if s is not None and (best is None or s > best[0]):
-                best = (s, h["url"])
-        if best and best[0] >= GOOD_ENOUGH:
-            break
-    if best and best[0] >= MIN_SCORE:
-        return best[1], ""
-    if not best and last_err:
-        return None, _yt_explain(last_err)
-    return None, "no matching upload found"
+    scored, seen_any, last_err = {}, False, []
+    with _track_budget():
+        for i, q in enumerate(spotify_queries(track)):
+            hits, last_err = search(q)
+            need_artist = any(h.get("channel") for h in hits)      # no channel anywhere = nothing to compare the artist with
+            for h in hits:
+                s = spotify_score(track, h, strict=(i == 2), artist_required=need_artist)
+                if s is None:
+                    continue
+                seen_any = True
+                if s >= MIN_SCORE and s > scored.get(h["url"], -99):
+                    scored[h["url"]] = s
+            if scored and max(scored.values()) >= GOOD_ENOUGH:
+                break
+            if last_err and _network_down(last_err):
+                break
+    ranked = [u for u, _ in sorted(scored.items(), key=lambda kv: -kv[1])][:limit]
+    if ranked:
+        return ranked, ""
+    if not seen_any and last_err:
+        return [], _yt_explain(last_err)
+    return [], "no matching upload found"
+
+
+def spotify_match(track, search=None):
+    """(url or None, message): the best acceptable upload. See spotify_candidates for the whole ranking."""
+    urls, msg = spotify_candidates(track, search)
+    return (urls[0], "") if urls else (None, msg)
 
 
 # ---- saving + tagging
@@ -423,7 +597,7 @@ def _fetch_bytes(url, limit=15_000_000):
 def _yt_download_native(url, outtmpl, extra, mp3=False):
     """Audio exactly as the upload carries it: AAC in .m4a when there is one, else the best audio stream
     in its own container (Opus -> .opus, a stream copy). Never an --audio-format conversion - unless the
-    mp3 switch is on, which converts to MP3 V0."""
+    mp3 switch is on, which converts to MP3 V0. outtmpl is a yt-dlp template: build it with tmpl_escape."""
     code, out, err = _yt(*audio_args(mp3), "-o", outtmpl,
                          "--no-playlist", "--quiet", "--no-progress", "--print", "after_move:filepath", *extra, url)
     if code != 0:
@@ -431,16 +605,23 @@ def _yt_download_native(url, outtmpl, extra, mp3=False):
     lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
     path = Path(lines[-1]) if lines else None
     if not (path and path.exists()):
-        import glob
-        base, stem = Path(outtmpl).parent, Path(outtmpl).name.replace(".%(ext)s", "")
+        plain = tmpl_unescape(outtmpl)
+        base, stem = Path(plain).parent, Path(plain).name.replace(".%(ext)s", "")
         found = sorted(base.glob(f"{glob.escape(stem)}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
         path = found[0] if found else None
     return True, path, []
 
 
+_ID_ATOM, _ID_KEY = "----:com.jownloader:spotifyid", "jownloader_spotify_id"
+
+
+def _track_id(meta):
+    return ((meta or {}).get("url") or "").split("?")[0].rstrip("/").rsplit("/", 1)[-1]
+
+
 def spotify_tag(path, meta, cover=None, year=""):
-    """Write title / artist / album / track number / cover into the saved file. m4a -> MP4 atoms, opus ->
-    Vorbis comments + picture. Other containers are left as they are. Returns '' or a caveat."""
+    """Write title / artist / album / track number / cover (and the Spotify track id) into the saved file. m4a -> MP4
+    atoms, opus -> Vorbis comments + picture. Other containers are left as they are. Returns '' or a caveat."""
     try:
         import mutagen  # noqa: F401
     except ImportError:
@@ -448,10 +629,11 @@ def spotify_tag(path, meta, cover=None, year=""):
     p = Path(path)
     ext = p.suffix.lower()
     n, total = meta.get("number") or 0, meta.get("total") or 0
+    tid = _track_id(meta)
     is_png = bool(cover) and cover[:4] == b"\x89PNG"
     try:
         if ext in (".m4a", ".mp4"):
-            from mutagen.mp4 import MP4, MP4Cover
+            from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
             f = MP4(str(p))
             f["\xa9nam"], f["\xa9ART"] = [meta.get("title") or p.stem], [meta.get("artists") or ""]
             if meta.get("album"):
@@ -460,6 +642,8 @@ def spotify_tag(path, meta, cover=None, year=""):
                 f["trkn"] = [(n, total or 0)]
             if year:
                 f["\xa9day"] = [year]
+            if tid:
+                f[_ID_ATOM] = [MP4FreeForm(tid.encode("utf-8"))]
             if cover:
                 f["covr"] = [MP4Cover(cover, imageformat=MP4Cover.FORMAT_PNG if is_png else MP4Cover.FORMAT_JPEG)]
             f.save()
@@ -475,13 +659,15 @@ def spotify_tag(path, meta, cover=None, year=""):
                 f["tracknumber"] = [f"{n}/{total}" if total else str(n)]
             if year:
                 f["date"] = [year]
+            if tid:
+                f[_ID_KEY] = [tid]
             if cover:
                 pic = Picture()
                 pic.type, pic.mime, pic.data = 3, "image/png" if is_png else "image/jpeg", cover
                 f["metadata_block_picture"] = [base64.b64encode(pic.write()).decode("ascii")]
             f.save()
         elif ext == ".mp3":
-            from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TRCK, TDRC, APIC
+            from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TRCK, TDRC, APIC, TXXX
             try:
                 f = ID3(str(p))
             except ID3NoHeaderError:
@@ -495,6 +681,8 @@ def spotify_tag(path, meta, cover=None, year=""):
                 f.delall("TRCK"); f.add(TRCK(encoding=3, text=f"{n}/{total}" if total else str(n)))
             if year:
                 f.delall("TDRC"); f.add(TDRC(encoding=3, text=year))
+            if tid:
+                f.delall("TXXX:" + _ID_KEY); f.add(TXXX(encoding=3, desc=_ID_KEY, text=tid))
             if cover:
                 f.delall("APIC")
                 f.add(APIC(encoding=3, mime="image/png" if is_png else "image/jpeg", type=3, desc="Cover", data=cover))
@@ -506,37 +694,106 @@ def spotify_tag(path, meta, cover=None, year=""):
     return ""
 
 
+def _read_track_id(path):
+    """The Spotify track id spotify_tag stored in a saved file, '' if none (older files, or no mutagen)."""
+    try:
+        import mutagen  # noqa: F401
+        ext = Path(path).suffix.lower()
+        if ext in (".m4a", ".mp4"):
+            from mutagen.mp4 import MP4
+            v = (MP4(str(path)).tags or {}).get(_ID_ATOM)
+            return bytes(v[0]).decode("utf-8", "replace") if v else ""
+        if ext == ".opus":
+            from mutagen.oggopus import OggOpus
+            v = OggOpus(str(path)).get(_ID_KEY)
+            return v[0] if v else ""
+        if ext == ".mp3":
+            from mutagen.id3 import ID3
+            fr = ID3(str(path)).getall("TXXX:" + _ID_KEY)
+            return str(fr[0].text[0]) if fr else ""
+    except Exception:
+        pass
+    return ""
+
+
+def _is_image(b):
+    return bool(b) and (b[:3] == b"\xff\xd8\xff" or b[:8] == b"\x89PNG\r\n\x1a\n")
+
+
 def _cover_bytes(url):
-    """The picture at url, or None: a dead or 404 cover link never fails a song."""
+    """The picture at url, or None: a dead link, a 404 or a page that is not a JPEG / PNG (a captcha, an error
+    page served with status 200) never fails a song and is never embedded."""
     if not url:
         return None
     try:
-        return _fetch_bytes(url)
+        b = _fetch_bytes(url)
     except Exception:
         return None
+    return b if _is_image(b) else None
 
 
 # ---- what is already downloaded: matched on "Artists - Title", not on the file's exact name
 _NUM_PREFIX = re.compile(r"^\d{1,4}\s*(?:-\s+|_)\s*")
 _BPM_SUFFIX = re.compile(r"\s\(\d+(?:\.\d+)? BPM [^)]*\)$")
 AUDIO_EXT = {".m4a", ".mp4", ".mp3", ".opus", ".ogg", ".oga", ".webm", ".flac", ".wav", ".aif", ".aiff", ".aac", ".alac", ".wma"}
+NAME_CLIP = 170          # the 'Artists - Title' part of a saved name is cut here (the number, BPM suffix and extension come on top)
+LONG_KEY = 120           # a saved name this long (letters + digits) may be a clipped one: a prefix of the track's key then counts
 
 
 def _alnum(text):
     return re.sub(r"[\W_]+", "", _norm(text))
 
 
-def spotify_keys(track):
-    """Every spelling of 'Artists - Title' a saved file may carry: all artists or the first, full or trimmed title."""
+def _rawkey(text):
+    """Letters, digits AND symbols, no spaces / dashes / underscores: the key of a title made only of symbols."""
+    return re.sub(r"[\s_\-]+", "", _norm(text))
+
+
+def _symbolic(track):
+    return not re.search(r"\w", _norm(track.get("title")))
+
+
+def _clip(text, n=NAME_CLIP):
+    text = text[:n]
+    while len(text.encode("utf-8")) > 200:
+        text = text[:-1]
+    return text.strip(". ")
+
+
+def _base_name(meta):
+    """'Artists - Title' as it is written into a file name (no number)."""
+    return _clip(" - ".join(x for x in (safe_name(meta.get("artists") or ""), safe_name(meta.get("title") or "")) if x and x != "download"))
+
+
+def spotify_key_levels(track):
+    """The spellings of 'Artists - Title' a saved file may carry, best first, as sets of letters+digits:
+    [all artists + the exact title, first artist or no '(feat. x)']. Never a title cut at ' - ': a remix, live or
+    remastered version is its own song. A symbol-only title has none (see _symbolic)."""
+    if _symbolic(track):
+        return [set(), set()]
     artists, title = track.get("artists") or "", track.get("title") or ""
     first = artists.split(",")[0]
-    return {_alnum(a + t) for a in (artists, first) for t in (title, _core_title(title))} - {""}
+    l0 = {_alnum(artists + title), _alnum(_base_name(track))}
+    l1 = {_alnum(a + t) for a in (artists, first) for t in (title, _strip_feat(title))} - l0
+    return [l0 - {""}, l1 - {""}]
+
+
+def spotify_keys(track):
+    return set().union(*spotify_key_levels(track))
+
+
+def _key_hit(filekey, keys):
+    return filekey in keys or (len(filekey) >= LONG_KEY and any(k.startswith(filekey) for k in keys))
+
+
+def _file_stem(name):
+    stem = Path(name).stem if Path(name).suffix.lower() in AUDIO_EXT else name
+    return _BPM_SUFFIX.sub("", _NUM_PREFIX.sub("", stem))
 
 
 def _file_key(name):
     """A saved file's name without extension, leading 'NN - ' / 'NN_' and BPM/key suffix, reduced to letters + digits."""
-    stem = Path(name).stem if Path(name).suffix.lower() in AUDIO_EXT else name
-    return _alnum(_BPM_SUFFIX.sub("", _NUM_PREFIX.sub("", stem)))
+    return _alnum(_file_stem(name))
 
 
 def _scan(folder):
@@ -551,10 +808,40 @@ def _scan(folder):
     return sorted(out)
 
 
+def match_files(files, tracks):
+    """{track index: path}: which saved file is which track. files = [(path, key)] from _scan. One file serves one
+    track. Exact 'artists - title' first for every track, only then the looser spellings, so a track never takes a file
+    another track names exactly. Symbol-only titles are matched by the Spotify track id inside the file, else by the
+    symbols themselves in the name (never by the artist's name alone)."""
+    got, used = {}, set()
+    sym = [i for i, t in enumerate(tracks) if _symbolic(t)]
+    if sym:
+        ids = {p: _read_track_id(p) for p, _ in files}
+        for i in sym:
+            tid = _track_id(tracks[i])
+            hit = next((p for p, _ in files if p not in used and tid and ids.get(p) == tid), None)
+            if not hit:
+                want = _rawkey(_base_name(tracks[i]))
+                hit = next((p for p, _ in files if p not in used and not ids.get(p) and _rawkey(_file_stem(os.path.basename(p))) == want), None)
+            if hit:
+                got[i] = hit
+                used.add(hit)
+    levels = [spotify_key_levels(t) for t in tracks]
+    for lv in (0, 1):
+        for i in range(len(tracks)):
+            if i in got:
+                continue
+            keys = levels[i][lv]
+            hit = next((p for p, k in files if p not in used and k and _key_hit(k, keys)), None)
+            if hit:
+                got[i] = hit
+                used.add(hit)
+    return got
+
+
 def find_existing(folder, track):
     """Path of a file in folder that is this track (any number, any extension), else None."""
-    keys = spotify_keys(track)
-    return next((p for p, k in _scan(folder) if k in keys), None)
+    return match_files(_scan(folder), [track]).get(0)
 
 
 def library_folder_name(name):
@@ -563,53 +850,114 @@ def library_folder_name(name):
 
 
 def spotify_stem(meta, total=None):
-    """NN - Artists - Title (no number for a lone song)."""
+    """NN - Artists - Title (no number for a lone song). The 'Artists - Title' part is cut at NAME_CLIP characters."""
     width = max(2, len(str(total or meta.get("total") or 0)))
-    base = " - ".join(x for x in (safe_name(meta.get("artists") or ""), safe_name(meta.get("title") or "")) if x and x != "download")
-    stem = (f"{int(meta['number']):0{width}d} - " if meta.get("number") and meta.get("folder") else "") + base
-    return stem[:180].strip(". ")
+    return (f"{int(meta['number']):0{width}d} - " if meta.get("number") and meta.get("folder") else "") + _base_name(meta)
+
+
+@contextlib.contextmanager
+def _folder_lock(folder):
+    """One list sync at a time per folder (the popup can be open twice, every sendNativeMessage is its own process)."""
+    fd = None
+    try:
+        fd = os.open(str(folder), os.O_RDONLY)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        if fd is not None:
+            os.close(fd)
+        fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
+def _move_noclobber(src, dst):
+    """Rename src to dst without ever replacing something already at dst. True when it moved."""
+    try:
+        os.link(src, dst)       # atomic, and refuses an existing dst
+    except FileExistsError:
+        return False
+    except OSError:             # a volume without hard links: check, then rename
+        if os.path.lexists(dst):
+            return False
+        try:
+            os.rename(src, dst)
+            return True
+        except OSError:
+            return False
+    try:
+        os.unlink(src)
+    except OSError:
+        pass
+    return True
+
+
+def _place(src, directory, name, first_try_plain=True):
+    """Move src into directory as name, or 'name (2)', 'name (3)' ... when taken. The final Path, or None."""
+    stem, suf = Path(name).stem, Path(name).suffix
+    for k in range(1, 1000):
+        cand = Path(directory) / (name if k == 1 else f"{stem} ({k}){suf}")
+        if _move_noclobber(src, cand):
+            return cand
+    return None
+
+
+_SYNC_TMP = re.compile(r"^\.jown-sync-[0-9a-f]+-\d+~(.+)$")
+
+
+def _recover_sync_leftovers(dest):
+    """A sync that died between its two renames leaves hidden .jown-sync-* files. Called under the folder lock (so
+    no live sync owns them): put each back under its old name, or 'Recovered song ...' when the name is unknown."""
+    try:
+        names = [e.name for e in os.scandir(dest) if e.is_file() and e.name.startswith(".jown-sync-")]
+    except OSError:
+        return
+    for nm in sorted(names):
+        m = _SYNC_TMP.match(nm)
+        back = m.group(1) if m else "Recovered song " + secrets.token_hex(3) + Path(nm).suffix
+        _place(Path(dest) / nm, dest, back)
 
 
 def spotify_sync(dst, folder, tracks, libs=(), total=None):
     """Before a list is queued, look at what is already there.
       - files in <dst>/<folder>/ that are songs of this list are renamed in place to the list's current
-        numbering (two-phase, so a reorder that swaps numbers never collides; a clash with an unrelated
-        file gets ' (2)'; nothing is overwritten; a file whose song left the list is never touched)
+        numbering (two-phase through unique hidden names, so a reorder that swaps numbers never collides; a clash
+        with an unrelated file gets ' (2)'; nothing is ever deleted or overwritten; a file whose song left the
+        list is never touched; matching is exact 'artists - title', see match_files)
       - songs found in <lib>/<folder as a library tool writes it>/ count as downloaded too (never copied)
     Returns {ok, have: [indexes already in the folder], inlib: [indexes found in a library], renamed, notes}."""
     dest = Path(dst or DOWNLOADS).expanduser() / safe_name(folder)
-    files, used, have, plan = _scan(dest), set(), [], []
-    for i, t in enumerate(tracks):
-        keys = spotify_keys(t)
-        m = next(((p, k) for p, k in files if p not in used and k in keys), None)
-        if not m:
-            continue
-        used.add(m[0])
-        have.append(i)
-        cur = Path(m[0])
-        bpm = _BPM_SUFFIX.search(cur.stem)
-        new = spotify_stem({**t, "folder": folder}, total or len(tracks)) + (bpm.group(0) if bpm else "") + cur.suffix
-        if new != cur.name:
-            plan.append((cur, new))
-    moved = []
-    for n, (src, new) in enumerate(plan):       # phase 1: out of the way; phase 2: into place
-        tmp = src.with_name(f".jown-sync-{n}{src.suffix}")
-        try:
-            src.rename(tmp)
-            moved.append((tmp, src, new))
-        except OSError:
-            pass
-    renamed = 0
-    for tmp, src, new in moved:
-        target, k = src.with_name(new), 2
-        while target.exists():
-            target = src.with_name(f"{Path(new).stem} ({k}){Path(new).suffix}")
-            k += 1
-        try:
-            tmp.rename(target)
-            renamed += 1
-        except OSError:
-            tmp.rename(src)
+    have, plan = [], []
+    with _folder_lock(dest):
+        _recover_sync_leftovers(dest)
+        got = match_files(_scan(dest), tracks)
+        for i in sorted(got):
+            have.append(i)
+            cur = Path(got[i])
+            bpm = _BPM_SUFFIX.search(cur.stem)
+            new = spotify_stem({**tracks[i], "folder": folder}, total or len(tracks)) + (bpm.group(0) if bpm else "") + cur.suffix
+            if new != cur.name:
+                plan.append((cur, new))
+        token, moved = secrets.token_hex(4), []
+        for n, (src, new) in enumerate(plan):       # phase 1: out of the way (a name nobody else uses); phase 2: into place
+            for tmp in (src.with_name(f".jown-sync-{token}-{n}~{src.name}"), src.with_name(f".jown-sync-{token}-{n}~{src.suffix}")):
+                try:
+                    src.rename(tmp)
+                    moved.append((tmp, src, new))
+                    break
+                except OSError:
+                    continue
+        renamed = 0
+        for tmp, src, new in moved:
+            if _place(tmp, src.parent, new):
+                renamed += 1
+            elif not _place(tmp, src.parent, src.name):     # could not even go back: it stays hidden, recovered next time
+                pass
     inlib, notes = [], []
     for lib in libs or []:
         lp = Path(lib).expanduser()
@@ -619,11 +967,34 @@ def spotify_sync(dst, folder, tracks, libs=(), total=None):
         ld = lp / library_folder_name(folder)
         if not ld.is_dir():
             continue
-        lkeys = {k for _, k in _scan(ld)}
-        for i, t in enumerate(tracks):
-            if i not in have and i not in inlib and lkeys & spotify_keys(t):
-                inlib.append(i)
+        rest = [i for i in range(len(tracks)) if i not in have and i not in inlib]
+        found = match_files(_scan(ld), [tracks[i] for i in rest])
+        inlib += [rest[j] for j in found]
     return {"ok": True, "have": have, "inlib": sorted(inlib), "renamed": renamed, "notes": notes}
+
+
+def _download_candidates(urls, outtmpl, mp3):
+    """Try each acceptable upload in turn (best first), each with the cookie strategies, inside the per-track run
+    budget. A failure that belongs to the upload (removed, private, region-blocked) moves to the next upload; one
+    that belongs to the connection ends the attempt. Returns (ok, path, error lines)."""
+    global _yt_working
+    last_err = []
+    for yt in urls:
+        for extra in _yt_order():
+            if not _budget_take():
+                return False, None, last_err or ["yt-dlp run budget for this track used up"]
+            ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
+            if ok and path:
+                _yt_working = extra
+                return True, path, []
+            if ok:
+                return False, None, ["the download finished but no file was found"]
+            text = " ".join(last_err).lower()
+            if _network_down(last_err):
+                return False, None, last_err
+            if re.search(r"private video|not available|unavailable|removed|blocked|copyright|terminated|does not exist", text):
+                break           # this upload is out; the next candidate gets its turn
+    return False, None, last_err
 
 
 def spotify_track(meta, outdir, analyze=False, mp3=False):
@@ -638,30 +1009,26 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
     there = find_existing(folder, meta)
     if there:
         return {"ok": True, "path": there, "files": [], "skipped": 1, "output": ""}
-    yt, msg = spotify_match(meta)
-    if not yt:
-        return {"ok": False, "output": f"{meta.get('title')}: {msg}"}
-    tid = (meta.get("url") or "").rstrip("/").rsplit("/", 1)[-1]
-    year, cover_url = "", meta.get("cover") or ""
-    try:        # this track's own embed: the album art of THIS song (a playlist's cover is not it) + release year
-        e = _spotify_embed("track", tid)
-        cover_url = _best_image(e) or cover_url
-        year = ((e.get("releaseDate") or {}).get("isoString") or "")[:10]
-    except Exception:
-        pass
-    global _yt_working
-    ok, path, last_err = False, None, []
-    outtmpl = str(folder / f"{stem}.%(ext)s")
-    for extra in _yt_order():
-        ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
-        if ok:
-            _yt_working = extra
-            break
-    if not ok or not path:
-        return {"ok": False, "output": f"{meta.get('title')}: {_yt_explain(last_err, yt)}"}
+    with _track_budget():
+        urls, msg = spotify_candidates(meta)
+        if not urls:
+            return {"ok": False, "output": f"{meta.get('title')}: {msg}"}
+        tid = _track_id(meta)
+        year, cover_url, album = "", meta.get("cover") or "", meta.get("album") or ""
+        try:        # this track's own embed: the album art of THIS song (a playlist's cover is not it) + release year + album
+            e = _spotify_embed("track", tid)
+            cover_url = _best_image(e) or cover_url
+            year = ((e.get("releaseDate") or {}).get("isoString") or "")[:10]
+            album = album or _embed_album(e)
+        except Exception:
+            pass
+        outtmpl = tmpl_escape(folder / stem) + ".%(ext)s"
+        ok, path, last_err = _download_candidates(urls, outtmpl, mp3)
+        if not ok or not path:
+            return {"ok": False, "output": f"{meta.get('title')}: {_yt_explain(last_err, urls[0])}"}
     cover = _cover_bytes(cover_url) or (_cover_bytes(meta.get("cover")) if meta.get("cover") != cover_url else None)
     notes = []
-    caveat = spotify_tag(path, meta, cover, year)
+    caveat = spotify_tag(path, {**meta, "album": album}, cover, year)
     if caveat:
         notes.append(caveat)
     if analyze:        # read-only analysis of the saved file; only its name changes
@@ -934,7 +1301,7 @@ def social(site, url, outdir):
 
 # ══════════════════════════════════════════════════════════════════════════════ finishing steps
 IMAGE_META = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".tif", ".tiff", ".gif", ".avif"}
-VIDEO_META = {".mp4", ".m4v", ".mov", ".m4a", ".mp3", ".webm"}
+VIDEO_META = {".mp4", ".m4v", ".mov", ".m4a", ".mp3", ".webm", ".opus", ".ogg", ".oga", ".flac"}
 
 
 def strip_metadata(path):

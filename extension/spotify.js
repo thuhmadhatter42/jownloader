@@ -40,6 +40,10 @@
     el("spGo").textContent = label(); el("spGo").disabled = true;
     list = await chrome.runtime.sendMessage({ type: "spotifyList", url: tab.url }).catch(() => null);
     if (!list?.ok) { say(list?.output || "native host not reachable — run native/install.sh"); list = null; return; }
+    if (list.truncated && list.kind === "playlist") {     // exactly 100 songs is not "100+": ask the open page how many it has
+      const n = await chrome.tabs.sendMessage(tabId, { type: "spotifyCount" }).catch(() => null);
+      if (Number.isInteger(n) && n <= list.tracks.length) list.truncated = false;
+    }
     el("spGo").textContent = label(); el("spGo").disabled = false;
     if (list.note) say(list.note);
   }
@@ -59,16 +63,17 @@
       let skip = new Set(), extra = "";
       if (list.kind !== "track") {
         const sync = await chrome.runtime.sendMessage({ type: "spotifySync", dst: dest, folder: list.name, total: tracks.length,
-          tracks: tracks.map((t) => ({ title: t.title, artists: t.artists, number: t.number })) });
+          tracks: tracks.map((t) => ({ title: t.title, artists: t.artists, number: t.number, url: t.url })) });
         if (!sync?.ok) { say(sync?.output || "couldn't check the folder"); return; }
         skip = new Set([...sync.have, ...sync.inlib]);
         extra = [sync.renamed ? `${sync.renamed} renamed to the new order` : "", sync.inlib.length ? `${sync.inlib.length} found in a library folder` : "", ...sync.notes].filter(Boolean).join(" · ");
       }
+      if (list.skipped?.length) extra = [extra, `skipped, not songs: ${list.skipped.join("; ")}`].filter(Boolean).join(" · ");
       const todo = tracks.filter((_, i) => !skip.has(i));
       if (!todo.length) { say(`all ${tracks.length} songs are already downloaded` + (extra ? `\n${extra}` : "")); return; }
       const items = todo.map((t) => ({
         url: t.url, engine: true, mode: "audio",
-        spotify: { title: t.title, artists: t.artists, album: t.album || list.name, number: t.number, total: tracks.length,
+        spotify: { title: t.title, artists: t.artists, album: t.album || (list.kind === "album" || list.kind === "playlist" ? list.name : ""), number: t.number, total: tracks.length,
                    duration_ms: t.duration_ms, cover: t.cover || "", url: t.url, folder: list.kind === "track" ? "" : list.name },
       }));
       say(`queuing ${items.length} song${items.length === 1 ? "" : "s"}…` + (extra ? `\n${extra}` : ""));
