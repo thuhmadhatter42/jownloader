@@ -906,6 +906,11 @@ def spotify_queries(track):
     artists, title = track.get("artists") or "", _core_title(track.get("title")) or track.get("title") or ""
     first = artists.split(",")[0].strip()
     qs = [f"{artists} - {title}", f"{first} {title} audio", f"{first} {(title.split() or [''])[0]}"]
+    # '- Live at the Pantages Theatre ...' / '(Acoustic)': a different recording than the studio one the core title
+    # finds, so the whole title (suffix included) is searched first
+    full = _strip_feat(track.get("title") or "").strip()
+    if full and re.search(r"\b(live|acoustic|unplugged|demo|session)\b", full[len(title):] if full.lower().startswith(title) else full, re.I):
+        qs.insert(0, f"{artists} - {full}")
     return [q.strip() for i, q in enumerate(qs) if q.strip() and q not in qs[:i]]
 
 
@@ -929,7 +934,7 @@ def spotify_candidates(track, search=None, limit=3):
             slog.info("  query %d/%d %r: %d hit(s)%s", i + 1, len(qs), q, len(hits), f", error: {_errline(last_err)}" if last_err and not hits else "")
             need_artist = any(h.get("channel") for h in hits)      # no channel anywhere = nothing to compare the artist with
             for h in hits:
-                s, why = spotify_score_why(track, h, strict=(i == 2), artist_required=need_artist)
+                s, why = spotify_score_why(track, h, strict=(i >= 2 and i == len(qs) - 1), artist_required=need_artist)
                 desc = f"{h.get('title')!r} by {h.get('channel')!r} {h.get('duration')}s {h.get('url')}"
                 if s is None:
                     slog.debug("    REJECT %s: %s", desc, why)

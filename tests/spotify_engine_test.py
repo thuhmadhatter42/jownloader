@@ -342,6 +342,11 @@ try:
     dg = {"title": "You Should Be Dancing", "artists": "Dee Gees", "duration_ms": 232000}
     sc = engine.spotify_score(dg, {"title": "Dee Gees | You Should Be Dancing", "channel": "Foo Fighters", "duration": 242})
     check("0.1.47: an upload titled 'Dee Gees | You Should Be Dancing' (10 s off) is accepted, score >= 3", sc is not None and sc >= 3, True)
+    lq = engine.spotify_queries({"title": "My Hero - Live at the Pantages Theatre, Los Angeles, CA - August 2006", "artists": "Foo Fighters"})
+    check("0.1.47: a live version is searched with its whole title first, then the core title",
+          lq[:2], ["Foo Fighters - My Hero - Live at the Pantages Theatre, Los Angeles, CA - August 2006", "Foo Fighters - my hero"])
+    check("0.1.47: 'Live Wire' and '- Remastered 2011' get no extra query",
+          [len(engine.spotify_queries({"title": t, "artists": "X"})) for t in ("Live Wire", "Everlong - Remastered 2011")], [3, 3])
     sc2 = engine.spotify_score(dg, {"title": "You Should Be Dancing (COVER)", "channel": "Some Band", "duration": 233})
     check("0.1.47: a '(COVER)' upload by an unrelated channel at 233 s is still rejected", sc2 is None or sc2 < engine.MIN_SCORE, True)
 
