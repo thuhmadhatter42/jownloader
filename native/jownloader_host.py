@@ -43,6 +43,11 @@ with the browser session; this side only writes them.
      done. "output" is the tail of what it printed; "missing" is whichever of the six deps below are
      still absent afterward (empty when everything installed clean); "python" is sys.executable —
      native/.venv's interpreter once it exists, so a persistent "missing" names which Python answered.
+  {"cmd": "log", "entries": [{"t": ms, "l": level, "a": area, "m": text, "d": data}], "noreply"?: true}
+     the extension's log entries, appended to the same file as the host's own (see jlog.py); never answered
+     when "noreply" is set, so a log batch can ride the streaming port without disturbing it.
+  {"cmd": "openlog"} -> {"ok", "path"}     opens the log in TextEdit (JOWN_OPEN overrides /usr/bin/open for tests)
+  {"cmd": "taillog", "lines": 200} -> {"ok", "path", "text", "lines"}   the last lines of the log
   "open" / "join" / "fetch" take "strip": true (remove all metadata) and "webp": "jpg" | "png" (WebP -> that);
   both are applied to the finished file(s) before the reply (engine.finish).
 Names are never overwritten: name (2).ext, name (3).ext …  A file is written as name.jownloading and
@@ -64,7 +69,11 @@ One-shot (sendNativeMessage, own process each):
      "python" is sys.executable and "prefix" is sys.prefix (the venv dir when re-exec worked), so the
      popup/tests can see which interpreter answered.
 """
-import base64, importlib.metadata, importlib.util, json, os, re, shutil, struct, subprocess, sys, threading
+import base64, importlib.metadata, importlib.util, json, os, re, shutil, struct, subprocess, sys, threading, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jlog     # stdlib only: importable under the bootstrap python3, before the venv re-exec
+log = jlog.get("host")
+jlog.install_hooks(log)
 
 # Re-exec into native/.venv (deps.sh's ensure_venv) before any third-party import or stdin read: the
 # shebang above is only the bootstrap (Brave launches us with PATH=/usr/bin:/bin -> Xcode CLT python3),
@@ -86,17 +95,26 @@ def _in_venv():
 # keeps running in this interpreter, and _VENV_UNUSABLE makes the deps reply say what to do.
 _REEXEC_MARK = "JOWNLOADER_HOST_REEXEC"
 _VENV_UNUSABLE = os.path.lexists(_VENV_PY) and not os.path.exists(_VENV_PY)   # dangling python3 symlink
+_BOOT_NOTE = "no native/.venv: running on " + sys.executable
 if os.path.exists(_VENV_PY) and not _in_venv():
     if os.environ.get(_REEXEC_MARK):
         _VENV_UNUSABLE = True
+        _BOOT_NOTE = "venv present but this process (after one re-exec) is still outside it: venv unusable"
+        log.warning("boot pid=%d: %s (prefix=%s venv=%s)", os.getpid(), _BOOT_NOTE, sys.prefix, _VENV_DIR)
     else:
         os.environ[_REEXEC_MARK] = "1"
+        log.info("boot pid=%d: outside native/.venv (python=%s prefix=%s), re-exec into %s", os.getpid(), sys.executable, sys.prefix, _VENV_PY)
         try:
             os.execv(_VENV_PY, [_VENV_PY, *sys.argv])
-        except OSError:
+        except OSError as e:
             _VENV_UNUSABLE = True
+            _BOOT_NOTE = f"re-exec into the venv failed: {e}"
+            log.error("boot pid=%d: %s", os.getpid(), _BOOT_NOTE)
+elif os.path.lexists(_VENV_PY):
+    _BOOT_NOTE = "inside native/.venv" if _in_venv() else "venv python3 is a dangling symlink: venv unusable"
+else:
+    _BOOT_NOTE = "native/.venv does not exist: running on " + sys.executable
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine
 
 SEND_LOCK = threading.Lock()   # fetch replies come from worker threads
@@ -107,10 +125,15 @@ def read_msg():
     if len(raw) < 4:
         return None
     n = struct.unpack("<I", raw)[0]
-    return json.loads(sys.stdin.buffer.read(n).decode())
+    msg = json.loads(sys.stdin.buffer.read(n).decode())
+    if msg.get("cmd") not in ("chunk", "log"):          # chunks are counted at close; log batches are the log itself
+        log.debug("msg in  %s", jlog.summarize(msg))
+    return msg
 
 
-def send(obj):
+def send(obj, quiet=False):
+    if not quiet:
+        log.debug("reply  %s", jlog.summarize(obj))
     data = json.dumps(obj).encode()
     with SEND_LOCK:
         sys.stdout.buffer.write(struct.pack("<I", len(data)) + data)
@@ -125,6 +148,7 @@ def finished(reply, msg):
     paths = reply.get("files") or ([reply["path"]] if reply.get("path") and os.path.isfile(reply["path"]) else [])
     if not paths:
         return reply
+    log.info("finishing %d file(s): strip=%s webp=%s", len(paths), bool(msg.get("strip")), msg.get("webp") or False)
     res = engine.finish(paths, strip=bool(msg.get("strip")), webp=msg.get("webp") or False)["results"]
     reply["files"] = [r["path"] for r in res]
     if reply.get("path") in paths:
@@ -138,10 +162,12 @@ def finished(reply, msg):
 def fetch_async(msg):
     """The engine (yt-dlp / gallery-dl) can run for minutes: its own thread, reply when done."""
     def run():
+        log.info("fetch thread start id=%s", msg.get("id"))
         try:
             r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "",
                              msg.get("meta") or None, bool(msg.get("analyze")), bool(msg.get("mp3")))
         except Exception as e:
+            log.exception("fetch id=%s raised", msg.get("id"))
             r = {"ok": False, "output": str(e)}
         r["id"] = msg.get("id")
         send(r if msg.get("meta") else finished(r, msg))   # a Spotify song keeps its tags: "strip metadata" would erase them
@@ -154,6 +180,7 @@ def list_async(msg):
         try:
             r = engine.spotify_list(msg.get("url") or "")
         except Exception as e:
+            log.exception("list id=%s raised", msg.get("id"))
             r = {"ok": False, "output": str(e)}
         r["id"] = msg.get("id")
         send(r)
@@ -165,12 +192,11 @@ def _cli_version(cmd, args):
     path = shutil.which(cmd)
     if not path:
         return False, ""
-    try:
-        p = subprocess.run([path, *args], capture_output=True, text=True, timeout=5)
-        line = ((p.stdout or p.stderr or "").strip().splitlines() or [""])[0]
-        return True, line[:80]
-    except Exception:
+    rc, out, err = jlog.run([path, *args], log, timeout=5, ok_tail=0)
+    if rc != 0 and not (out or err):
         return True, ""   # on PATH but wouldn't run — still "present" for the ✓/✗
+    line = ((out or err or "").strip().splitlines() or [""])[0]
+    return True, line[:80]
 
 
 def _pkg_version(name):
@@ -268,14 +294,11 @@ def setup_async(msg):
     minutes: its own thread, reply when done (never blocks the port)."""
     def run():
         deps_sh = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deps.sh")
-        try:
-            # the path is an argument, never spliced into the script: `"`, `$`, backticks in it are harmless
-            p = subprocess.run(["/bin/bash", "-c", 'source "$1" && ensure_deps', "_", deps_sh],
-                                capture_output=True, text=True, timeout=1800)
-            lines = [l for l in (p.stdout + p.stderr).splitlines() if l.strip()]
-            output, ok = "\n".join(lines[-20:]), p.returncode == 0
-        except Exception as e:
-            output, ok = str(e), False
+        log.info("setup: running ensure_deps from %s", deps_sh)
+        # the path is an argument, never spliced into the script: `"`, `$`, backticks in it are harmless
+        rc, so, se = jlog.run(["/bin/bash", "-c", 'source "$1" && ensure_deps', "_", deps_sh], log, timeout=1800)
+        lines = [l for l in (so + se).splitlines() if l.strip()]
+        output, ok = "\n".join(lines[-20:]), rc == 0
         # On a first-run install this process was launched (and re-exec-checked) BEFORE ensure_deps
         # ever created native/.venv, so it's still running under the old (system) Python and an
         # in-process check_deps() would see none of what ensure_deps just installed into the venv.
@@ -284,17 +307,18 @@ def setup_async(msg):
         missing, python, hints = None, sys.executable, {}
         if os.path.exists(_VENV_PY) and not _in_venv():
             try:
-                cp = subprocess.run([_VENV_PY, os.path.abspath(__file__), "--deps"],
-                                     capture_output=True, text=True, timeout=60)
-                info = json.loads(cp.stdout)
+                _, cpout, _ = jlog.run([_VENV_PY, os.path.abspath(__file__), "--deps"], log, timeout=60)
+                info = json.loads(cpout)
                 missing = [name for name, v in info["deps"].items() if not v["present"]]
                 python = info["python"]
                 hints = info.get("hints", {})
             except Exception:
+                log.exception("setup: re-check in the venv failed, falling back to the in-process check")
                 missing = None
         if missing is None:
             cd = check_deps()
             missing, hints = [name for name, info in cd.items() if not info["present"]], deps_hints(cd)
+        log.info("setup done: ok=%s missing=%s python=%s", ok, missing, python)
         send({"id": msg.get("id"), "ok": ok, "output": output, "missing": missing, "python": python, "hints": hints})
     threading.Thread(target=run, daemon=True).start()
 
@@ -304,10 +328,10 @@ def choose_dir():
     script = ('tell application "System Events" to activate\n'
               'tell application "System Events" to return POSIX path of '
               '(choose folder with prompt "Jownloader: save downloads into…")')
-    p = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
-    path = p.stdout.strip()
-    if p.returncode != 0 or not path:
-        return {"ok": False, "output": "cancelled" if "-128" in p.stderr else p.stderr.strip()}
+    rc, out, err = jlog.run(["/usr/bin/osascript", "-e", script], log)
+    path = out.strip()
+    if rc != 0 or not path:
+        return {"ok": False, "output": "cancelled" if "-128" in err else err.strip()}
     return {"ok": True, "path": path.rstrip("/")}
 
 
@@ -322,10 +346,10 @@ def choose_files():
               'end repeat\n'
               'return out\n'
               'end tell')
-    p = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
-    paths = [l for l in p.stdout.split("\n") if l.strip()]
-    if p.returncode != 0 or not paths:
-        return {"ok": False, "output": "cancelled" if "-128" in p.stderr else p.stderr.strip()}
+    rc, out, err = jlog.run(["/usr/bin/osascript", "-e", script], log)
+    paths = [l for l in out.split("\n") if l.strip()]
+    if rc != 0 or not paths:
+        return {"ok": False, "output": "cancelled" if "-128" in err else err.strip()}
     files = []
     for path in paths:
         try:
@@ -350,13 +374,16 @@ def rename(msg):
             if not copy and dst_dir == os.path.dirname(src) and name == os.path.basename(src):
                 results.append({"ok": True, "path": src}); continue      # already named that
             dst = unique_path(dst_dir, name)
+            log.debug("rename %s %s -> %s", "copy" if copy else "move", src, dst)
             if copy:
                 shutil.copy2(src, dst)
             else:
                 shutil.move(src, dst)                                   # rename, or cross-volume move
             results.append({"ok": True, "path": dst})
         except Exception as e:
+            log.warning("rename %s -> %s/%s failed: %s", src, dst_dir, name, e)
             results.append({"ok": False, "output": str(e)})
+    log.info("rename mode=%s: %d op(s), %d ok", "copy" if copy else "move", len(results), sum(1 for r in results if r["ok"]))
     return {"ok": True, "results": results}
 
 
@@ -394,16 +421,20 @@ def unique_path(dst_dir, name, reserve=False):
     the caller then owns that temp (write into it, rename or remove it)."""
     base, ext = os.path.splitext(name)
     with NAME_LOCK:
-        out, n = os.path.join(dst_dir, name), 2
+        first = out = os.path.join(dst_dir, name); n = 2
         while True:
             if not _taken(out):
                 if not reserve:
+                    if out != first:
+                        log.info("name taken, using %s instead of %s", out, first)
                     return out
                 try:
                     os.close(os.open(out + ".jownloading", os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644))
+                    if out != first:
+                        log.info("name taken, reserved %s instead of %s", out, first)
                     return out
                 except FileExistsError:
-                    pass
+                    log.info("reserve race on %s: someone else took it just now, trying the next name", out)
             out = os.path.join(dst_dir, f"{base} ({n}){ext}"); n += 1
 
 
@@ -423,11 +454,16 @@ def commit(temp, path):
         try:
             os.link(temp, path)
         except FileExistsError:
-            path = unique_path(os.path.dirname(path), os.path.basename(path))
+            new = unique_path(os.path.dirname(path), os.path.basename(path))
+            log.warning("commit: %s appeared meanwhile, saving as %s", path, new)
+            path = new
             continue
-        except OSError:                                  # filesystem without hard links
+        except OSError as e:                             # filesystem without hard links
             if os.path.lexists(path):
-                path = unique_path(os.path.dirname(path), os.path.basename(path)); continue
+                new = unique_path(os.path.dirname(path), os.path.basename(path))
+                log.warning("commit: no hard links (%s) and %s exists, saving as %s", e, path, new)
+                path = new; continue
+            log.info("commit: no hard links here (%s), moving %s into place with os.replace", e, temp)
             os.replace(temp, path); return path
         os.remove(temp)
         return path
@@ -451,7 +487,9 @@ def join(msg):
     dst = msg.get("dst") or os.path.expanduser("~/Downloads")
     name = clean_name(msg.get("name"), "video")
     tracks = [TEMP.pop(i) for i in ids if i in TEMP]
+    log.info("join id=%s: %d/%d track(s) known %s -> %s/%s", sid, len(tracks), len(ids), [os.path.basename(t) for t in tracks], dst, name)
     if len(tracks) != len(ids) or not tracks:
+        log.error("join id=%s: track missing (asked %s, have temp ids %s)", sid, ids, sorted(TEMP))
         for t in tracks:
             try: os.remove(t)
             except OSError: pass
@@ -466,11 +504,8 @@ def join(msg):
         for i in range(len(tracks)):
             cmd += ["-map", str(i)]
         cmd += ["-c", "copy", "-movflags", "+faststart", "-f", "mp4", out + ".jownloading"]
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            err = "" if p.returncode == 0 else (p.stderr.strip().splitlines() or ["ffmpeg failed"])[-1]
-        except Exception as e:
-            err = str(e)
+        rc, _so, se = jlog.run(cmd, log, timeout=1800)
+        err = "" if rc == 0 else (se.strip().splitlines() or ["ffmpeg failed"])[-1]
         if not err:
             for t in tracks:
                 try: os.remove(t)
@@ -482,6 +517,7 @@ def join(msg):
         note = "ffmpeg could not join the tracks (" + err + ")"
     else:
         note = "ffmpeg not found (" + TOOL_HOWTO["ffmpeg"] + ")"
+    log.warning("join id=%s: falling back to the raw tracks: %s", sid, note)
     # no ffmpeg / it failed: keep what was fetched, say so
     if len(tracks) == 1:
         out = commit(tracks[0], final_for(tracks[0], dst, name + raw_ext(tracks[0])))
@@ -520,6 +556,7 @@ def mergepdf(msg):
             except OSError: pass
         return {"id": sid, "ok": False, "output": "track missing"}
     title_of = lambda i: safe_name(titles[i] if i < len(titles) else "", f"{name} page {i + 1}")
+    log.info("mergepdf id=%s: %d page(s) split=%s dst=%s", sid, len(tracks), bool(msg.get("split")), dst)
     try:
         os.makedirs(dst, exist_ok=True)
         if len(tracks) == 1:
@@ -529,6 +566,7 @@ def mergepdf(msg):
             from pypdf import PdfReader, PdfWriter
         except ImportError:
             PdfReader = None
+        log.info("mergepdf id=%s: pypdf %s", sid, "available" if PdfReader is not None else "NOT installed")
         if msg.get("split") or PdfReader is None:
             folder = os.path.join(dst, name); k = 2
             while os.path.exists(folder):
@@ -560,10 +598,23 @@ def mergepdf(msg):
             except OSError: pass
             raise
     except Exception as e:
+        log.exception("mergepdf id=%s failed", sid)
         for t in tracks:                                # a failed merge / rename leaves no temp page in dst
             try: os.remove(t)
             except OSError: pass
         return {"id": sid, "ok": False, "output": str(e)}
+
+
+def open_log():
+    """Open the log in TextEdit. JOWN_OPEN replaces /usr/bin/open (tests)."""
+    path = jlog.log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "a").close()
+    except OSError as e:
+        return {"ok": False, "path": path, "output": f"cannot create the log file: {e}"}
+    rc, _, err = jlog.run([os.environ.get("JOWN_OPEN") or "/usr/bin/open", "-a", "TextEdit", path], log, timeout=20)
+    return {"ok": rc == 0, "path": path, **({} if rc == 0 else {"output": (err.strip() or "open failed")})}
 
 
 def stream(msg):
@@ -575,27 +626,32 @@ def stream(msg):
         try:
             os.makedirs(dst, exist_ok=True)
             path = unique_path(dst, name, reserve=True)           # the name is ours from here: no other open can pick it
-            OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "temp": bool(msg.get("temp")),
+            OPEN[sid] = {"f": open(path + ".jownloading", "wb"), "path": path, "bytes": 0, "chunks": 0, "temp": bool(msg.get("temp")),
                          "strip": bool(msg.get("strip")), "webp": msg.get("webp") or False}
             return {"id": sid, "ok": True, "path": path}
         except Exception as e:
+            log.exception("open id=%s name=%r dst=%s failed", sid, name, dst)
             return {"id": sid, "ok": False, "output": str(e)}
     st = OPEN.get(sid)
     if not st:
         if cmd == "abort" and sid in TEMP:              # a closed track of a stream that failed later
+            log.info("abort id=%s: removing its closed temp track", sid)
             try: os.remove(TEMP.pop(sid))
             except OSError: pass
             return {"id": sid, "ok": False, "output": "aborted"}
+        log.warning("%s id=%s: not open (open ids: %s)", cmd, sid, sorted(OPEN))
         return {"id": sid, "ok": False, "output": "not open"}
     if cmd == "chunk":
         data = base64.b64decode(msg.get("data", ""))
-        st["f"].write(data); st["bytes"] += len(data)
+        st["f"].write(data); st["bytes"] += len(data); st["chunks"] += 1
         return {"id": sid, "ok": True}
     st["f"].close(); OPEN.pop(sid, None)
     if cmd == "abort":
+        log.info("abort id=%s: %s discarded after %d chunk(s), %d bytes", sid, st["path"], st["chunks"], st["bytes"])
         try: os.remove(st["path"] + ".jownloading")
         except OSError: pass
         return {"id": sid, "ok": False, "output": "aborted"}
+    log.info("close id=%s: %s %d chunk(s), %d bytes%s", sid, st["path"], st["chunks"], st["bytes"], " (temp track, waits for join)" if st["temp"] else "")
     if st["temp"]:                                      # a stream track: stays hidden until "join"
         TEMP[sid] = st["path"] + ".jownloading"
         return {"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}
@@ -603,13 +659,55 @@ def stream(msg):
         st["path"] = commit(st["path"] + ".jownloading", st["path"])
         return finished({"id": sid, "ok": True, "path": st["path"], "bytes": st["bytes"]}, st)
     except Exception as e:
+        log.exception("close id=%s: commit of %s failed", sid, st["path"])
         return {"id": sid, "ok": False, "output": str(e)}
 
 
+def _version_cache_path():
+    return os.path.join(jlog.log_dir(), ".versions.json")
+
+
+def log_startup():
+    """One block per host process: who launched it, which python, venv decision, tool versions. Tool versions are
+    cached on disk by (path, mtime, size) so a one-shot process does not spawn three subprocesses every time."""
+    log.info("host start pid=%d ppid=%d python=%s (%s) prefix=%s base_prefix=%s", os.getpid(), os.getppid(), sys.executable, sys.version.split()[0], sys.prefix, sys.base_prefix)
+    log.info("host boot: %s | re-exec mark=%s venv_dir=%s in_venv=%s unusable=%s | HOME=%s PATH=%s", _BOOT_NOTE, os.environ.get(_REEXEC_MARK), _VENV_DIR, _in_venv(), _VENV_UNUSABLE, os.path.expanduser("~"), os.environ.get("PATH"))
+    try:
+        cache = json.load(open(_version_cache_path()))
+    except (OSError, ValueError):
+        cache = {}
+    changed, seen = False, []
+    for name, args in (("yt-dlp", ["--version"]), ("ffmpeg", ["-version"]), ("gallery-dl", ["--version"])):
+        path = shutil.which(name) or (ffmpeg_path() if name == "ffmpeg" else None)
+        if not path:
+            seen.append(f"{name}=MISSING"); continue
+        try:
+            st = os.stat(os.path.realpath(path)); key = f"{path}|{int(st.st_mtime)}|{st.st_size}"
+        except OSError:
+            key = path
+        if key not in cache:
+            rc, out, err = jlog.run([path, *args], log, timeout=10, ok_tail=0)
+            cache = {k: v for k, v in cache.items() if not k.startswith(path + "|")}
+            cache[key] = ((out or err).strip().splitlines() or ["?"])[0][:80]; changed = True
+        seen.append(f"{name}={cache[key]} ({path})")
+    if changed:
+        try:
+            tmp = _version_cache_path() + f".{os.getpid()}"
+            json.dump(cache, open(tmp, "w")); os.replace(tmp, _version_cache_path())
+        except OSError:
+            pass
+    log.info("host tools: %s", "; ".join(seen))
+
+
 def main():
+    log_startup()
     try:
         serve()
+    except BaseException:
+        log.exception("host stopped by an exception")
+        raise
     finally:                                   # port closed mid-stream: no half files left behind
+        log.info("host exit pid=%d: %d open file(s), %d temp track(s) discarded", os.getpid(), len(OPEN), len(TEMP))
         for st in OPEN.values():
             try:
                 st["f"].close(); os.remove(st["path"] + ".jownloading")
@@ -625,12 +723,25 @@ def serve():
         msg = read_msg()
         if msg is None:
             break
-        if msg.get("cmd") == "exists":
-            send({"ok": True, "exists": [bool(p) and os.path.exists(p) for p in msg.get("paths") or []]})
+        if msg.get("cmd") == "log":
+            n = jlog.write_ext(msg.get("entries"))
+            if not msg.get("noreply"):
+                send({"ok": True, "n": n}, quiet=True)
+        elif msg.get("cmd") == "openlog":
+            send(open_log())
+        elif msg.get("cmd") == "taillog":
+            text = jlog.tail_file(msg.get("lines") or 200)
+            send({"ok": True, "path": jlog.log_path(), "text": text, "lines": len(text.splitlines())}, quiet=True)
+            log.debug("taillog: sent %d line(s) to the popup", len(text.splitlines()))
+        elif msg.get("cmd") == "exists":
+            res = [bool(p) and os.path.exists(p) for p in msg.get("paths") or []]
+            log.debug("exists: %s", [(p, r) for p, r in zip(msg.get("paths") or [], res)][:20])
+            send({"ok": True, "exists": res})
         elif msg.get("cmd") in ("open", "chunk", "close", "abort"):
             try:
                 r = stream(msg)
             except Exception as e:          # disk full, bad base64 …: fail THIS file, keep serving the others
+                log.exception("%s id=%s failed", msg.get("cmd"), msg.get("id"))
                 st = OPEN.pop(msg.get("id"), None)
                 if st:
                     try:
@@ -639,17 +750,19 @@ def serve():
                         pass
                 r = {"id": msg.get("id"), "ok": False, "output": str(e)}
             if r is not None:
-                send(r)
+                send(r, quiet=(msg.get("cmd") == "chunk" and bool(r.get("ok"))))     # chunk acks are counted at close, not logged one by one
         elif msg.get("cmd") == "join":
             try:
                 r = finished(join(msg), msg)
             except Exception as e:
+                log.exception("join id=%s raised", msg.get("id"))
                 r = {"id": msg.get("id"), "ok": False, "output": str(e)}
             send(r)
         elif msg.get("cmd") == "mergepdf":
             try:
                 r = finished(mergepdf(msg), msg)
             except Exception as e:
+                log.exception("mergepdf id=%s raised", msg.get("id"))
                 r = {"id": msg.get("id"), "ok": False, "output": str(e)}
             send(r)
         elif msg.get("cmd") == "fetch":
@@ -658,6 +771,7 @@ def serve():
             try:
                 r = engine.spotify_sync(msg.get("dst") or "", msg.get("folder") or "", msg.get("tracks") or [], msg.get("libs") or [], msg.get("total"))
             except Exception as e:
+                log.exception("sync raised")
                 r = {"ok": False, "output": str(e)}
             r["id"] = msg.get("id")
             send(r)
@@ -675,8 +789,10 @@ def serve():
             send(rename(msg))
         elif msg.get("cmd") == "deps":
             cd = check_deps()
+            log.info("deps: %s", "; ".join(f"{k}={'v' + v['version'] if v['present'] else 'MISSING'}" for k, v in cd.items()))
             send({"ok": True, "deps": cd, "hints": deps_hints(cd), "python": sys.executable, "prefix": sys.prefix})
         else:
+            log.warning("unknown cmd %r", msg.get("cmd"))
             send({"ok": False, "output": "unknown cmd"})
 
 

@@ -12,6 +12,8 @@
   const autoDone = new Set();      // video URLs already auto-downloaded this page
   const buttons = new Map();       // video element -> overlay button
   const pending = new Map();       // canonical job key -> the button that queued it (for a late saveResult)
+  // the developer log: notable events go to the worker, which forwards them to the one log file
+  const clog = (level, area, m, d) => { try { chrome.runtime.sendMessage({ type: "log", entries: [{ t: Date.now(), l: level, a: area, m, d }] }).catch(() => {}); } catch {} };
   const canon = (u) => { try { const x = new URL(u); return x.origin + x.pathname; } catch { return u; } };
   const jobKey = (it) => it.engine ? canon(it.url) + "#" + (it.mode || "video") : it.site ? canon(it.url) + "#site-" + (it.mode || "pdf") : canon(it.url);
 
@@ -320,6 +322,7 @@
     else if (msg.type === "spotifyRows" && top === window) { spotifyRows().then(reply, () => reply(null)); return true; }
     else if (msg.type === "saveResult") {
       const btn = pending.get(msg.c);
+      clog(msg.ok ? "info" : "warn", "button", `save result: ${msg.ok ? "ok" : "FAILED"}${msg.output ? " — " + msg.output : ""}`, { key: msg.c, button: !!btn });
       if (btn) { pending.delete(msg.c); flash(btn, msg.ok ? (msg.output ? `saved (${msg.output})` : "saved ✓") : `failed — ${msg.output || "unknown error"}`, 6000); }
     }
     return false;
@@ -332,6 +335,7 @@
   // just a console warning nobody sees. Any unexpected throw here is also caught, never silent.
   async function downloadVideo(v, btn) {
     try {
+      clog("info", "button", "⬇ clicked", { page: location.href.slice(0, 200), drm: !!v.mediaKeys, engine: ENGINE_PAGE });
       if (v.mediaKeys) { flash(btn, "protected video (DRM) — can't be saved by any tool", 4000); return; }
       const urls = videoUrls(v).filter((u) => !u.startsWith("blob:"));
       const date = dateNear(v);
@@ -340,13 +344,15 @@
       if (!items.length) {
         items = (await capturedWhole()).map((c) => ({ url: c.url, ctype: c.ctype, date }));
         if (!items.length) items = (await streams()).map((s) => ({ ...s, date }));
-        if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); return; }
+        if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); clog("warn", "button", "no URL, no whole file, no stream captured: nothing to save"); return; }
       }
+      clog("info", "button", `sending ${items.length} item(s) to the worker`, { first: items[0].url?.slice(0, 200), engine: !!items[0].engine, stream: !!items[0].stream });
       const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
       if (r?.queued) for (const it of items) pending.set(jobKey(it), btn);
       const what = items[0].engine ? "downloading" : items[0].stream ? "joining stream" : `saving ${r?.queued}`;
       flash(btn, r?.queued ? `${what} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
     } catch (e) {
+      clog("error", "button", `download threw: ${e?.stack || e}`);
       flash(btn, `failed — ${e?.message || e}`, 4000);
     }
   }
@@ -433,6 +439,7 @@
     items = items.filter((i) => !autoDone.has(i.url));
     if (!items.length) return;
     items.forEach((i) => autoDone.add(i.url));
+    clog("info", "auto", `auto-download: ${items.length} video item(s)`, { first: items[0].url?.slice(0, 200) });
     chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
   }
   function autoGrabAll() { if (settings.autoVideos) document.querySelectorAll("video").forEach(autoGrab); }

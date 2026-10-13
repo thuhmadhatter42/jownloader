@@ -5,7 +5,8 @@ import base64, json, os, struct, subprocess, sys, tempfile, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.environ.get("JOWN_HOST_UNDER_TEST") or os.path.join(os.path.dirname(HERE), "native", "jownloader_host.py")   # override: show the checks FAIL on the old host
 VENV_PY = os.path.join(os.path.dirname(HERE), "native", ".venv", "bin", "python3")
-ENV = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]}
+LOGDIR = tempfile.mkdtemp(prefix="jown-fileslog-"); os.environ["JOWN_LOG_DIR"] = LOGDIR   # the developer log goes to a temp folder
+ENV = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"], "JOWN_LOG_DIR": LOGDIR}
 BOOT_PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
 fails = 0
 def check(label, got, want):
@@ -120,5 +121,6 @@ print(json.dumps([r['ok'], sorted(os.listdir({sp!r}))]))
     check("leading dots stripped on open", sorted(os.listdir(t)), ["download", "hidden.txt", "zshrc"])
 finally:
     shutil.rmtree(d)
+    shutil.rmtree(LOGDIR, ignore_errors=True)
 print("ALL GREEN" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

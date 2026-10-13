@@ -148,6 +148,28 @@ missing automatically (a badge on the icon shows while that runs), and the popup
 "Dependencies" row with a ✓/✗ per tool and an **Install missing dependencies** button for whenever
 one needs a manual nudge (e.g. after a Homebrew upgrade removes something).
 
+## Logs
+
+One developer log holds everything that happens on both sides: the extension (saves, dedupe decisions,
+host connects, crawl and stream decisions, Spotify progress), the native host (every message in and out,
+every subprocess with its full command line, exit code, timing and output tail) and the engine (each
+download strategy tried and why it failed, every Spotify match with its score and the reason a result
+was rejected).
+
+```
+~/Library/Logs/Jownloader/jownloader.log      (5 files of 5 MB: jownloader.log, .1 … .5)
+```
+
+- Extra tools → **Logs** in the popup: **Open log** opens the file in TextEdit, **Copy last 200 lines**
+  puts the tail on the clipboard (paste it into a bug report).
+- The level is `debug` by default. Quiet it with `JOWN_LOG=info` (or `warning`, `error`) in the
+  environment the host starts with, for example `launchctl setenv JOWN_LOG info` and then restart the browser.
+- Cookie, token and password values are replaced by `***` before anything is written; file data is never logged
+  (chunks are only counted). Cookie file *paths* do appear.
+- `JOWN_LOG_DIR` moves the file (the tests use a temp folder).
+- Failures also show in the popup: every failed song or file is listed with its reason, and a run that saved
+  nothing ends on a red error line instead of a plain "done".
+
 ## Layout
 
 ```
@@ -163,6 +185,7 @@ python3 tests/ext_test.py          # Chromium via Playwright: scanning, naming, 
 python3 tests/stream_test_cdp.py   # real Brave over CDP: host writes, chosen folder, [date] names, skip-if-on-disk
 python3 tests/host_test.py         # the host alone: batch rename / move / copy, collisions, WebP → JPEG / PNG, strip metadata,
                                    # Spotify lists / matching / tags / re-run rules (saved pages in tests/fixtures, no network)
+python3 tests/log_test.py          # the developer log: file, redaction, subprocess lines, rotation, two hosts at once
 python3 tests/streams_test_cdp.py  # real Brave: HLS (TS, AES-128, fMP4 + audio group) and DASH joined into .mp4, DRM refused
 python3 tests/engine_test_cdp.py   # real Brave: a YouTube page → H.264 .mp4 and a BPM/key-named audio file (network)
 python3 tests/site_test_cdp.py     # real Brave: Whole-site crawl (its own local fixture site) → merged PDF and Markdown

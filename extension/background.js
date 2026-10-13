@@ -18,6 +18,96 @@ const EXT_BY_MIME = {
   "image/avif": "avif", "image/svg+xml": "svg", "image/bmp": "bmp", "image/tiff": "tif",
 };
 
+// ---------- developer log ----------
+// log(level, area, msg, data): a ring buffer of the last LOG_MAX entries (memory + chrome.storage.session under
+// its own key, byte-capped, apart from the page-hook manifest cache), forwarded to the native host in batches
+// (fire-and-forget, never awaited by a save) so ONE file, ~/Library/Logs/Jownloader/jownloader.log, holds both
+// sides. Popup and content scripts send theirs as {type:"log"} messages. Cookie / token values never get in.
+const LOG_MAX = 2000, LOG_KEY = "devLog", LOG_SENT_KEY = "devLogSent", LOG_BYTES = 400 * 1024;
+const LOG_FLUSH_MS = 2000, LOG_BATCH = 200, LOG_DOWN_MS = 30000;
+const logRing = [];                  // oldest first: {n, t, l, a, m, d}
+let logLastN = 0, logSent = 0, logSendTimer = 0, logSaveTimer = 0, logBusy = null, logDownUntil = 0;
+const LOG_SECRET_KEY = "(?:cookie|authorization|token|passwd|password|secret|api[_-]?key|sessionid|session_id|signature)";
+const logRedact = (s) => String(s)
+  .replace(new RegExp('("[\\w-]*' + LOG_SECRET_KEY + '[\\w-]*"\\s*:\\s*)"[^"]*"', "gi"), '$1"***"')     // JSON: "authorization":"Bearer x"
+  .replace(/\b(cookie|set-cookie|authorization|proxy-authorization)\s*[:=]\s*[^\r\n]*/gi, "$1: ***")
+  .replace(/([\w-]*(?:token|passwd|password|secret|api[_-]?key|sessionid|session_id|signature)[\w-]*)(\s*[=:]\s*)([^\s&"'`;,<>]+)/gi, "$1$2***");
+const logUrl = (u) => logRedact(String(u || "")).slice(0, 300);
+function logAdd(e) {
+  logRing.push(e);
+  if (logRing.length > LOG_MAX) logRing.splice(0, logRing.length - LOG_MAX);
+  if (!logSendTimer) logSendTimer = setTimeout(logFlush, LOG_FLUSH_MS);
+  if (!logSaveTimer) logSaveTimer = setTimeout(logSave, 1500);
+}
+function log(level, area, msg, data) {
+  try {
+    const e = { n: (logLastN = Math.max(logLastN + 1, Date.now())), t: Date.now(), l: level, a: String(area), m: logRedact(msg).slice(0, 600) };
+    if (data !== undefined) {
+      let d; try { d = typeof data === "string" ? data : JSON.stringify(data); } catch { d = String(data); }
+      e.d = logRedact(d).slice(0, 800);
+    }
+    logAdd(e);
+    if (level === "error") console.error("[jownloader]", area, msg, data ?? ""); else if (level === "warn") console.warn("[jownloader]", area, msg, data ?? "");
+  } catch {}
+}
+// an entry from the popup or a content script: its own timestamp, its area prefixed with where it came from
+function logFrom(src, entries) {
+  for (const x of Array.isArray(entries) ? entries.slice(0, 200) : []) {
+    try {
+      const e = { n: (logLastN = Math.max(logLastN + 1, Date.now())), t: Number(x.t) || Date.now(), l: ["debug", "info", "warn", "error"].includes(x.l) ? x.l : "info", a: `${src}.${String(x.a || "ui").slice(0, 16)}`, m: logRedact(x.m ?? "").slice(0, 600) };
+      if (x.d !== undefined) { let d; try { d = typeof x.d === "string" ? x.d : JSON.stringify(x.d); } catch { d = String(x.d); } e.d = logRedact(d).slice(0, 800); }
+      logAdd(e);
+    } catch {}
+  }
+}
+function logSave() {
+  logSaveTimer = 0;
+  let bytes = 0, keep = logRing.length;
+  while (keep > 0 && bytes + (logRing[keep - 1].m.length + (logRing[keep - 1].d || "").length + 80) < LOG_BYTES) { keep--; bytes += logRing[keep].m.length + (logRing[keep].d || "").length + 80; }
+  chrome.storage.session.set({ [LOG_KEY]: logRing.slice(keep), [LOG_SENT_KEY]: logSent }).catch(() => {});
+}
+// forwards what the host has not seen: down the open port when a batch is running, else one sendNativeMessage per
+// batch. A host that cannot be reached is left alone for LOG_DOWN_MS; nothing is lost (the ring keeps the entries).
+function logFlush() {
+  if (logSendTimer) { clearTimeout(logSendTimer); logSendTimer = 0; }
+  if (logBusy) return logBusy;
+  logBusy = (async () => {
+    await 0;                      // logBusy must be assigned before the body can reach its finally (an empty flush ends at once)
+    try {
+      while (Date.now() >= logDownUntil) {
+        const batch = logRing.filter((e) => e.n > logSent).slice(0, LOG_BATCH);
+        if (!batch.length) break;
+        const entries = batch.map(({ t, l, a, m, d }) => ({ t, l, a, m, d }));
+        let ok = false;
+        if (hostPort) { try { hostPort.postMessage({ cmd: "log", entries, noreply: true }); ok = true; } catch {} }
+        if (!ok) { try { ok = !!(await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "log", entries })); } catch { ok = false; } }
+        if (!ok) { logDownUntil = Date.now() + LOG_DOWN_MS; break; }
+        logSent = batch[batch.length - 1].n;
+      }
+    } finally { logBusy = null; }
+    if (logRing.some((e) => e.n > logSent) && !logSendTimer) logSendTimer = setTimeout(logFlush, Math.max(LOG_FLUSH_MS, logDownUntil - Date.now()));
+    logSave();
+  })();
+  return logBusy;
+}
+// everything the host has not seen yet, now (the popup's "Copy last 200 lines" wants the file to be current)
+async function logFlushNow() {
+  logDownUntil = 0;
+  for (let i = 0; i < 20 && logRing.some((e) => e.n > logSent); i++) await logFlush();
+}
+const logReady = chrome.storage.session.get([LOG_KEY, LOG_SENT_KEY]).then((r) => {
+  const prev = Array.isArray(r[LOG_KEY]) ? r[LOG_KEY] : [];
+  if (prev.length) {
+    logRing.unshift(...prev);
+    if (logRing.length > LOG_MAX) logRing.splice(0, logRing.length - LOG_MAX);
+    logLastN = Math.max(logLastN, prev[prev.length - 1].n || 0);
+  }
+  logSent = Math.max(logSent, Number(r[LOG_SENT_KEY]) || 0);
+}).catch(() => {});
+self.addEventListener("unhandledrejection", (ev) => log("error", "worker", "unhandled promise rejection: " + String(ev.reason?.stack || ev.reason)));
+self.addEventListener("error", (ev) => log("error", "worker", `uncaught error: ${ev.message} (${ev.filename}:${ev.lineno})`));
+log("info", "worker", `service worker started, extension ${chrome.runtime.getManifest().version}`);
+
 // ---------- media capture (per tab, in session storage) ----------
 const mediaKey = (tabId) => `media:${tabId}`;
 // a captured URL is a whole file unless it is a playlist/manifest, a segment of one, or a YouTube track
@@ -223,23 +313,30 @@ let hostPort = null, hostSeq = 0;
 const hostWaiters = new Map();   // message id -> resolve
 function hostConnect() {
   if (hostPort) return hostPort;
+  log("info", "host", "connect: opening the persistent port to " + NATIVE_HOST);
   const p = chrome.runtime.connectNative(NATIVE_HOST);
   p.onMessage.addListener((m) => { const w = hostWaiters.get(m.id); if (w) { hostWaiters.delete(m.id); w(m); } });
   p.onDisconnect.addListener(() => {
     hostPort = null;
     const err = chrome.runtime.lastError?.message || "native host disconnected";
+    log(hostWaiters.size ? "error" : "info", "host", "port disconnected: " + err, { waiting: [...hostWaiters.keys()] });
     for (const [id, w] of hostWaiters) { hostWaiters.delete(id); w({ id, ok: false, output: err }); }
   });
   return (hostPort = p);
 }
-function hostRelease() { if (hostPort && !progress.active) { try { hostPort.disconnect(); } catch {} hostPort = null; keyCache.clear(); } }
+function hostRelease() { if (hostPort && !progress.active) { log("info", "host", "port released: no batch is running"); try { hostPort.disconnect(); } catch {} hostPort = null; keyCache.clear(); } }
 function hostAsk(port, msg) {
   return new Promise((resolve) => {
     hostWaiters.set(msg.id, resolve);
-    try { port.postMessage(msg); } catch (e) { hostWaiters.delete(msg.id); resolve({ ok: false, output: String(e?.message || e) }); }
+    try { port.postMessage(msg); } catch (e) { hostWaiters.delete(msg.id); log("error", "host", `postMessage ${msg.cmd} ${msg.id} threw: ${e?.message || e}`); resolve({ ok: false, output: String(e?.message || e) }); }
   });
 }
 const NO_HOST = /not found|forbidden|disconnected/i;
+// one request, own host process; never throws
+async function hostOnce(m) {
+  try { return (await chrome.runtime.sendNativeMessage(NATIVE_HOST, m)) || { ok: false, output: "native host did not answer" }; }
+  catch (e) { return { ok: false, output: hostError(String(e?.message || e)) }; }
+}
 const hostError = (out) => NO_HOST.test(out || "") ? "native host not installed — run native/install.sh" : out;
 
 // ---------- dependencies (yt-dlp, ffmpeg, gallery-dl, exiftool, pypdf, the BPM/key analyzer) ----------
@@ -256,11 +353,13 @@ async function runSetup() {
   return r.ok ? r : { ...r, output: hostError(r.output) };
 }
 // install / update: check once, and only bother the user (badge) if something is actually missing
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((det) => {
+  log("info", "worker", `installed/updated (${det?.reason}), version ${chrome.runtime.getManifest().version}`);
   (async () => {
     const d = await getDeps();
-    if (!d?.ok) return;   // host unreachable — nothing to check yet; the popup's own status explains why
+    if (!d?.ok) { log("warn", "deps", "host unreachable at install: " + (d?.output || "no answer")); return; }   // nothing to check yet; the popup's own status explains why
     const missing = Object.entries(d.deps).filter(([, v]) => !v.present).map(([k]) => k);
+    log("info", "deps", missing.length ? "missing: " + missing.join(", ") : "all dependencies present");
     if (!missing.length) return;
     try { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: "…" }); } catch {}
     const r = await runSetup();
@@ -297,6 +396,7 @@ const STALL_MS = 60000;         // no bytes for this long = the file failed, the
 async function saveViaHost(url, name, dest, kind, fin = {}) {
   const id = "s" + (++hostSeq);
   let stallTimer = 0;
+  log("info", "save", `${id} file: ${name} -> ${dest || "Downloads"}`, { url: logUrl(url), kind, strip: !!fin.strip, webp: fin.webp || "" });
   const read = (reader) => Promise.race([
     reader.read(),
     new Promise((_, rej) => { stallTimer = setTimeout(() => rej(new Error(`stalled: no data for ${STALL_MS / 1000} s`)), STALL_MS); }),
@@ -304,18 +404,19 @@ async function saveViaHost(url, name, dest, kind, fin = {}) {
   let res, reader, first;
   try {
     res = await fetch(url, { credentials: "include" });
+    log("debug", "save", `${id} response HTTP ${res.status} ${res.headers.get("content-type") || "?"} length=${res.headers.get("content-length") || "?"}`);
     if (!res.ok) throw new Error("HTTP " + res.status);
     reader = res.body.getReader();
     first = await read(reader);   // first chunk before "open": it decides the extension when nothing else does
-  } catch (e) { try { reader?.cancel(); } catch {} return { ok: false, output: String(e?.message || e) }; }
-  if (first.value && looksEncrypted(first.value)) { try { reader.cancel(); } catch {} return { ok: false, output: "protected video (DRM) — encrypted file, not saved" }; }
+  } catch (e) { log("warn", "save", `${id} fetch failed: ${e?.message || e}`, { url: logUrl(url) }); try { reader?.cancel(); } catch {} return { ok: false, output: String(e?.message || e) }; }
+  if (first.value && looksEncrypted(first.value)) { log("warn", "save", `${id} refused: encrypted (DRM) bytes`, { url: logUrl(url) }); try { reader.cancel(); } catch {} return { ok: false, output: "protected video (DRM) — encrypted file, not saved" }; }
   if (!hasExt(name)) {
     const ext = extForMime(res.headers.get("content-type")) || (first.value ? sniffExt(first.value) : "") || { video: "mp4", image: "jpg", doc: "pdf" }[kind] || "";
     if (ext) name += "." + ext;
   }
   const port = hostConnect();
   const opened = await hostAsk(port, { cmd: "open", id, name, dst: dest || "", ...fin });
-  if (!opened.ok) { try { reader.cancel(); } catch {} return { ok: false, output: hostError(opened.output) }; }
+  if (!opened.ok) { log("error", "save", `${id} host refused open: ${opened.output}`); try { reader.cancel(); } catch {} return { ok: false, output: hostError(opened.output) }; }
   try {
     let buf = new Uint8Array(0);
     const send = async (part) => {
@@ -331,8 +432,10 @@ async function saveViaHost(url, name, dest, kind, fin = {}) {
     }
     if (buf.length) await send(buf);
     const closed = await hostAsk(port, { cmd: "close", id });
+    log(closed.ok ? "info" : "error", "save", `${id} closed: ${closed.ok ? `${closed.path} (${closed.bytes} bytes)` : closed.output}`);
     return closed.ok ? closed : { ok: false, output: hostError(closed.output) };
   } catch (e) {
+    log("error", "save", `${id} aborted mid-file: ${e?.message || e}`, { url: logUrl(url) });
     try { reader.cancel(); } catch {}
     try { port.postMessage({ cmd: "abort", id }); } catch {}
     return { ok: false, output: String(e?.message || e) };
@@ -423,7 +526,8 @@ async function fetchBytes(url, range) {
     try { return await fetchBytesOnce(url, range); }
     catch (e) {
       if (e?.retry !== true) throw e;
-      if (attempt >= 2) throw e.cause;
+      if (attempt >= 2) { log("error", "stream", `segment gave up after 3 tries: ${e.cause?.message || e.cause}`, { url: logUrl(url) }); throw e.cause; }
+      log("warn", "stream", `segment retry ${attempt + 1}/2 after: ${e.cause?.message || e.cause}`, { url: logUrl(url) });
       await new Promise((r) => setTimeout(r, attempt ? 1500 : 500));
     }
   }
@@ -596,7 +700,7 @@ async function streamsFor(tabId) {
   for (const c of cap) {
     let text;
     try { text = await fetchManifestOnce(c.url, tabId); }
-    catch (e) { failed.push({ url: c.url, output: String(e?.message || e) }); continue; }
+    catch (e) { log("warn", "stream", `manifest not readable: ${e?.message || e}`, { url: logUrl(c.url) }); failed.push({ url: c.url, output: String(e?.message || e) }); continue; }
     if (text.trimStart().startsWith("#EXTM3U")) {
       const m = parseHls(text, c.url);
       if (m.master) for (const v of [...m.variants, ...m.audio]) children.add(canon(v.url));
@@ -605,6 +709,7 @@ async function streamsFor(tabId) {
   }
   const seen = new Set();
   const ok = found.filter((s) => (s.master || !children.has(canon(s.url))) && !seen.has(canon(s.url)) && seen.add(canon(s.url))).map((s) => ({ url: s.url, stream: true }));
+  log("debug", "stream", `candidates for tab ${tabId}: ${cap.length} captured manifest(s), ${found.length} readable, ${ok.length} offered, ${failed.length} failed`, ok.map((s) => logUrl(s.url)));
   if (ok.length || !failed.length) return ok;
   // every manifest the tab captured failed to (re-)fetch (a one-shot signed URL some sites issue,
   // already spent by the page's own player): offer the newest one anyway, so the real save is attempted
@@ -627,13 +732,16 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null) {
   const port = hostConnect(), ids = [];
   try {
     const text = await fetchManifestOnce(url, tabId);
-    const tracks = text.trimStart().startsWith("#EXTM3U") ? await hlsTracks(url, text, tabId) : dashTracks(text, url);
+    const isHls = text.trimStart().startsWith("#EXTM3U");
+    const tracks = isHls ? await hlsTracks(url, text, tabId) : dashTracks(text, url);
+    log("info", "stream", `${name}: ${isHls ? "HLS" : "DASH"} manifest, ${tracks.length} track(s) to fetch`, { url: logUrl(url), tracks: tracks.map((t) => ({ kind: t.kind, label: t.label, ext: t.ext, segments: t.segs.length, init: !!t.init })) });
     for (const t of tracks) {
       const id = "s" + (++hostSeq);
       const opened = await hostAsk(port, { cmd: "open", id, name: `${name}.${t.kind}.${t.ext}`, dst: dest || "", temp: true });
       if (!opened.ok) throw new Error(hostError(opened.output));
       ids.push(id);
       const parts = [...(t.init ? [{ ...t.init, init: true }] : []), ...t.segs];
+      log("debug", "stream", `${name}: ${t.kind} track ${id}: ${parts.length} part(s), ${STREAM_AHEAD} fetched ahead`);
       const pending = [];
       for (let i = 0, k = 0; i < parts.length || pending.length; k++) {
         while (pending.length < STREAM_AHEAD && i < parts.length) { const s = parts[i++]; pending.push(fetchBytes(s.url, s.range).then((b) => s.init ? b : decryptSeg(b, s))); }
@@ -649,8 +757,10 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null) {
       if (!closed.ok) throw new Error(hostError(closed.output));
     }
     const r = await hostAsk(port, { cmd: "join", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
+    log(r.ok ? "info" : "error", "stream", `${name}: join ${r.ok ? `ok -> ${r.path} (${r.bytes} bytes)${r.output ? " — " + r.output : ""}` : "FAILED: " + r.output}`);
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   } catch (e) {
+    log("error", "stream", `${name}: stream save failed: ${e?.message || e}`, { url: logUrl(url) });
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
     return { ok: false, output: streamError(String(e?.message || e)) };
   }
@@ -743,6 +853,7 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
   const hostname = new URL(url).hostname.replace(/^www\./, "");
   const name = sanitize(hostname) || "site";
   const crawlId = ++crawlSeq;
+  log("info", "crawl", `#${crawlId} start: ${mode} of ${logUrl(url)} follow=${follow} maxPages=${follow ? maxPages : 1}`);
   if (mode !== "pdf") {   // Markdown writes one file at the very end: find out now that the host or the folder is unusable, not after every page
     const pid = "s" + (++hostSeq);
     const probe = await hostAsk(port, { cmd: "open", id: pid, name: ".jownloader-check.md", dst: dest || "", temp: true });
@@ -761,19 +872,20 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
       const pageUrl = queue.shift(), isStart = pageUrl === start && !n;
       // ask the server first: error pages, downloads and redirect targets already seen never become pages
       const probe = await siteProbe(pageUrl);
-      if (probe.skip) { if (isStart) throw new Error(`${pageUrl} was not saved: ${probe.skip}`); continue; }
+      if (probe.skip) { log("info", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: ${probe.skip}`); if (isStart) throw new Error(`${pageUrl} was not saved: ${probe.skip}`); continue; }
       const final = siteNorm(probe.final, origin);
-      if (!final || (final !== pageUrl && visited.has(final))) { if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
+      if (!final || (final !== pageUrl && visited.has(final))) { log("info", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: redirected to ${logUrl(probe.final)} (off-site or already seen)`); if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
       visited.add(final);
       await chrome.tabs.update(tabId, { url: pageUrl });
       await waitTabLoad(tabId);
       let pageTitle = "", landedUrl = "";
       try { const t = await chrome.tabs.get(tabId); pageTitle = t.title || ""; landedUrl = t.url || ""; } catch {}
-      if (/^chrome-error:/.test(landedUrl)) { if (isStart) throw new Error(`${pageUrl} was not saved: the page did not load`); continue; }
+      if (/^chrome-error:/.test(landedUrl)) { log("warn", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: the page did not load (chrome-error)`); if (isStart) throw new Error(`${pageUrl} was not saved: the page did not load`); continue; }
       const landed = siteNorm(landedUrl, origin);   // a script/meta redirect after load
-      if (!landed || (landed !== final && visited.has(landed))) { if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
+      if (!landed || (landed !== final && visited.has(landed))) { log("info", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: script redirect to ${logUrl(landedUrl)}`); if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
       visited.add(landed);
       n++;
+      log("info", "crawl", `#${crawlId} page ${n}: ${logUrl(pageUrl)} "${pageTitle.slice(0, 80)}"`);
       crawlProgress(crawlId, n, Math.min(maxPages, n + queue.length), pageUrl);
       if (mode === "pdf") {
         const r = await chrome.debugger.sendCommand({ tabId }, "Page.printToPDF", { printBackground: true });
@@ -797,9 +909,12 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
       }
       if (!follow) break;
       const links = await siteLinksOf(tabId, origin);
+      const before = queue.length;
       for (const l of links) if (!visited.has(l)) { visited.add(l); queue.push(l); }
+      log("debug", "crawl", `#${crawlId} ${links.length} same-site safe link(s) on page ${n}, ${queue.length - before} new, ${queue.length} queued`);
     }
   } catch (e) {
+    log("error", "crawl", `#${crawlId} failed after ${n} page(s): ${e?.message || e}`);
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
     return { ok: false, output: String(e?.message || e) };
   } finally {
@@ -807,8 +922,10 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
     if (attached) try { await chrome.debugger.detach({ tabId }); } catch {}
     if (tabId != null) try { await chrome.tabs.remove(tabId); } catch {}
   }
+  log("info", "crawl", `#${crawlId} crawled ${n} page(s), ${mode === "pdf" ? "merging PDFs" : "writing Markdown"}`);
   if (mode === "pdf") {
     const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, titles, dst: dest || "", ...fin });
+    log(r.ok ? "info" : "error", "crawl", `#${crawlId} merge ${r.ok ? "ok -> " + r.path : "FAILED: " + r.output}`);
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   }
   const md = mdParts.join("");
@@ -835,7 +952,10 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
 // Twitter/X) with the browser's own session. One reply when it is done; the host keeps streaming other files.
 async function saveEngineViaHost(url, mode, dest, fin = {}, extra = {}) {
   const port = hostConnect();
-  const r = await hostAsk(port, { cmd: "fetch", id: "s" + (++hostSeq), url, mode, dst: dest || "", ...fin, ...extra });
+  const id = "s" + (++hostSeq), t0 = Date.now();
+  log("info", "engine", `${id} dispatch to the host engine: ${mode} ${logUrl(url)} -> ${dest || "Downloads"}`, { mp3: !!extra.mp3, analyze: !!extra.analyze, strip: !!fin.strip, webp: fin.webp || "", song: extra.meta ? `${extra.meta.number}. ${extra.meta.artists} - ${extra.meta.title}` : undefined });
+  const r = await hostAsk(port, { cmd: "fetch", id, url, mode, dst: dest || "", ...fin, ...extra });
+  log(r.ok ? "info" : "error", "engine", `${id} reply after ${((Date.now() - t0) / 1000).toFixed(1)} s: ${r.ok ? "ok " + (r.path || "") + (r.output ? " — " + r.output : "") : "FAILED: " + r.output}`);
   return r.ok ? r : { ok: false, output: hostError(r.output) };
 }
 
@@ -848,7 +968,7 @@ let spotifyChain = Promise.resolve(), spotifyLast = 0;
 function spotifyTurn(fn) {
   const run = spotifyChain.then(async () => {
     const wait = spotifyLast + SPOTIFY_GAP_MS - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    if (wait > 0) { log("debug", "spotify", `waiting ${Math.round(wait / 1000)} s (the gap between two songs)`); await new Promise((r) => setTimeout(r, wait)); }
     spotifyLast = Date.now();
     return fn();
   });
@@ -857,14 +977,18 @@ function spotifyTurn(fn) {
 }
 async function spotifyList(url) {
   const port = hostConnect();
+  log("info", "spotify", "list requested: " + logUrl(url));
   try {
     const r = await hostAsk(port, { cmd: "list", id: "s" + (++hostSeq), url });
+    if (r.ok) log("info", "spotify", `list ok: ${r.kind} "${r.name}" ${r.tracks?.length} song(s)${r.truncated ? " (embed cut short)" : ""}${r.skipped?.length ? `, ${r.skipped.length} skipped (not songs)` : ""}`);
+    else log("error", "spotify", "list FAILED: " + r.output);
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   } finally { hostRelease(); }
 }
 
 // ---------- progress (the popup's bar) ----------
-const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", crawl: null };
+// errors = every failure of the run, one line each ("song 6 Floaty: YouTube refused the download ..."); now = what is running
+const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", errors: [], now: [], crawl: null };
 // site crawl: page n of m (m = the pages known so far, capped by "Max pages") + the URL being rendered; n = 0 clears it
 // Every crawl has its own entry (id -> {n, m, url}); the bar and badge show the sum of the crawls running, and
 // are only cleared when the last one ends. m only grows, and the bar never steps back (m is raised to hold it).
@@ -931,6 +1055,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
   const settings = await chrome.storage.sync.get({ dest: "", prefix: "", strip: false, webp: "", spotifyBpm: false, mp3: false });
   const dest = opts.dest ?? settings.dest, prefix = opts.prefix ?? settings.prefix;
   const fin = { strip: !!settings.strip, webp: settings.webp === true ? "jpg" : settings.webp || "" };   // finishing steps the host applies to every file
+  log("info", "batch", `start: ${items.length} item(s), kind=${kind}, dest=${dest || "Downloads"}, prefix=${prefix || "-"}, strip=${fin.strip}, webp=${fin.webp || "-"}, mp3=${!!settings.mp3}, spotifyBpm=${!!settings.spotifyBpm}`);
   // dedupe within the batch by canonical URL, and against everything ever saved
   const jobs = [], seen = new Set();
   let skipped = 0, unusable = 0;
@@ -940,33 +1065,40 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     const cands = [];
     for (const raw of items) {
       const it = typeof raw === "string" ? { url: raw } : raw;
-      if (!it.url || !/^https?:/.test(it.url)) { unusable++; continue; }
+      if (!it.url || !/^https?:/.test(it.url)) { unusable++; log("info", "dedupe", "unusable (not an http/https URL): " + logUrl(it.url)); continue; }
       // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder)
       const mode = it.mode || "video";
       const c = it.site ? siteCanon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "")
         : it.engine ? engineCanon(it.url) + "#" + mode + (it.spotify ? ":" + (it.spotify.folder || "") : mode === "audio" && settings.mp3 ? "-mp3" : "")
         : canon(it.url);
       const alts = it.engine && !it.spotify ? engineAlts(it.url, mode, settings.mp3, c) : [];
-      if (seen.has(c) || inFlight.has(c)) { skipped++; continue; }
+      if (seen.has(c) || inFlight.has(c)) { skipped++; log("info", "dedupe", `skip: ${seen.has(c) ? "the same item twice in this batch" : "already downloading right now"}`, { key: c }); continue; }
       seen.add(c); cands.push({ alts, url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
     const altRecs = await getSaved(cands.flatMap((j) => j.alts.map((a) => a.k)));
-    for (const j of cands) if (!saved[j.c]) for (const a of j.alts) if (altRecs[a.k] && (!a.mp3 || /\.mp3$/i.test(altRecs[a.k].path || ""))) { saved[j.c] = altRecs[a.k]; break; }
+    for (const j of cands) if (!saved[j.c]) for (const a of j.alts) if (altRecs[a.k] && (!a.mp3 || /\.mp3$/i.test(altRecs[a.k].path || ""))) { saved[j.c] = altRecs[a.k]; log("debug", "dedupe", `older record counts: ${a.k}`, { key: j.c }); break; }
     const prior = cands.filter((j) => saved[j.c]);
     const there = await stillOnDisk(prior.map((j) => saved[j.c].path || ""));
     const keep = new Set(prior.filter((j, i) => there[i] || !saved[j.c].path).map((j) => j.c));
-    for (const j of cands) { if (keep.has(j.c)) skipped++; else { jobs.push(j); inFlight.add(j.c); } }
+    for (const j of cands) {
+      if (keep.has(j.c)) { skipped++; log("info", "dedupe", `skip: saved before, ${saved[j.c].path ? "its file is still at " + saved[j.c].path : "no path was recorded"}`, { key: j.c }); }
+      else { jobs.push(j); inFlight.add(j.c); log("info", "dedupe", `queue: ${saved[j.c] ? "saved before but its file is gone (" + (saved[j.c].path || "?") + "), downloading again" : "new"}`, { key: j.c }); }
+    }
     let n = prefix ? await nextCounter(dest, typed(prefix), jobs.length) : 0;
     // a stream's name carries no extension: the host names the joined file (.mp4); a site job is named
     // from the hostname, inside saveSiteViaHost
     for (const j of jobs) j.filename = j.engine || j.site ? "" : j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
   });
+  log("info", "batch", `queued ${jobs.length}, skipped ${skipped}, unusable ${unusable}`);
   onQueued({ queued: jobs.length, skipped, unusable });
   if (!jobs.length) return;
 
-  if (!progress.active) Object.assign(progress, { total: 0, done: 0, failed: 0, bytes: 0, error: "" });
+  if (!progress.active) {
+    Object.assign(progress, { total: 0, done: 0, failed: 0, bytes: 0, error: "", errors: [], now: [] });
+    if (!progress.crawl) try { chrome.action.setBadgeText({ text: "" }); } catch {}   // a "!" from the last run's failures
+  }
   progress.total += jobs.length; progress.active++; progress.where = dest || "Downloads"; progress.kind = kind;
   pushProgress(true);
   const queue = jobs.slice();
@@ -974,15 +1106,28 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     await Promise.all(Array.from({ length: 4 }, async () => {   // four files at a time
       while (queue.length) {
         const j = queue.shift();
+        const label = jobLabel(j), t0 = Date.now();
+        progress.now.push(label); pushProgress(false);
+        log("info", "job", `start ${label}`, { key: j.c, url: logUrl(j.url), type: j.spotify ? "spotify" : j.engine ? "engine" : j.site ? "site" : j.stream ? "stream" : "file" });
         let r;
         try {
           r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin, srcTab) : await saveViaHost(j.url, j.filename, dest, kind, fin);
           if (r.ok) await markSaved(j.c, r.path);
         }
-        catch (e) { r = { ok: false, output: String(e?.message || e) }; }
+        catch (e) { r = { ok: false, output: String(e?.message || e) }; log("error", "job", `${label} threw: ${e?.stack || e}`); }
         inFlight.delete(j.c);
-        if (!r.ok) { progress.failed++; progress.error = r.output; console.warn("save failed", j.url, r.output); }
-        else if (r.output) progress.error = r.output;   // saved, with a caveat (e.g. no ffmpeg: tracks left separate)
+        const at = progress.now.indexOf(label); if (at >= 0) progress.now.splice(at, 1);
+        const secs = ((Date.now() - t0) / 1000).toFixed(1);
+        if (!r.ok) {
+          // every failure is named in the popup with its reason ("song 6 Floaty: YouTube refused the download ..."), never just counted
+          const why = j.spotify ? `${label}: ${stripTitle(r.output, j.spotify.title || "")}` : r.output;
+          progress.failed++; progress.error = why;
+          progress.errors.push(j.spotify ? why : `${label}: ${r.output}`); if (progress.errors.length > 100) progress.errors.shift();
+          log("error", "job", `FAILED ${label} after ${secs} s: ${r.output}`, { key: j.c });
+        } else {
+          log("info", "job", `done ${label} in ${secs} s -> ${r.path || ""}${r.output ? " — " + r.output : ""}`);
+          if (r.output) progress.error = r.output;   // saved, with a caveat (e.g. no ffmpeg: tracks left separate)
+        }
         progress.done++; pushProgress(false);
         // the ⬇ button's own flash only reflects "queued", not how the save actually finished (it runs
         // async, after the button already replied) — tell the originating tab the real outcome so a
@@ -993,8 +1138,24 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
   } finally {
     for (const j of queue) inFlight.delete(j.c);
     progress.active--; pushProgress(true);
+    if (!progress.active) endOfRun(jobs.some((j) => j.spotify));
     hostRelease();
   }
+}
+
+const jobLabel = (j) => j.spotify ? `song ${j.spotify.number ?? "?"} ${j.spotify.title || ""}`.trim()
+  : j.engine ? `${j.mode} ${logUrl(j.url).replace(/^https?:\/\/(www\.)?/, "").slice(0, 60)}`
+  : j.site ? `site ${j.mode} ${logUrl(j.url).replace(/^https?:\/\/(www\.)?/, "").slice(0, 50)}`
+  : j.stream ? `stream ${j.filename}` : `file ${j.filename}`;
+const stripTitle = (out, title) => String(out || "failed").replace(new RegExp("^" + String(title).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ":\\s*"), "");
+// the last batch of a run has ended: the log gets the verdict, the badge turns red on any failure, and a Spotify run
+// (long, the popup usually closed) raises a notification naming the failures
+function endOfRun(hadSpotify) {
+  const ok = progress.done - progress.failed;
+  log(progress.failed ? "warn" : "info", "batch", `run finished: ${ok} saved, ${progress.failed} failed of ${progress.total}`, progress.errors.slice(-5));
+  if (!progress.failed) return;
+  try { chrome.action.setBadgeBackgroundColor({ color: "#d33" }); chrome.action.setBadgeText({ text: "!" }); } catch {}
+  if (hadSpotify) notify(ok ? `Jownloader: ${progress.failed} song${progress.failed > 1 ? "s" : ""} failed` : "Jownloader: no song was saved", progress.errors.slice(-3).join("\n"));
 }
 
 function notify(title, message) {
@@ -1008,9 +1169,11 @@ let pickerOpen = false;   // a Finder dialog is up (folder or file picker); one 
 async function withPicker(cmd, onResult) {
   if (pickerOpen) return { ok: false, output: "picker already open" };
   pickerOpen = true; chrome.runtime.sendMessage({ type: "picker", open: true }).catch(() => {});
+  log("info", "picker", `${cmd}: Finder dialog opened`);
   let r;
   try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd }); }
   catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
+  log(r?.ok ? "info" : "warn", "picker", `${cmd}: ${r?.ok ? "chose " + (r.path || (r.files || []).length + " file(s)") : r?.output || "no answer"}`);
   pickerOpen = false; chrome.runtime.sendMessage({ type: "picker", open: false }).catch(() => {});
   if (r?.ok) await onResult(r);
   else if (r?.output && r.output !== "cancelled") notify("Jownloader: Finder dialog failed", r.output);
@@ -1040,8 +1203,9 @@ async function renameBatch(name, dest, mode) {
   let r;
   try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "rename", mode, ops }); }
   catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
-  if (!r?.ok) { notify("Jownloader: rename failed", r?.output); return r; }
+  if (!r?.ok) { log("error", "rename", "failed: " + r?.output); notify("Jownloader: rename failed", r?.output); return r; }
   const done = r.results.filter((x) => x.ok).length, failed = r.results.filter((x) => !x.ok);
+  log(failed.length ? "warn" : "info", "rename", `${mode}: ${done} ok, ${failed.length} failed${failed.length ? " — " + failed[0].output : ""}`);
   await chrome.storage.session.remove("renameFiles");
   if (failed.length) notify("Jownloader: rename", `${failed.length} failed — ${failed[0].output}`);
   return { ok: true, done, failed: failed.length, error: failed[0]?.output || "", ops };
@@ -1060,8 +1224,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     } else if (msg.type === "spotifySync") {
       // what is already in the list's folder (renamed to the list's current order) or in an extra library folder
       let r;
+      log("info", "spotify", `sync "${msg.folder}": ${msg.tracks?.length} song(s), dest=${msg.dst || "Downloads"}`);
       try { r = await chrome.runtime.sendNativeMessage(NATIVE_HOST, { cmd: "sync", id: "y", dst: msg.dst || "", folder: msg.folder, tracks: msg.tracks, total: msg.total, libs: (await chrome.storage.sync.get({ spotifyLibs: [] })).spotifyLibs }); }
       catch (e) { r = { ok: false, output: hostError(String(e?.message || e)) }; }
+      if (r?.ok) log("info", "spotify", `sync "${msg.folder}": ${r.have.length} already in the folder, ${r.inlib.length} in a library, ${r.renamed} renamed`, r.notes?.length ? r.notes : undefined);
+      else log("error", "spotify", `sync "${msg.folder}" FAILED: ${r?.output || "native host did not answer"}`);
       reply(r?.ok ? r : { ok: false, output: hostError(r?.output) || "native host did not answer" });
     } else if (msg.type === "addSpotifyLib") {
       reply(await withPicker("choose_dir", async (r) => {
@@ -1070,6 +1237,14 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       }));
     } else if (msg.type === "getProgress") {
       reply({ ...progress });
+    } else if (msg.type === "log") {                  // popup / content script events: one file holds every side
+      logFrom(sender.url?.startsWith("chrome-extension://") ? "popup" : "content", msg.entries); reply({ ok: true });
+    } else if (msg.type === "openLog") {
+      await logFlushNow(); reply(await hostOnce({ cmd: "openlog" }));
+    } else if (msg.type === "tailLog") {
+      await logFlushNow(); reply(await hostOnce({ cmd: "taillog", lines: msg.lines || 200 }));
+    } else if (msg.type === "getLog") {                // the in-memory ring (tests, support)
+      await logReady; reply(logRing.slice(-(msg.n || 200)));
     } else if (msg.type === "chooseDir") {
       reply(await withPicker("choose_dir", (r) => chrome.storage.sync.set({ dest: r.path })));
     } else if (msg.type === "chooseRenameDest") {

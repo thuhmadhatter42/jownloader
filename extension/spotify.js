@@ -5,6 +5,7 @@
   const SP = /^https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2,5}(?:-[a-z]{2,4})?\/)?(track|album|playlist|artist)\/[A-Za-z0-9]+/i;
   const el = (id) => document.getElementById(id);
   const say = (t) => { el("status").textContent = t; };
+  const plog = (...a) => { if (typeof jlog === "function") jlog(...a); };   // the developer log (popup.js); absent when this file runs alone
   let list = null, tabId = null;
 
   chrome.storage.sync.get({ spotifyBpm: false }, (s) => { el("spBpm").checked = !!s.spotifyBpm; });
@@ -39,7 +40,8 @@
     el("spotify").hidden = false;
     el("spGo").textContent = label(); el("spGo").disabled = true;
     list = await chrome.runtime.sendMessage({ type: "spotifyList", url: tab.url }).catch(() => null);
-    if (!list?.ok) { say(list?.output || "native host not reachable — run native/install.sh"); list = null; return; }
+    if (!list?.ok) { say(list?.output || "native host not reachable — run native/install.sh"); plog("error", "spotify", "list failed: " + (list?.output || "host not reachable")); list = null; return; }
+    plog("info", "spotify", `list shown: ${list.kind} "${list.name}", ${list.tracks.length} song(s)${list.truncated ? " (may be cut short)" : ""}`);
     if (list.truncated && list.kind === "playlist") {     // exactly 100 songs is not "100+": ask the open page how many it has
       const n = await chrome.tabs.sendMessage(tabId, { type: "spotifyCount" }).catch(() => null);
       if (Number.isInteger(n) && n <= list.tracks.length) list.truncated = false;
@@ -57,6 +59,7 @@
         const rows = await chrome.tabs.sendMessage(tabId, { type: "spotifyRows" }).catch(() => null);
         if (rows?.length > tracks.length) tracks = rows.map((r, i) => ({ ...r, number: i + 1, cover: "" }));
         else if (!rows?.length) say("couldn't read the page — saving the first " + tracks.length);
+        plog(rows?.length ? "info" : "warn", "spotify", rows?.length ? `read ${rows.length} rows off the open page (embed gave ${list.tracks.length})` : "could not read the rest of the playlist off the page");
       }
       const dest = (await chrome.storage.sync.get({ dest: "" })).dest;
       // songs already in the list's folder (renamed to this order) or in a library folder are not queued again
@@ -64,12 +67,13 @@
       if (list.kind !== "track") {
         const sync = await chrome.runtime.sendMessage({ type: "spotifySync", dst: dest, folder: list.name, total: tracks.length,
           tracks: tracks.map((t) => ({ title: t.title, artists: t.artists, number: t.number, url: t.url })) });
-        if (!sync?.ok) { say(sync?.output || "couldn't check the folder"); return; }
+        if (!sync?.ok) { say(sync?.output || "couldn't check the folder"); plog("error", "spotify", "folder check failed: " + (sync?.output || "no answer")); return; }
         skip = new Set([...sync.have, ...sync.inlib]);
         extra = [sync.renamed ? `${sync.renamed} renamed to the new order` : "", sync.inlib.length ? `${sync.inlib.length} found in a library folder` : "", ...sync.notes].filter(Boolean).join(" · ");
       }
       if (list.skipped?.length) extra = [extra, `skipped, not songs: ${list.skipped.join("; ")}`].filter(Boolean).join(" · ");
       const todo = tracks.filter((_, i) => !skip.has(i));
+      plog("info", "spotify", `go: ${tracks.length} song(s), ${skip.size} already there, ${todo.length} to download`, { dest: dest || "Downloads", skipped: todo.length ? undefined : "all" });
       if (!todo.length) { say(`all ${tracks.length} songs are already downloaded` + (extra ? `\n${extra}` : "")); return; }
       const items = todo.map((t) => ({
         url: t.url, engine: true, mode: "audio",
@@ -78,6 +82,7 @@
       }));
       say(`queuing ${items.length} song${items.length === 1 ? "" : "s"}…` + (extra ? `\n${extra}` : ""));
       const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "song", dest, prefix: "" });
+      plog(r?.queued ? "info" : "warn", "spotify", `queued ${r?.queued || 0}, skipped ${r?.skipped || 0} as already saved before`);
       if (!r?.queued) say(r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save");
       else say(`${r.queued} song${r.queued === 1 ? "" : "s"} queued → one at a time, 20 s apart` + (skip.size ? `, ${skip.size} already there` : "") + (extra ? `\n${extra}` : ""));
     } finally { el("spGo").disabled = false; }
