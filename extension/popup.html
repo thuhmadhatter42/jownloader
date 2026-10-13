@@ -83,6 +83,9 @@
   <div class="row"><button id="rnStrip" disabled title="remove all metadata from the selected files, in place">Strip metadata</button><button id="rnWebp" disabled title="convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button><button id="rnPng" disabled title="convert the selected .webp files to .png (originals removed)">WebP → PNG</button></div>
   <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
   <label><span>Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
+  <h2>Logs</h2>
+  <div class="files" id="logPath" title="the host, the engine and the extension all write here">~/Library/Logs/Jownloader/jownloader.log</div>
+  <div class="row"><button id="logOpen" title="open the log file in TextEdit">Open log</button><button id="logCopy" title="copy the last 200 lines to the clipboard">Copy last 200 lines</button></div>
   <div class="files" id="deps">Dependencies: checking…</div>
   <div class="files" id="depsWhy" style="white-space:pre-line" hidden></div>
   <button id="depsInstall" hidden>Install missing dependencies</button>

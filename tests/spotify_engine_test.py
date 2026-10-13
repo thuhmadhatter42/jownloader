@@ -7,6 +7,7 @@ import hashlib, http.server, json, os, random, shutil, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 NATIVE = os.path.join(os.path.dirname(HERE), "native")
 sys.path.insert(0, NATIVE)
+_LOGDIR = tempfile.mkdtemp(prefix="jown-spotlog-"); os.environ["JOWN_LOG_DIR"] = _LOGDIR   # the developer log goes to a temp folder
 import engine
 fails = 0
 PORT = int(os.environ.get("JOWNLOADER_TEST_PORT", "9621"))
@@ -321,5 +322,6 @@ finally:
     if srv:
         srv.shutdown()
     shutil.rmtree(d, ignore_errors=True)
+    shutil.rmtree(_LOGDIR, ignore_errors=True)
 print("ALL GREEN" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

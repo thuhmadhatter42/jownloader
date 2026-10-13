@@ -63,7 +63,7 @@ with sync_playwright() as p:
     pop.screenshot(path=SHOT + "/popup-tab2-pdf.png")
     pop.click("input[name=crawl][value=page]")
     pop.click("#tabTools"); pop.wait_for_timeout(200)
-    check("Extra tools: Batch rename heading", pop.evaluate("() => [...document.querySelectorAll('#paneTools h2')].map(h => h.textContent)"), ["Batch rename", "Strip metadata and WebP conversion"])
+    check("Extra tools: Batch rename heading", pop.evaluate("() => [...document.querySelectorAll('#paneTools h2')].map(h => h.textContent)"), ["Batch rename", "Strip metadata and WebP conversion", "Logs"])
     pop.screenshot(path=SHOT + "/popup-tab3-extra-tools.png")
     pop.click("#tabDl"); pop.wait_for_timeout(200)
     check("Collect switch wording", pop.evaluate("() => document.querySelector('#collect').closest('label').querySelector('small').textContent"), "every picture shown on screen is remembered; thumbnails ignored")
@@ -143,6 +143,11 @@ with sync_playwright() as p:
     check("batch reply (dup + blob)", r, {"queued": 1, "skipped": 1, "unusable": 1})
     pr = pop.evaluate("async () => { for (let i = 0; i < 40; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active) return p; await new Promise(r => setTimeout(r, 250)); } return 'still active'; }")
     check("no host → loud failure", [pr["done"], pr["failed"], "install.sh" in (pr.get("error") or "")], [1, 1, True])
+    # the developer log saw it all: dedupe decisions, the job's start and its failure with the reason
+    lg = sw.evaluate("async () => (await new Promise(r => setTimeout(r, 200)), logRing.map(e => `${e.l} ${e.a} ${e.m}`))")
+    check("log: dedupe decisions (same item twice, non-http URL) are recorded", [any(l.startswith("info dedupe skip: the same item twice") for l in lg), any(l.startswith("info dedupe unusable") for l in lg)], [True, True])
+    check("log: the failing job is recorded with its reason (error level)", any(l.startswith("error job FAILED file") and "install.sh" in l for l in lg), True)
+    check("log: the batch start and queue verdict are recorded", [any(l.startswith("info batch start: 3 item(s), kind=image") for l in lg), any(l.startswith("info batch queued 1, skipped 1, unusable 1") for l in lg)], [True, True])
     check("counter advanced", sw.evaluate("async () => (await chrome.storage.local.get('counter:|beat'))['counter:|beat']"), 1)
     # saved-for-good memory: a URL in the saved list is skipped however long ago it was saved
     pop.evaluate("async () => chrome.storage.local.set({'saved:https://picsum.photos/id/31/300/200.jpg': {ts: 1, path: ''}})")
@@ -273,5 +278,92 @@ with sync_playwright() as p:
     pop.evaluate("async () => { await chrome.storage.sync.set({mp3: false}); await chrome.runtime.sendMessage({type:'forgetSaved'}); }")
     sw.evaluate("() => { stillOnDisk = __origDisk; saveSiteViaHost = __origSite; }")
     sw.evaluate("() => { saveEngineViaHost = __orig; }")
+
+    # ---- 0.1.44: developer log (ring buffer, redaction, forwarding to the host), visible failures, the Logs row
+    pop.click("#tabTools"); pop.wait_for_timeout(200)
+    check("Logs row: Open log + Copy last 200 lines live on the Extra tools tab",
+          pop.evaluate("() => ['logOpen', 'logCopy'].map(id => document.getElementById(id).textContent)"), ["Open log", "Copy last 200 lines"])
+    check("Logs row: the file's place is shown", pop.evaluate("() => document.getElementById('logPath').textContent"), "~/Library/Logs/Jownloader/jownloader.log")
+    check("Logs row: the [hidden] rule is still in the popup CSS", pop.evaluate("() => [...document.styleSheets[0].cssRules].some(r => r.cssText.replace(/\\s+/g, ' ').includes('[hidden] { display: none !important; }'))"), True)
+    pop.click("#logOpen"); pop.wait_for_function("() => /install.sh|opened/.test(document.getElementById('status').textContent)", timeout=15000)
+    check("Open log with no host: says why, in the popup", "install.sh" in pop.evaluate("() => document.getElementById('status').textContent"), True)
+    pop.evaluate("() => { document.getElementById('status').textContent = ''; }")
+    pop.click("#logCopy"); pop.wait_for_function("() => /install.sh|copied/.test(document.getElementById('status').textContent)", timeout=15000)
+    check("Copy last 200 lines with no host: says why, in the popup", "install.sh" in pop.evaluate("() => document.getElementById('status').textContent"), True)
+    pop.click("#tabDl"); pop.wait_for_timeout(200)
+
+    # ring buffer: newest 2000 kept in memory and in session storage (own key, byte cap), the page-hook cache untouched
+    sw.evaluate("""async () => { await chrome.storage.session.set({ manifestTexts: { keep: { tabId: 1, url: 'u', text: '#EXTM3U', ts: Date.now() } } }); }""")
+    n = sw.evaluate("""() => { for (let i = 0; i < 2600; i++) log('debug', 'ring', 'entry ' + i); return logRing.length; }""")
+    check("ring: capped at 2000 entries", n, 2000)
+    ring = sw.evaluate("() => [logRing[0].m, logRing[logRing.length - 1].m]")
+    check("ring: the oldest fall out, the newest stay", ring, ["entry 600", "entry 2599"])
+    sw.evaluate("() => logSave()"); pop.wait_for_timeout(500)
+    st = sw.evaluate("""async () => { const r = await chrome.storage.session.get(['devLog', 'manifestTexts']); return [r.devLog.length, JSON.stringify(r.devLog).length < 450 * 1024, Object.keys(r.manifestTexts)]; }""")
+    check("ring: persisted in chrome.storage.session under its own key, within the byte cap; the manifest cache is separate and intact", st, [2000, True, ["keep"]])
+    sw.evaluate("""async () => { for (let i = 0; i < 400; i++) log('debug', 'big', 'x'.repeat(590), { pad: 'y'.repeat(700) }); logSave(); await new Promise(r => setTimeout(r, 300)); }""")
+    st = sw.evaluate("""async () => { const r = await chrome.storage.session.get('devLog'); return [r.devLog.length < 2000, JSON.stringify(r.devLog).length < 450 * 1024]; }""")
+    check("ring: a flood of large entries is cut to the byte cap, not the quota", st, [True, True])
+    sw.evaluate("() => { logRing.length = 0; }")
+    sw.evaluate("() => { log('info', 'test', 'Cookie: SID=EXTCOOKIE123; HSID=EXTCOOKIE456'); log('warn', 'test', 'fetch https://x.test/a?token=EXTTOKEN789&q=1', { authorization: 'Bearer EXTBEARER', sessionid: 'EXTSESSION' }); }")
+    red = sw.evaluate("() => logRing.map(e => e.m + ' ' + (e.d || ''))")
+    check("log(): cookie / token / authorization values never enter the ring", [any(x in " ".join(red) for x in ("EXTCOOKIE", "EXTTOKEN", "EXTBEARER", "EXTSESSION")), "Cookie: ***" in red[0], "token=***" in red[1]], [False, True, True])
+
+    # forwarding: batched, fire-and-forget to the host (stubbed here), same entries; host down -> kept and retried
+    fwd = sw.evaluate("""async () => {
+      while (logBusy) await logBusy;                                               // no timer-started flush may hold the lock
+      logRing.length = 0; logSent = logLastN; logDownUntil = 0;
+      globalThis.__sentLogs = []; const orig = chrome.runtime.sendNativeMessage;
+      chrome.runtime.sendNativeMessage = async (host, m) => { __sentLogs.push([host, m]); return { ok: true, n: m.entries.length }; };
+      for (let i = 0; i < 5; i++) log('info', 'fwd', 'm' + i, { i });
+      await logFlush();
+      chrome.runtime.sendNativeMessage = orig;
+      return __sentLogs.map(([h, m]) => [h, m.cmd, m.entries.map((e) => [e.a, e.m, e.l, typeof e.t])]);
+    }""")
+    check("forward: one batch, cmd=log to the host, entries carry time/level/area/message", fwd, [["com.jshriver.jownloader", "log", [["fwd", f"m{i}", "info", "number"] for i in range(5)]]])
+    down = sw.evaluate("""async () => {
+      while (logBusy) await logBusy;
+      logRing.length = 0; logSent = logLastN; logDownUntil = 0;
+      const orig = chrome.runtime.sendNativeMessage; let calls = 0;
+      chrome.runtime.sendNativeMessage = async () => { calls++; throw new Error('Specified native messaging host not found.'); };
+      log('info', 'down', 'kept while the host is away');
+      await logFlush(); const afterFail = [calls, logRing.filter((e) => e.n > logSent).length, logDownUntil > Date.now()];
+      await logFlush(); const noHammer = calls;                                   // within the 30 s pause: not asked again
+      const sent = []; chrome.runtime.sendNativeMessage = async (h, m) => { sent.push(m.entries.map((e) => e.m)); return { ok: true }; };
+      await logFlushNow();                                                         // the popup's Copy: asks regardless of the pause
+      chrome.runtime.sendNativeMessage = orig;
+      return [afterFail, noHammer, sent];
+    }""")
+    check("forward: host away -> entry kept, host left alone for a while, delivered when asked again", down, [[1, 1, True], 1, [["kept while the host is away"]]])
+    ex = pop.evaluate("""async () => { await chrome.runtime.sendMessage({ type: 'log', entries: [{ t: Date.now(), l: 'info', a: 'click', m: 'Download all images', d: { n: 3 } }, { t: Date.now(), l: 'bogus', a: 'x'.repeat(50), m: 'token=POPTOKEN1' }] });
+      return (await chrome.runtime.sendMessage({ type: 'getLog', n: 5 })).filter((e) => e.a.startsWith('popup.')).map((e) => [e.a, e.l, e.m]); }""")
+    check("popup events enter the same ring (area prefixed popup., unknown level -> info, secrets cut)", ex, [["popup.click", "info", "Download all images"], ["popup." + "x" * 16, "info", "token=***"]])
+
+    # visible failures: every failed song is named with its reason; a run where all failed ends on an error line
+    sw.evaluate("""() => { globalThis.__notes = []; globalThis.__notify = notify; notify = (t, m) => __notes.push([t, m]); spotifyLast = 0;
+      globalThis.__orig2 = saveEngineViaHost; saveEngineViaHost = async () => ({ ok: false, output: 'Floaty: YouTube refused the download (format not available).' }); }""")
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+    song2 = lambda url, n, t: {"url": url, "engine": True, "mode": "audio", "spotify": {"title": t, "artists": "A", "album": "L", "number": n, "total": 7, "duration_ms": 1000, "cover": "", "url": url, "folder": "Fail list"}}
+    pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'song', dest:'/d', prefix:'', items})", [song2("https://open.spotify.com/track/ffff1", 6, "Floaty")])
+    pr = pop.evaluate("async () => { for (let i = 0; i < 160; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active && p.total) return p; await new Promise(r => setTimeout(r, 250)); } return 'still active'; }")
+    check("visible: a failed song is listed with its number, title and reason", [pr["done"], pr["failed"], pr["errors"]], [1, 1, ["song 6 Floaty: YouTube refused the download (format not available)."]])
+    txt = pop.evaluate("(pr) => progressText(pr)", pr)
+    check("visible: all songs failed -> the popup ends on an error line, not a quiet 'saved'", [txt.splitlines()[0], txt.splitlines()[1]], ["✗ nothing was saved: the song failed", "✗ song 6 Floaty: YouTube refused the download (format not available)."])
+    check("visible: a Spotify run with failures raises a notification naming them and badges the icon", [sw.evaluate("() => __notes"), sw.evaluate("async () => await chrome.action.getBadgeText({})")], [[["Jownloader: no song was saved", "song 6 Floaty: YouTube refused the download (format not available)."]], "!"])
+    lg = sw.evaluate("() => logRing.map((e) => `${e.l} ${e.a} ${e.m}`)")
+    check("log: the run's verdict and the failure reason are in the log", [any(l.startswith("error job FAILED song 6 Floaty after") and "format not available" in l for l in lg), any(l.startswith("warn batch run finished: 0 saved, 1 failed of 1") for l in lg)], [True, True])
+    shown = pop.evaluate("""(pr) => { showProgress(pr); return [document.getElementById('status').textContent.split('\\n')[0], document.getElementById('status').classList.contains('warn')]; }""", pr)
+    check("visible: the failed run's status line is in the warning colour", shown, ["✗ nothing was saved: the song failed", True])
+    many = {"total": 9, "done": 9, "failed": 8, "bytes": 0, "active": 0, "where": "Downloads", "kind": "song", "error": "x", "errors": [f"song {i} T{i}: reason {i}" for i in range(1, 9)], "now": []}
+    t2 = pop.evaluate("(pr) => progressText(pr)", many).splitlines()
+    check("visible: 1 saved of 9: head says so, the last 6 failures are listed, the older ones counted", [t2[0], t2[1], len(t2), t2[-1]], ["1 song saved → Downloads (8 failed) · 0.0 MB", "… 2 earlier failures (Extra tools → Logs)", 8, "✗ song 8 T8: reason 8"])
+    running = pop.evaluate("(pr) => progressText(pr)", {"total": 3, "done": 1, "failed": 1, "bytes": 0, "active": 1, "where": "Downloads", "kind": "song", "error": "", "errors": ["song 1 A: boom"], "now": ["song 2 B"]}).splitlines()
+    check("visible: while running: counts, failures so far and what is in flight", running, ["1 / 3 songs saved → Downloads (1 failed) · 0.0 MB", "✗ song 1 A: boom", "now: song 2 B"])
+    # a single-link engine save that fails shows its reason too
+    sw.evaluate("""() => { saveEngineViaHost = async () => ({ ok: false, output: 'YouTube is blocking the download. Sign in to YouTube in this browser, then retry.' }); }""")
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'download', kind:'video', dest:'/d', prefix:'', items:[{url:'https://www.youtube.com/watch?v=single00001', engine:true, mode:'video'}]})")
+    pr = pop.evaluate("async () => { for (let i = 0; i < 60; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active && p.total) return p; await new Promise(r => setTimeout(r, 250)); } return 'still active'; }")
+    check("visible: a failed single-link save lists the page and the reason", [pr["failed"], pr["errors"], pr["error"]], [1, ["video youtube.com/watch?v=single00001: YouTube is blocking the download. Sign in to YouTube in this browser, then retry."], "YouTube is blocking the download. Sign in to YouTube in this browser, then retry."])
+    sw.evaluate("() => { notify = __notify; saveEngineViaHost = __orig2; }")
     ctx.close()
 print("ALL GREEN" if not fails else f"{fails} FAILED")

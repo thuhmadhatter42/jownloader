@@ -3,7 +3,9 @@
 import json, os, select, struct, subprocess, sys, tempfile, time, shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.path.join(os.path.dirname(HERE), "native", "jownloader_host.py")
-BROWSER_ENV = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"]}   # how Brave launches the host: login PATH, HOME, nothing else
+# the developer log of every host / engine this test starts goes to a temp folder, never ~/Library/Logs
+LOGDIR = tempfile.mkdtemp(prefix="jown-hostlog-"); os.environ["JOWN_LOG_DIR"] = LOGDIR
+BROWSER_ENV = {"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"], "JOWN_LOG_DIR": LOGDIR}   # how Brave launches the host: login PATH, HOME, nothing else (+ the log folder)
 # the interpreter the browser's PATH resolves (Xcode CLT python3) — proves the host re-execs into the venv itself
 BOOT_PY = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
 fails = 0
@@ -346,7 +348,7 @@ print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["T
         print("skip merged-PDF checks (no native/.venv with pypdf)")
     # no pypdf (a copy of the host with no venv, run by the browser's bare python) -> per-page title-named PDFs, never 001.pdf
     nov = os.path.join(d, "novenv"); os.makedirs(nov)
-    for f in ("jownloader_host.py", "engine.py", "analyze.py"): shutil.copy(os.path.join(os.path.dirname(HOST), f), nov)
+    for f in ("jownloader_host.py", "engine.py", "jlog.py", "analyze.py"): shutil.copy(os.path.join(os.path.dirname(HOST), f), nov)
     fb = os.path.join(d, "fallback"); os.makedirs(fb)
     r = session(tracks(3, fb) + [merge(3, "docs.example.org", ["Intro / Start", "Guide: Part 1", ""], fb)], host=nov + "/jownloader_host.py")
     check("no pypdf: one PDF per page named by title, never 001.pdf", sorted(os.listdir(fb + "/docs.example.org")), ["Guide: Part 1.pdf", "Intro - Start.pdf", "docs.example.org page 3.pdf"])
@@ -358,7 +360,7 @@ print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["T
     # dir + a copy of the host, launched with the browser's env; sys.prefix must land inside the venv.
     # JOWN_HOST_UNDER_TEST overrides the host file (used to show this FAILS on the old code).
     ap = os.path.join(d, "applevenv"); os.makedirs(ap)
-    for f in ("jownloader_host.py", "engine.py", "analyze.py", "deps.sh"):
+    for f in ("jownloader_host.py", "engine.py", "jlog.py", "analyze.py", "deps.sh"):
         shutil.copy(os.path.join(os.path.dirname(HOST), f), ap)
     if os.environ.get("JOWN_HOST_UNDER_TEST"): shutil.copy(os.environ["JOWN_HOST_UNDER_TEST"], os.path.join(ap, "jownloader_host.py"))
     mk = subprocess.run([BOOT_PY, "-m", "venv", os.path.join(ap, ".venv")], capture_output=True, text=True, env=BROWSER_ENV)
@@ -372,7 +374,7 @@ print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["T
     # ---- 0.1.43: a venv the host cannot use never hangs it; Apple-Python venvs get their hint; odd install paths ----
     def host_copy(name, stub_deps=False):
         h = os.path.join(d, name); os.makedirs(h)
-        for f in ("jownloader_host.py", "engine.py", "analyze.py", "deps.sh"):
+        for f in ("jownloader_host.py", "engine.py", "jlog.py", "analyze.py", "deps.sh"):
             shutil.copy(os.path.join(os.path.dirname(HOST), f), h)
         if os.environ.get("JOWN_HOST_UNDER_TEST"): shutil.copy(os.environ["JOWN_HOST_UNDER_TEST"], os.path.join(h, "jownloader_host.py"))
         if stub_deps:
@@ -432,4 +434,5 @@ print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["T
     check("setup in a path with \" $ ` : ensure_deps ran", [bool(r and r.get("ok")), "STUB-ENSURE-DEPS-RAN" in ((r or {}).get("output") or "")], [True, True])
 finally:
     shutil.rmtree(d)
+    shutil.rmtree(LOGDIR, ignore_errors=True)
 print("ALL GREEN" if not fails else f"{fails} FAILED")

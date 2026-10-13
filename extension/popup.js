@@ -1,5 +1,9 @@
 const $ = (id) => document.getElementById(id);
 let destPath = "", scan = null, tab = null;
+// the developer log: popup events go to the worker, which forwards them to the one log file (fire-and-forget)
+function jlog(level, area, m, d) { try { chrome.runtime.sendMessage({ type: "log", entries: [{ t: Date.now(), l: level, a: area, m, d }] }).catch(() => {}); } catch {} }
+window.addEventListener("error", (e) => jlog("error", "popup", `uncaught error: ${e.message} (${e.filename}:${e.lineno})`));
+window.addEventListener("unhandledrejection", (e) => jlog("error", "popup", "unhandled rejection: " + String(e.reason?.stack || e.reason)));
 // pages the engine downloads whole (the site's player API, not the page's files): YouTube, Instagram, Twitter/X
 const ENGINE_RE = /^https?:\/\/(?:[\w-]+\.)?(youtube\.com|youtu\.be|instagram\.com|twitter\.com|x\.com)\//i;
 function engineOf(url) {
@@ -41,7 +45,7 @@ async function videoItems() {
 async function refresh() {
   [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   scan = await chrome.runtime.sendMessage({ type: "scan", tabId: tab.id });
-  if (!scan) { $("host").textContent = "can't read this page"; return; }
+  if (!scan) { $("host").textContent = "can't read this page"; jlog("warn", "scan", "the page could not be scanned", { url: tab.url }); return; }
   $("host").textContent = scan.host;
   const eng = engineOf(tab.url);
   $("site").hidden = !eng?.what; $("siteAudio").hidden = eng?.site !== "youtube" || !eng.what; $("mp3Row").hidden = $("siteAudio").hidden;
@@ -56,6 +60,7 @@ async function refresh() {
   setCount("imgs", "images", scan.images.length);
   setCount("vids", "videos", nVideos);
   setCount("docs", "documents", scan.docs.length);
+  jlog("debug", "scan", `${scan.host}: ${scan.images.length} image(s), ${nVideos} video(s) (direct=${vi.direct} stream=${vi.stream} drm=${drm} blob=${blobs}), ${scan.docs.length} document(s), ${scan.captured.length} captured request(s)${eng ? ", engine page: " + eng.site : ""}`);
   const st = [];
   if (drm) st.push(`${drm} protected video${drm > 1 ? "s" : ""} (DRM: Widevine/PlayReady) — encrypted, no tool can save ${drm > 1 ? "them" : "it"}`);
   if (blobs && !scan.captured.length) st.push(`${blobs} streamed player${blobs > 1 ? "s" : ""} — press play so the stream can be captured`);
@@ -66,6 +71,19 @@ function setCount(id, label, n) { $(id).textContent = `Download all ${label} (${
 
 // ---------- progress bar ----------
 const MB = (n) => (n / 1048576).toFixed(n < 10485760 ? 1 : 0) + " MB";
+// Every failure is named with its reason (the worker builds "song 6 Floaty: YouTube refused the download ...");
+// a run where nothing was saved ends on an error line, never a quiet "0 saved".
+function progressText(pr) {
+  const saved = pr.done - pr.failed, errs = pr.errors || [];
+  const fails = pr.failed ? ` (${pr.failed} failed)` : "";
+  const head = pr.active ? `${pr.done} / ${pr.total} ${pr.kind}s saved → ${folderName(pr.where)}${fails} · ${MB(pr.bytes)}`
+    : pr.failed && !saved ? `✗ nothing was saved: ${pr.failed === 1 ? "the " + pr.kind + " failed" : "all " + pr.failed + " " + pr.kind + "s failed"}`
+    : `${saved} ${pr.kind}${saved === 1 ? "" : "s"} saved → ${folderName(pr.where)}${fails} · ${MB(pr.bytes)}`;
+  const lines = errs.slice(-6).map((e) => "✗ " + e);
+  if (errs.length > 6) lines.unshift(`… ${errs.length - 6} earlier failure${errs.length - 6 > 1 ? "s" : ""} (Extra tools → Logs)`);
+  const tail = lines.length ? "\n" + lines.join("\n") : pr.error ? "\n" + pr.error : "";
+  return head + tail + (pr.active && pr.now?.length ? `\nnow: ${pr.now.slice(0, 4).join(" · ")}` : "");
+}
 function showProgress(pr) {
   if (!pr || !pr.total) return;
   $("bar").hidden = false;
@@ -75,9 +93,8 @@ function showProgress(pr) {
     $("status").textContent = `page ${pr.crawl.n} of ${Math.max(pr.crawl.m, pr.crawl.n)}\n${pr.crawl.url}`;
     return;
   }
-  const fails = pr.failed ? ` (${pr.failed} failed)` : "";
-  const head = pr.active ? `${pr.done} / ${pr.total}` : `${pr.done - pr.failed}`;
-  $("status").textContent = `${head} ${pr.kind}s saved → ${folderName(pr.where)}${fails} · ${MB(pr.bytes)}` + (pr.error ? `\n${pr.error}` : "");
+  $("status").textContent = progressText(pr);
+  $("status").classList.toggle("warn", !!pr.failed && !pr.active);
 }
 chrome.runtime.onMessage.addListener((m) => { if (m?.type === "progress") showProgress(m); });
 // poll while a batch runs: if the worker restarted mid-batch its progress is gone, and the bar must say so
@@ -86,7 +103,7 @@ let lastActive = false;
 async function pollProgress() {
   const pr = await chrome.runtime.sendMessage({ type: "getProgress" }).catch(() => null);
   if (pr?.total) showProgress(pr);
-  else if (lastActive) { $("status").textContent = "download stopped — the extension's worker restarted; run the batch again (saved files are skipped)"; $("bar").hidden = true; }
+  else if (lastActive) { $("status").textContent = "download stopped — the extension's worker restarted; run the batch again (saved files are skipped)"; $("bar").hidden = true; jlog("error", "progress", "the worker restarted mid-batch: progress lost"); }
   lastActive = !!pr?.active;
   if (lastActive) setTimeout(pollProgress, 1000);
 }
@@ -96,6 +113,7 @@ pollProgress();
 const batches = { imgs: ["image", () => scan.images], vids: ["video", () => vi.items], docs: ["doc", () => scan.docs.map((d) => ({ url: d.url }))] };
 for (const [id, [kind, items]] of Object.entries(batches)) $(id).onclick = async () => {
   $("status").textContent = `queuing ${kind}s → ${folderName(destPath)} …`;
+  jlog("info", "click", `Download all ${kind}s`, { items: items().length, dest: destPath || "Downloads" });
   const r = await chrome.runtime.sendMessage({ type: "download", items: items(), kind, tabId: tab?.id, dest: destPath, prefix: $("prefix").value.trim() });
   if (!r?.queued) $("status").textContent = "nothing new to save" + (r?.skipped ? ` (${r.skipped} already saved before)` : "");
 };
@@ -103,6 +121,7 @@ for (const [id, [kind, items]] of Object.entries(batches)) $(id).onclick = async
 // the engine buttons: the page URL goes to the host, which runs the site's downloader
 for (const [id, mode] of [["site", "video"], ["siteAudio", "audio"]]) $(id).onclick = async () => {
   $("status").textContent = mode === "audio" ? "downloading audio, then detecting BPM + key…" : "downloading through the site's player API…";
+  jlog("info", "click", `Download from this page (${mode})`, { url: tab.url });
   const r = await chrome.runtime.sendMessage({ type: "download", items: [{ url: tab.url, engine: true, mode }], kind: "video", dest: destPath, prefix: "" });
   if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
 };
@@ -114,6 +133,7 @@ for (const r of document.querySelectorAll("input[name=crawl]")) r.onchange = () 
 for (const [id, mode] of [["sitePdf", "pdf"], ["siteMd", "md"]]) $(id).onclick = async () => {
   const follow = crawlFollow(), maxPages = Math.max(1, parseInt($("sitePages").value, 10) || 50);
   $("status").textContent = follow ? `crawling the site (max ${maxPages} pages)…` : "saving this page…";
+  jlog("info", "click", `Save ${follow ? "site" : "page"} as ${mode}`, { url: tab.url, maxPages });
   const r = await chrome.runtime.sendMessage({ type: "download", items: [{ url: tab.url, site: true, mode, maxPages, follow }], kind: "site", dest: destPath, prefix: "" });
   if (!r?.queued) $("status").textContent = r?.skipped ? "already saved before (forget saved to redo)" : "nothing to save";
 };
@@ -124,6 +144,7 @@ chrome.runtime.onMessage.addListener((m) => { if (m?.type === "collected") showC
 chrome.runtime.sendMessage({ type: "getCollected" }).then((l) => showCollected((l || []).length)).catch(() => {});
 $("coll").onclick = async () => {
   $("status").textContent = `queuing collected images → ${folderName(destPath)} …`;
+  jlog("info", "click", "Download collected");
   const r = await chrome.runtime.sendMessage({ type: "downloadCollected", dest: destPath, prefix: $("prefix").value.trim() });
   if (!r?.queued) $("status").textContent = "nothing new to save" + (r?.skipped ? ` (${r.skipped} already saved before)` : "");
 };
@@ -233,8 +254,9 @@ const depsWhyText = (deps, hints) => Object.entries(deps || {}).filter(([, v]) =
   .map(([k]) => (hints?.[k] ? `✗ ${DEP_LABEL[k] || k}: ${hints[k]}` : "")).concat(hints?.venv ? [hints.venv] : []).filter(Boolean).join("\n");
 async function showDeps() {
   const r = await chrome.runtime.sendMessage({ type: "deps" }).catch(() => null);
-  if (!r?.ok) { $("deps").textContent = "Dependencies: " + (r?.output || "native host not reachable — run native/install.sh"); $("depsInstall").hidden = true; return; }
+  if (!r?.ok) { $("deps").textContent = "Dependencies: " + (r?.output || "native host not reachable — run native/install.sh"); $("depsInstall").hidden = true; jlog("warn", "deps", "host not reachable: " + (r?.output || "no answer")); return; }
   const missing = Object.entries(r.deps).filter(([, v]) => !v.present).map(([k]) => k);
+  jlog("info", "deps", missing.length ? "missing: " + missing.join(", ") : "all present", { python: r.python });
   $("deps").textContent = "Dependencies: " + Object.entries(r.deps).map(([k, v]) => (v.present ? "✓ " : "✗ ") + (DEP_LABEL[k] || k)).join("   ");
   $("deps").title = Object.values(r.hints || {}).join("\n");
   const why = depsWhyText(r.deps, r.hints);
@@ -243,6 +265,7 @@ async function showDeps() {
 }
 $("depsInstall").onclick = async () => {
   $("depsInstall").disabled = true;
+  jlog("info", "click", "Install missing dependencies");
   $("status").textContent = "installing missing dependencies… (this can take a few minutes)";
   const r = await chrome.runtime.sendMessage({ type: "setup" }).catch(() => null);
   $("depsInstall").disabled = false;
@@ -259,6 +282,26 @@ chrome.runtime.sendMessage({ type: "getSetupResult" }).then((r) => {
     ? (r.missing.length ? `dependencies installed — still missing: ${r.missing.join(", ")}${r.python ? ` (python: ${r.python})` : ""}${hintText(r.hints)}${byHand(r.output)}` : "dependencies installed")
     : (r.output || "dependency install failed");
 }).catch(() => {});
+
+// ---------- logs ----------
+// One developer log holds the host, the engine and this extension (native/jlog.py). Open it in TextEdit, or copy its tail.
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch {}
+  const ta = document.createElement("textarea"); ta.value = text; document.body.append(ta); ta.select();
+  let ok = false; try { ok = document.execCommand("copy"); } catch {}
+  ta.remove(); return ok;
+}
+$("logOpen").onclick = async () => {
+  $("status").classList.remove("warn");
+  const r = await chrome.runtime.sendMessage({ type: "openLog" }).catch(() => null);
+  $("status").textContent = r?.ok ? `opened ${r.path} in TextEdit` : `couldn't open the log: ${r?.output || "native host not reachable — run native/install.sh"}`;
+};
+$("logCopy").onclick = async () => {
+  $("status").classList.remove("warn");
+  const r = await chrome.runtime.sendMessage({ type: "tailLog", lines: 200 }).catch(() => null);
+  if (!r?.ok) { $("status").textContent = `couldn't read the log: ${r?.output || "native host not reachable — run native/install.sh"}`; return; }
+  $("status").textContent = (await copyText(r.text)) ? `copied the last ${r.lines} lines of the log` : "the browser refused the copy — use Open log instead";
+};
 
 // saved-URL memory: skipped while the file is still in its folder; the link wipes it
 async function showSaved() { const n = await chrome.runtime.sendMessage({ type: "savedCount" }).catch(() => 0); $("forget").textContent = `forget saved (${n || 0})`; }

@@ -24,6 +24,7 @@ The extension fetches ordinary files itself. For sites that hide their media beh
 Sign-in: the browser session is read from the cookie stores on this Mac (Brave first, then Chrome,
 Firefox, Safari …) — nothing is asked for and nothing leaves the machine.
 Every function returns plain dicts and never raises; messages are plain English for the popup.
+Everything it decides or runs is written to the developer log (jlog.py: ~/Library/Logs/Jownloader/jownloader.log).
 Usage from a shell (for tests): python3 engine.py <url> [out-dir] [video|audio] [--mp3]
 """
 
@@ -43,6 +44,10 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import jlog
+log = jlog.get("engine")       # downloads, strategies, subprocesses, finishing steps
+slog = jlog.get("spotify")     # Spotify lists, matching, per-track decisions
 CONFIG = HERE / "gallery-dl.conf"
 COOKIES_TXT = HERE / "cookies.txt"
 LAST_SOURCE = HERE / ".cookie-source"
@@ -70,12 +75,23 @@ def site_of(url):
     return None
 
 
-def _run(cmd, timeout=None):
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except (OSError, subprocess.SubprocessError) as e:
-        return 1, "", str(e)
+def _run(cmd, timeout=None, cwd=None):
+    """(returncode, stdout, stderr); never raises. Every call is logged by jlog.run: argv, cwd, rc, time, output tail."""
+    return jlog.run(cmd, log, timeout=timeout, cwd=cwd)
+
+
+def _sname(extra):
+    """A yt-dlp strategy as it is written in the log."""
+    return " ".join(extra) if extra else "default (no extra args)"
+
+
+def _errline(lines):
+    """The line of yt-dlp output that says what went wrong: the last 'ERROR:' line, else the last non-blank one."""
+    ls = [l.strip() for l in (lines or []) if l and l.strip()]
+    for l in reversed(ls):
+        if l.upper().startswith("ERROR"):
+            return l[:400]
+    return (ls[-1][:400] if ls else "(no output)")
 
 
 def _missing(*tools):
@@ -185,14 +201,14 @@ def _yt_explain(lines, url=""):
     text = " ".join(lines).lower()
     if "private video" in text:
         return "That video is private and cannot be downloaded."
+    if "requested format" in text or "no video formats" in text:     # before "not available": "Requested format is not available" is YouTube refusing, not a removed video
+        return "YouTube refused the download (format not available)."
     if "age" in text and ("restrict" in text or "confirm" in text):
         return "That video is age-restricted. Sign in to YouTube in this browser, then retry."
     if "not available" in text or "unavailable" in text:
         return "That video is unavailable in your region or has been removed."
     if "urlopen error" in text or "network" in text or "connection" in text:
         return "Network error — check your connection and try again."
-    if "no video formats" in text or "requested format" in text:
-        return "No downloadable format was found for that video."
     if "sign in" in text or "login" in text or "bot" in text:
         return "YouTube is blocking the download. Sign in to YouTube in this browser, then retry."
     if "copyright" in text:
@@ -211,8 +227,10 @@ def _analyze(path):
     code, out, _ = _run([sys.executable, str(HERE / "analyze.py"), str(path)], timeout=600)
     lines = [l.strip() for l in (out or "").splitlines()]
     if code != 0 or len(lines) < 4 or not lines[0]:
+        log.warning("analyze: no BPM/key for %s (rc=%s, %d output line(s)): no analyzer installed or it failed", path, code, len(lines))
         return None
     keys = [k.split(" (")[0] for k in lines[1:4]]
+    log.info("analyze: %s -> %s BPM, keys %s", Path(path).name, lines[0], keys)
     return lines[0], keys
 
 
@@ -230,29 +248,39 @@ def _bpm_named(folder, title, mp3=False):
 
 
 def youtube(url, mode, outdir, mp3=False):
+    log.info("youtube: %s mode=%s mp3=%s outdir=%s", url, mode, mp3, outdir)
     err = _need("yt-dlp", "ffmpeg")
     if err:
+        log.error("youtube: %s", err)
         return {"ok": False, "output": err}
     info, meta_err, working = None, [], None
-    for extra in YT_STRATEGIES:
+    for i, extra in enumerate(YT_STRATEGIES, 1):
         info, meta_err = _yt_info(url, extra)
         if info:
             working = extra
+            log.info("youtube info: strategy %d/%d [%s] OK, title=%r", i, len(YT_STRATEGIES), _sname(extra), info.get("title"))
             break
+        log.warning("youtube info: strategy %d/%d [%s] FAILED: %s", i, len(YT_STRATEGIES), _sname(extra), _errline(meta_err))
     if not info:
+        log.error("youtube info: all %d strategies failed for %s; last error: %s", len(YT_STRATEGIES), url, _errline(meta_err))
         return {"ok": False, "output": _yt_explain(meta_err, url)}
     title = safe_name(info.get("title") or ("audio" if mode == "audio" else "video"))
     if mode == "audio":      # a re-download of a song whose BPM-named file is already there: that file is the song
         there = _bpm_named(Path(outdir), title, mp3)
         if there:
+            log.info("youtube: %s is already there as %s, nothing to download", title, there)
             return {"ok": True, "path": str(there), "files": [], "skipped": 1, "output": ""}
     outtmpl = tmpl_escape(Path(outdir) / title) + ".%(ext)s"
     last_err, ok, path = [], False, None
-    for extra in [working] + [s for s in YT_STRATEGIES if s != working]:
+    order = [working] + [s for s in YT_STRATEGIES if s != working]
+    for i, extra in enumerate(order, 1):
         ok, path, last_err = _yt_download(url, mode, outtmpl, extra, mp3)
         if ok:
+            log.info("youtube download: strategy %d/%d [%s] OK -> %s", i, len(order), _sname(extra), path)
             break
+        log.warning("youtube download: strategy %d/%d [%s] FAILED: %s", i, len(order), _sname(extra), _errline(last_err))
     if not ok:
+        log.error("youtube download: all %d strategies failed for %s; last error: %s", len(order), url, _errline(last_err))
         return {"ok": False, "output": _yt_explain(last_err, url)}
     if not path:
         return {"ok": True, "path": str(outdir), "output": f"downloaded into {outdir} (file name not reported)"}
@@ -263,12 +291,15 @@ def youtube(url, mode, outdir, mp3=False):
             bpm, keys = res
             new = path.with_name(f"{path.stem} ({bpm} BPM {' '.join(keys)}){path.suffix}")
             if not new.exists():
+                log.info("youtube: rename %s -> %s", path.name, new.name)
                 path.rename(new)
                 path = new
+            else:
+                log.warning("youtube: %s already exists, file keeps its name without BPM/keys", new.name)
         else:
             note = "no BPM/key analyzer installed — run native/install.sh"
-        log = Path(outdir) / time.strftime("(%-y-%-m-%-d) Youtube DL LINKS.txt")
-        with open(log, "a") as f:
+        linkfile = Path(outdir) / time.strftime("(%-y-%-m-%-d) Youtube DL LINKS.txt")
+        with open(linkfile, "a") as f:
             f.write(f"Input URL: {url}\nDownloaded: {path.name}\n\n")
     return {"ok": True, "path": str(path), "files": [str(path)], "output": note}
 
@@ -294,13 +325,18 @@ def _spotify_embed(kind, sid):
     """The entity dict inside the embed page's __NEXT_DATA__ (props.pageProps.state.data.entity)."""
     fixtures = os.environ.get(EMBED_DIR_ENV)
     if fixtures:
+        slog.info("embed %s/%s: reading the fixture %s", kind, sid, Path(fixtures) / f"{kind}.html")
         html = (Path(fixtures) / f"{kind}.html").read_text(encoding="utf-8")
     else:
+        slog.info("embed %s/%s: GET https://open.spotify.com/embed/%s/%s", kind, sid, kind, sid)
         req = urllib.request.Request(f"https://open.spotify.com/embed/{kind}/{sid}", headers={"User-Agent": UA})
+        t0 = time.monotonic()
         with urllib.request.urlopen(req, timeout=30) as resp:
             html = resp.read().decode("utf-8", "replace")
+            slog.info("embed %s/%s: HTTP %s, %d chars, %.2fs", kind, sid, getattr(resp, "status", "?"), len(html), time.monotonic() - t0)
     m = _NEXT_DATA.search(html)
     if not m:
+        slog.error("embed %s/%s: the page has no __NEXT_DATA__ block (%d chars): %r", kind, sid, len(html), html[:200])
         raise ValueError("the page had no track data")
     return json.loads(m.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
 
@@ -328,11 +364,14 @@ def spotify_list(url):
     collects the rest from the open page. Rows that are not songs (podcast episodes, local files) are left out
     and named in `skipped`. Never raises."""
     kind, sid = spotify_parse(url)
+    slog.info("list: %s -> kind=%s id=%s", url, kind, sid)
     if not kind:
+        slog.error("list: not a Spotify track / album / playlist / artist link")
         return {"ok": False, "output": "That isn't a Spotify track, album, playlist or artist link."}
     try:
         e = _spotify_embed(kind, sid)
     except Exception as exc:
+        slog.exception("list: could not read the embed page for %s/%s", kind, sid)
         return {"ok": False, "output": f"Couldn't read that Spotify link ({exc}). Is it public?"}
     name = e.get("name") or e.get("title") or kind
     cover = _best_image(e)
@@ -358,8 +397,12 @@ def spotify_list(url):
                        "album": name if kind == "album" else _embed_album(r),
                        "number": len(tracks) + 1, "duration_ms": r.get("duration") or 0,
                        "cover": cover, "url": f"https://open.spotify.com/track/{tid}"})
+    for sk in skipped:
+        slog.info("list: skipped row: %s", sk)
     if not tracks:
+        slog.error("list: no songs in %s/%s (%d row(s), %d skipped)", kind, sid, len(rows), len(skipped))
         return {"ok": False, "output": "No songs found in that Spotify link." + (f" Skipped (not songs): {'; '.join(skipped)}." if skipped else "")}
+    slog.info("list: %r (%s): %d song(s) from %d row(s), %d skipped, truncated=%s", name, kind, len(tracks), len(rows), len(skipped), kind == "playlist" and len(rows) >= SPOTIFY_EMBED_CAP)
     notes = []
     if kind == "artist":
         notes.append("an artist link lists the artist's top tracks only")
@@ -444,6 +487,50 @@ def _artist_agrees(track, ctitle, channel):
     return any(_has_word(n, channel) or _has_word(n, ctitle) for n in names)
 
 
+def spotify_score_why(track, cand, strict=False, artist_required=True):
+    """(score or None, why). The score as spotify_score documents it; why = the reason an upload was rejected, or the
+    bonuses and penalties that made up its score (the developer log shows both for every hit)."""
+    ctitle, want = _loose(cand.get("title")), _loose(_core_title(track.get("title")))
+    channel = _loose(cand.get("channel"))
+    symbols_only = not re.search(r"\w", want)
+    if symbols_only:
+        if re.sub(r"\s+", "", want) not in re.sub(r"\s+", "", ctitle):
+            return None, "symbol-only title: the symbols are not in the upload's title"
+    elif not _title_ok(want, ctitle):
+        return None, (f"title {want!r} is not in the upload's title as whole words" +
+                      (" (a title of 3 letters or fewer must be a whole piece of it)" if len(_alnum(want)) <= 3 else ""))
+    if artist_required and not _artist_agrees(track, ctitle, channel):
+        return None, f"none of the artists ({track.get('artists')!r}) is named in the upload's title or channel {cand.get('channel')!r}"
+    score, parts = 0, []
+    want_s = (track.get("duration_ms") or 0) / 1000
+    got_s = cand.get("duration")
+    main_artist = _loose((track.get("artists") or "").split(",")[0])
+    if want_s:
+        if not got_s:
+            return None, "the upload has no length (live stream?)"
+        gap = abs(got_s - want_s)
+        if gap > SPOTIFY_MAX_GAP_S:
+            return None, f"duration off by {gap:.0f}s (track {want_s:.0f}s, upload {got_s:.0f}s; the limit is {SPOTIFY_MAX_GAP_S}s)"
+        if (strict or symbols_only) and gap > 3:
+            return None, f"duration off by {gap:.1f}s; the {'strict last-resort query' if strict else 'symbol-only title'} needs 3s or less"
+        pts = 4 if gap <= 3 else 2 if gap <= 8 else 0
+        score += pts
+        parts.append(f"duration gap {gap:.1f}s {pts:+d}")
+    if main_artist and main_artist in channel:
+        score += 1; parts.append("main artist in channel +1")
+    if channel.endswith("- topic"):
+        score += 3; parts.append("'- Topic' channel +3")
+    if "official audio" in ctitle:
+        score += 1; parts.append("'official audio' +1")
+    if "lyric" in ctitle:
+        score -= 1; parts.append("'lyric' -1")
+    own = _norm(track.get("title"))
+    for w in _BAD_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", ctitle) and not re.search(rf"\b{re.escape(w)}\b", own):
+            score -= 5; parts.append(f"penalty: {w!r} in the upload's title -5")
+    return score, ", ".join(parts) or "no bonuses"
+
+
 def spotify_score(track, cand, strict=False, artist_required=True):
     """Score one search hit for a track (higher is better); None = never acceptable.
     cand = {title, channel, duration (s)}. Length is the main signal (+4 within 3 s, +2 within 8 s, hard
@@ -455,40 +542,7 @@ def spotify_score(track, cand, strict=False, artist_required=True):
     streams, 77-minute sets). A symbol-only title has no words to match, so the symbols themselves must be in the
     upload's title and the length within 3 s. strict (the shortened last-resort query) also needs length within 3 s:
     never a blind first hit."""
-    ctitle, want = _loose(cand.get("title")), _loose(_core_title(track.get("title")))
-    channel = _loose(cand.get("channel"))
-    symbols_only = not re.search(r"\w", want)
-    if symbols_only:
-        if re.sub(r"\s+", "", want) not in re.sub(r"\s+", "", ctitle):
-            return None
-    elif not _title_ok(want, ctitle):
-        return None
-    if artist_required and not _artist_agrees(track, ctitle, channel):
-        return None
-    score = 0
-    want_s = (track.get("duration_ms") or 0) / 1000
-    got_s = cand.get("duration")
-    main_artist = _loose((track.get("artists") or "").split(",")[0])
-    if want_s:
-        if not got_s:
-            return None
-        gap = abs(got_s - want_s)
-        if gap > SPOTIFY_MAX_GAP_S or ((strict or symbols_only) and gap > 3):
-            return None
-        score += 4 if gap <= 3 else 2 if gap <= 8 else 0
-    if main_artist and main_artist in channel:
-        score += 1
-    if channel.endswith("- topic"):
-        score += 3
-    if "official audio" in ctitle:
-        score += 1
-    if "lyric" in ctitle:
-        score -= 1
-    own = _norm(track.get("title"))
-    for w in _BAD_WORDS:
-        if re.search(rf"\b{re.escape(w)}\b", ctitle) and not re.search(rf"\b{re.escape(w)}\b", own):
-            score -= 5
-    return score
+    return spotify_score_why(track, cand, strict, artist_required)[0]
 
 
 # yt-dlp runs are the scarce thing (YouTube's bot gate, the cookie stores): one track may start this many in all,
@@ -501,8 +555,10 @@ def _budget_take():
     if _budget is None:
         return True
     if _budget["left"] <= 0:
+        slog.warning("yt-dlp run budget for this track is used up (%d runs): no further attempt", YT_RUNS_PER_TRACK)
         return False
     _budget["left"] -= 1
+    slog.debug("yt-dlp run budget: %d of %d left after this run", _budget["left"], YT_RUNS_PER_TRACK)
     return True
 
 
@@ -512,6 +568,7 @@ def _track_budget():
     mine = _budget is None
     if mine:
         _budget = {"left": YT_RUNS_PER_TRACK}
+        slog.debug("yt-dlp run budget opened: %d runs for this track", YT_RUNS_PER_TRACK)
     try:
         yield
     finally:
@@ -548,14 +605,25 @@ def _yt_search(query, n=5):
                 hits.append({"title": d.get("title") or "", "channel": d.get("channel") or d.get("uploader") or "",
                              "duration": d.get("duration"), "url": d.get("url") or f"https://www.youtube.com/watch?v={d['id']}"})
         if code == 0 and hits:
+            if _yt_working != extra:
+                slog.info("search: strategy [%s] now remembered as the working one (was [%s])", _sname(extra), _sname(_yt_working) if _yt_working is not None else "none")
             _yt_working = extra
+            slog.info("search %r: strategy [%s] OK, %d hit(s)", query, _sname(extra), len(hits))
             return hits, []
         if code == 0:
+            slog.info("search %r: strategy [%s] ran fine but found nothing; other strategies would not change that", query, _sname(extra))
             return [], []
         err = (out + e).splitlines()
+        slog.warning("search %r: strategy [%s] FAILED: %s", query, _sname(extra), _errline(err))
         if _network_down(err):
+            slog.error("search %r: the network looks down, not trying other strategies", query)
             break
     return [], err
+
+
+def _tl(track):
+    """A track as it is written in the log: 'Artists - Title'."""
+    return f"{(track or {}).get('artists') or '?'} - {(track or {}).get('title') or '?'}"
 
 
 def spotify_queries(track):
@@ -575,26 +643,42 @@ def spotify_candidates(track, search=None, limit=3):
     at most `limit` of them. search(query) -> (hits, err); default = yt-dlp."""
     search = search or _yt_search
     scored, seen_any, last_err = {}, False, []
+    tl = _tl(track)
+    qs = spotify_queries(track)
+    slog.info("candidates for %s (%ss): %d queries %s", tl, round((track.get("duration_ms") or 0) / 1000, 1), len(qs), qs)
     with _track_budget():
-        for i, q in enumerate(spotify_queries(track)):
+        for i, q in enumerate(qs):
             hits, last_err = search(q)
+            slog.info("  query %d/%d %r: %d hit(s)%s", i + 1, len(qs), q, len(hits), f", error: {_errline(last_err)}" if last_err and not hits else "")
             need_artist = any(h.get("channel") for h in hits)      # no channel anywhere = nothing to compare the artist with
             for h in hits:
-                s = spotify_score(track, h, strict=(i == 2), artist_required=need_artist)
+                s, why = spotify_score_why(track, h, strict=(i == 2), artist_required=need_artist)
+                desc = f"{h.get('title')!r} by {h.get('channel')!r} {h.get('duration')}s {h.get('url')}"
                 if s is None:
+                    slog.debug("    REJECT %s: %s", desc, why)
                     continue
                 seen_any = True
                 if s >= MIN_SCORE and s > scored.get(h["url"], -99):
                     scored[h["url"]] = s
+                    slog.debug("    ACCEPT score=%d %s: %s", s, desc, why)
+                elif s < MIN_SCORE:
+                    slog.debug("    REJECT score=%d < %d %s: %s", s, MIN_SCORE, desc, why)
+                else:
+                    slog.debug("    keep earlier score for %s (this one %d): %s", h.get("url"), s, why)
             if scored and max(scored.values()) >= GOOD_ENOUGH:
+                slog.info("  best score %d >= %d: enough, no more queries", max(scored.values()), GOOD_ENOUGH)
                 break
             if last_err and _network_down(last_err):
+                slog.error("  the network looks down: no more queries")
                 break
     ranked = [u for u, _ in sorted(scored.items(), key=lambda kv: -kv[1])][:limit]
     if ranked:
+        slog.info("candidates for %s: chosen %s", tl, [(u, scored[u]) for u in ranked])
         return ranked, ""
     if not seen_any and last_err:
+        slog.error("candidates for %s: none; every search failed, last error: %s", tl, _errline(last_err))
         return [], _yt_explain(last_err)
+    slog.warning("candidates for %s: none acceptable (all hits rejected or none found)", tl)
     return [], "no matching upload found"
 
 
@@ -707,6 +791,7 @@ def spotify_tag(path, meta, cover=None, year=""):
         else:
             return f"{ext or 'this'} files can't be tagged — saved untagged"
     except Exception as exc:
+        slog.exception("tagging %s failed", p.name)
         return f"saved, but tagging failed: {exc}"
     return ""
 
@@ -744,9 +829,14 @@ def _cover_bytes(url):
         return None
     try:
         b = _fetch_bytes(url)
-    except Exception:
+    except Exception as e:
+        slog.warning("cover: %s could not be fetched: %s", url, e)
         return None
-    return b if _is_image(b) else None
+    if not _is_image(b):
+        slog.warning("cover: %s is not a JPEG / PNG (%d bytes, starts %r): not embedded", url, len(b), b[:16])
+        return None
+    slog.debug("cover: %s -> %d bytes", url, len(b))
+    return b
 
 
 # ---- what is already downloaded: matched on "Artists - Title", not on the file's exact name
@@ -899,13 +989,15 @@ def _move_noclobber(src, dst):
         os.link(src, dst)       # atomic, and refuses an existing dst
     except FileExistsError:
         return False
-    except OSError:             # a volume without hard links: check, then rename
+    except OSError as e:        # a volume without hard links: check, then rename
         if os.path.lexists(dst):
             return False
+        log.info("move: no hard links here (%s), renaming %s -> %s instead", e, src, dst)
         try:
             os.rename(src, dst)
             return True
-        except OSError:
+        except OSError as e2:
+            log.warning("move: rename %s -> %s failed: %s", src, dst, e2)
             return False
     try:
         os.unlink(src)
@@ -920,7 +1012,10 @@ def _place(src, directory, name, first_try_plain=True):
     for k in range(1, 1000):
         cand = Path(directory) / (name if k == 1 else f"{stem} ({k}){suf}")
         if _move_noclobber(src, cand):
+            if k > 1:
+                log.info("name taken, placed as %s instead of %s", cand.name, name)
             return cand
+    log.error("could not place %s in %s as %r (1000 names taken?)", src, directory, name)
     return None
 
 
@@ -937,6 +1032,7 @@ def _recover_sync_leftovers(dest):
     for nm in sorted(names):
         m = _SYNC_TMP.match(nm)
         back = m.group(1) if m else "Recovered song " + secrets.token_hex(3) + Path(nm).suffix
+        slog.warning("sync: leftover %s from a sync that died; putting it back as %s", nm, back)
         _place(Path(dest) / nm, dest, back)
 
 
@@ -950,15 +1046,20 @@ def spotify_sync(dst, folder, tracks, libs=(), total=None):
     Returns {ok, have: [indexes already in the folder], inlib: [indexes found in a library], renamed, notes}."""
     dest = Path(dst or DOWNLOADS).expanduser() / safe_name(folder)
     have, plan = [], []
+    slog.info("sync %r: %d song(s), destination %s, %d library folder(s)", folder, len(tracks), dest, len(libs or []))
     with _folder_lock(dest):
         _recover_sync_leftovers(dest)
-        got = match_files(_scan(dest), tracks)
+        files = _scan(dest)
+        got = match_files(files, tracks)
+        slog.info("sync %r: %d audio file(s) in the folder, %d matched to the list", folder, len(files), len(got))
         for i in sorted(got):
             have.append(i)
             cur = Path(got[i])
             bpm = _BPM_SUFFIX.search(cur.stem)
             new = spotify_stem({**tracks[i], "folder": folder}, total or len(tracks)) + (bpm.group(0) if bpm else "") + cur.suffix
+            slog.debug("  have #%s %s <- %s", tracks[i].get("number"), _tl(tracks[i]), cur.name)
             if new != cur.name:
+                slog.info("  rename %s -> %s", cur.name, new)
                 plan.append((cur, new))
         token, moved = secrets.token_hex(4), []
         for n, (src, new) in enumerate(plan):       # phase 1: out of the way (a name nobody else uses); phase 2: into place
@@ -967,14 +1068,15 @@ def spotify_sync(dst, folder, tracks, libs=(), total=None):
                     src.rename(tmp)
                     moved.append((tmp, src, new))
                     break
-                except OSError:
+                except OSError as e:
+                    slog.warning("  rename step 1 %s -> %s failed: %s", src.name, tmp.name, e)
                     continue
         renamed = 0
         for tmp, src, new in moved:
             if _place(tmp, src.parent, new):
                 renamed += 1
             elif not _place(tmp, src.parent, src.name):     # could not even go back: it stays hidden, recovered next time
-                pass
+                slog.error("  %s could not be renamed to %s nor put back; it stays hidden as %s until the next sync", src.name, new, tmp.name)
     inlib, notes = [], []
     for lib in libs or []:
         lp = Path(lib).expanduser()
@@ -986,7 +1088,12 @@ def spotify_sync(dst, folder, tracks, libs=(), total=None):
             continue
         rest = [i for i in range(len(tracks)) if i not in have and i not in inlib]
         found = match_files(_scan(ld), [tracks[i] for i in rest])
+        for j, fp in found.items():
+            slog.info("  in library %s: #%s %s <- %s", lp.name or lib, tracks[rest[j]].get("number"), _tl(tracks[rest[j]]), Path(fp).name)
         inlib += [rest[j] for j in found]
+    for n in notes:
+        slog.warning("sync note: %s", n)
+    slog.info("sync %r done: %d have, %d in a library, %d renamed, %d to download", folder, len(have), len(inlib), renamed, len(tracks) - len(have) - len(inlib))
     return {"ok": True, "have": have, "inlib": sorted(inlib), "renamed": renamed, "notes": notes}
 
 
@@ -996,39 +1103,55 @@ def _download_candidates(urls, outtmpl, mp3):
     that belongs to the connection ends the attempt. Returns (ok, path, error lines)."""
     global _yt_working
     last_err = []
-    for yt in urls:
+    for ui, yt in enumerate(urls, 1):
+        slog.info("download: upload %d/%d %s", ui, len(urls), yt)
         for extra in _yt_order():
             if not _budget_take():
                 return False, None, last_err or ["yt-dlp run budget for this track used up"]
             ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
             if ok and path:
+                if _yt_working != extra:
+                    slog.info("download: strategy [%s] now remembered as the working one (was [%s])", _sname(extra), _sname(_yt_working) if _yt_working is not None else "none")
                 _yt_working = extra
+                slog.info("download: upload %d/%d strategy [%s] OK -> %s", ui, len(urls), _sname(extra), path)
                 return True, path, []
             if ok:
+                slog.error("download: strategy [%s] exited 0 but no file was found for %s", _sname(extra), yt)
                 return False, None, ["the download finished but no file was found"]
             text = " ".join(last_err).lower()
+            slog.warning("download: upload %d/%d strategy [%s] FAILED: %s", ui, len(urls), _sname(extra), _errline(last_err))
             if _network_down(last_err):
+                slog.error("download: the network looks down, giving up on this song")
                 return False, None, last_err
-            if re.search(r"private video|not available|unavailable|removed|blocked|copyright|terminated|does not exist", text):
+            if "requested format" not in text and re.search(r"private video|not available|unavailable|removed|blocked|copyright|terminated|does not exist", text):
+                slog.warning("download: the failure belongs to the upload itself, moving to the next upload")
                 break           # this upload is out; the next candidate gets its turn
+    slog.error("download: no upload could be downloaded; last error: %s", _errline(last_err))
     return False, None, last_err
 
 
 def spotify_track(meta, outdir, analyze=False, mp3=False):
     """Download one Spotify track described by meta ({title, artists, album, number, total, duration_ms,
     cover, url, folder}) into outdir/<folder>/NN - Artists - Title.<ext>, tagged. Never overwrites."""
+    tl = _tl(meta)
+    t0 = time.monotonic()
+    slog.info("track #%s %s: start (%ss, folder=%r, outdir=%s, analyze=%s, mp3=%s, %s)", meta.get("number"), tl,
+              round((meta.get("duration_ms") or 0) / 1000, 1), meta.get("folder"), outdir, analyze, mp3, meta.get("url"))
     err = _need("yt-dlp", "ffmpeg")
     if err:
+        slog.error("track %s: FAILED: %s", tl, err)
         return {"ok": False, "output": err}
     folder = Path(outdir) / safe_name(meta["folder"]) if meta.get("folder") else Path(outdir)
     stem = spotify_stem(meta)
     os.makedirs(folder, exist_ok=True)
     there = find_existing(folder, meta)
     if there:
+        slog.info("track %s: already saved as %s (matched on Artists - Title), nothing to do", tl, there)
         return {"ok": True, "path": there, "files": [], "skipped": 1, "output": ""}
     with _track_budget():
         urls, msg = spotify_candidates(meta)
         if not urls:
+            slog.error("track %s: FAILED, no upload to download: %s", tl, msg)
             return {"ok": False, "output": f"{meta.get('title')}: {msg}"}
         tid = _track_id(meta)
         year, cover_url, album = "", meta.get("cover") or "", meta.get("album") or ""
@@ -1037,15 +1160,21 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
             cover_url = _best_image(e) or cover_url
             year = ((e.get("releaseDate") or {}).get("isoString") or "")[:10]
             album = album or _embed_album(e)
-        except Exception:
-            pass
+            slog.info("track %s: own embed page: year=%r album=%r cover=%s", tl, year, album, cover_url)
+        except Exception as ex:
+            slog.warning("track %s: its own embed page could not be read (%s: %s); using the list's cover and album", tl, type(ex).__name__, ex)
         outtmpl = tmpl_escape(folder / stem) + ".%(ext)s"
+        slog.info("track %s: downloading %d candidate upload(s) to %s", tl, len(urls), outtmpl)
         ok, path, last_err = _download_candidates(urls, outtmpl, mp3)
         if not ok or not path:
-            return {"ok": False, "output": f"{meta.get('title')}: {_yt_explain(last_err, urls[0])}"}
+            reason = _yt_explain(last_err, urls[0])
+            slog.error("track %s: FAILED after %.1fs: %s (raw: %s)", tl, time.monotonic() - t0, reason, _errline(last_err))
+            return {"ok": False, "output": f"{meta.get('title')}: {reason}"}
     cover = _cover_bytes(cover_url) or (_cover_bytes(meta.get("cover")) if meta.get("cover") != cover_url else None)
+    slog.info("track %s: cover %s", tl, f"{len(cover)} bytes" if cover else "none (not embedded)")
     notes = []
     caveat = spotify_tag(path, {**meta, "album": album}, cover, year)
+    slog.log(20 if not caveat else 30, "track %s: tags %s", tl, caveat or "written")
     if caveat:
         notes.append(caveat)
     if analyze:        # read-only analysis of the saved file; only its name changes
@@ -1054,10 +1183,14 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
             bpm, keys = res
             new = path.with_name(f"{path.stem} ({bpm} BPM {' '.join(keys)}){path.suffix}")
             if not new.exists():
+                slog.info("track %s: rename %s -> %s", tl, path.name, new.name)
                 path.rename(new)
                 path = new
+            else:
+                slog.warning("track %s: %s already exists, keeping %s", tl, new.name, path.name)
         else:
             notes.append("no BPM/key analyzer installed — run native/install.sh")
+    slog.info("track %s: DONE in %.1fs -> %s", tl, time.monotonic() - t0, path)
     return {"ok": True, "path": str(path), "files": [str(path)], "output": "; ".join(notes), "format": path.suffix.lower().lstrip(".")}
 
 
@@ -1126,6 +1259,7 @@ def session_browsers(site):
         return _sessions[site]
     found = []
     interp = gallery_dl_python()
+    log.info("session probe for %s: gallery-dl's python is %s", site, interp)
     if interp:
         order = list(BROWSERS)
         try:
@@ -1138,6 +1272,7 @@ def session_browsers(site):
         domain, cookie = SESSION_COOKIE[site]
         code, out, _ = _run([interp, "-c", _PROBE, domain, cookie] + order, timeout=90)
         found = out.strip().splitlines() if code == 0 else []
+    log.info("session probe for %s: browsers holding a session: %s", site, found or "none")
     _sessions[site] = found
     return found
 
@@ -1213,16 +1348,19 @@ def build_cmd(site, url, cookie_args, outdir):
 
 def attempt(site, url, cookie_args, outdir):
     """Run gallery-dl once. Returns (downloaded, skipped, messages, returncode)."""
-    downloaded, skipped, messages = [], [], []
+    downloaded, skipped, messages, everything = [], [], [], []
+    cmd = build_cmd(site, url, cookie_args, outdir)
+    t0 = jlog.exec_start(log, cmd)
     try:
-        proc = subprocess.Popen(build_cmd(site, url, cookie_args, outdir), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     except OSError as exc:
+        jlog.exec_done(log, cmd, 1, t0, "", str(exc), "could not start")
         return [], [], [str(exc)], 1
     for line in proc.stdout:
         line = line.rstrip("\n")
         if not line.strip():
             continue
+        everything.append(line)
         if line.startswith("# "):
             skipped.append(line[2:].strip())
         elif line.startswith("/"):
@@ -1230,6 +1368,7 @@ def attempt(site, url, cookie_args, outdir):
         else:
             messages.append(line)
     proc.wait()
+    jlog.exec_done(log, cmd, proc.returncode, t0, "\n".join(everything), "", f"{len(downloaded)} downloaded, {len(skipped)} skipped")
     return downloaded, skipped, messages, proc.returncode
 
 
@@ -1297,9 +1436,13 @@ def social(site, url, outdir):
         return {"ok": False, "output": err}
     url, kind, label = normalize(site, url)
     messages, code = [], 1
-    for source, cookie_args in cookie_strategies(site):
+    strategies = cookie_strategies(site)
+    log.info("%s: %s (%s, %s) outdir=%s, login sources to try: %s", site, url, kind, label, outdir, [n for n, _ in strategies])
+    for source, cookie_args in strategies:
+        log.info("%s: trying login source [%s]", site, source)
         downloaded, skipped, messages, code = attempt(site, url, cookie_args, outdir)
         if downloaded or skipped:
+            log.info("%s: source [%s] worked: %d downloaded, %d already there", site, source, len(downloaded), len(skipped))
             try:
                 LAST_SOURCE.write_text(source)
             except OSError:
@@ -1312,8 +1455,12 @@ def social(site, url, outdir):
                    + (f", {converted} converted to H.264" if converted else "") + ("; " + warn[0] if warn else ""))
             return {"ok": True, "path": downloaded[0] if n == 1 else str(dest), "files": downloaded, "skipped": k, "output": out}
         if not (AUTH_RE.search(" ".join(messages)) or code == 16):
+            log.warning("%s: source [%s] failed (rc=%s) and it is not a login problem, not trying other sources", site, source, code)
             break   # not a login problem — another cookie source won't help
-    return {"ok": False, "output": _social_explain(site, messages, code, kind)}
+        log.warning("%s: source [%s] bounced to the login page (rc=%s), trying the next source", site, source, code)
+    out = _social_explain(site, messages, code, kind)
+    log.error("%s: FAILED: %s", site, out)
+    return {"ok": False, "output": out}
 
 
 # ══════════════════════════════════════════════════════════════════════════════ finishing steps
@@ -1330,6 +1477,7 @@ def strip_metadata(path):
         if not shutil.which("exiftool"):
             return False, "exiftool not installed — click Install missing dependencies or run native/install.sh; by hand: " + tool_howto("exiftool")
         code, out, err = _run(["exiftool", "-all=", "-overwrite_original", "-q", str(p)], timeout=300)
+        log.info("strip metadata (exiftool) %s: %s", p.name, "ok" if code == 0 else f"FAILED rc={code}")
         return (True, "") if code == 0 else (False, (err or out).strip().splitlines()[-1] if (err or out).strip() else "exiftool failed")
     if ext in VIDEO_META:
         if not shutil.which("ffmpeg"):
@@ -1339,10 +1487,13 @@ def strip_metadata(path):
                              "-c", "copy", "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact", *(["-movflags", "+faststart"] if ext in (".mp4", ".m4v", ".mov", ".m4a") else []), str(tmp)], timeout=1800)
         if code == 0 and tmp.exists() and tmp.stat().st_size > 0:
             tmp.replace(p)
+            log.info("strip metadata (ffmpeg) %s: ok", p.name)
             return True, ""
         if tmp.exists():
             tmp.unlink()
+        log.error("strip metadata (ffmpeg) %s: FAILED rc=%s", p.name, code)
         return False, (err.strip().splitlines() or ["ffmpeg failed"])[-1]
+    log.debug("strip metadata: %s has no metadata step for %r, left alone", p.name, ext)
     return True, ""
 
 
@@ -1361,8 +1512,10 @@ def webp_to_jpeg(path, fmt="jpg"):
     opts = ["-s", "format", "png"] if fmt == "png" else ["-s", "format", "jpeg", "-s", "formatOptions", "100"]
     code, _, err = _run(["/usr/bin/sips", *opts, str(p), "--out", str(out)], timeout=300)
     if code != 0 or not out.exists():
+        log.error("webp -> %s: sips failed for %s (rc=%s)", fmt, p.name, code)
         return False, (err.strip() or "sips failed")
     p.unlink()
+    log.info("webp -> %s: %s -> %s (original removed)", fmt, p.name, out.name)
     return True, str(out)
 
 
@@ -1382,11 +1535,22 @@ def finish(paths, strip=False, webp=False):
             ok, m = strip_metadata(cur)
             msg = m if not ok else msg
         results.append({"path": cur, "ok": ok, "output": msg})
+        log.info("finish %s: strip=%s webp=%s -> %s ok=%s%s", path, bool(strip), webp or False, cur, ok, f" ({msg})" if msg else "")
     return {"results": results}
 
 
 # ══════════════════════════════════════════════════════════════════════════════ entry
 def fetch(url, mode="video", outdir="", meta=None, analyze=False, mp3=False):
+    """Run the engine for a page URL; the whole call and its outcome are in the log."""
+    t0 = time.monotonic()
+    log.info("fetch: %s site=%s mode=%s outdir=%s analyze=%s mp3=%s%s", url, site_of(url), mode, outdir or "~/Downloads", analyze, mp3,
+             f" meta={jlog.summarize({'meta': meta})}" if meta else "")
+    r = _fetch(url, mode, outdir, meta, analyze, mp3)
+    (log.info if r.get("ok") else log.error)("fetch done in %.1fs: ok=%s path=%s output=%s", time.monotonic() - t0, r.get("ok"), r.get("path"), (r.get("output") or "")[:400])
+    return r
+
+
+def _fetch(url, mode="video", outdir="", meta=None, analyze=False, mp3=False):
     outdir = str(Path(outdir or DOWNLOADS).expanduser())
     try:
         os.makedirs(outdir, exist_ok=True)
@@ -1405,6 +1569,7 @@ def fetch(url, mode="video", outdir="", meta=None, analyze=False, mp3=False):
             return spotify_track(meta, outdir, bool(analyze), bool(mp3))
         return {"ok": False, "output": "no engine for this site"}
     except Exception as e:      # never let a site module take the host down
+        log.exception("fetch of %s raised", url)
         return {"ok": False, "output": str(e)}
 
 
