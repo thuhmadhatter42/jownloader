@@ -55,6 +55,9 @@ DOWNLOADS = Path.home() / "Downloads"
 # the browser launches the host with a bare PATH; Homebrew and pipx live here
 os.environ["PATH"] = ":".join([
     "/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local/bin"), os.environ.get("PATH", "")])
+# tests only: a folder of stand-in yt-dlp / gallery-dl / ffmpeg executables that wins over the real ones
+if os.environ.get("JOWN_TOOL_DIR"):
+    os.environ["PATH"] = os.environ["JOWN_TOOL_DIR"] + ":" + os.environ["PATH"]
 
 YOUTUBE_RE = re.compile(r"^https?://(?:www\.|m\.|music\.)?(?:youtube\.com/|youtu\.be/)", re.I)
 INSTAGRAM_RE = re.compile(r"^https?://(?:www\.)?instagram\.com/", re.I)
@@ -73,6 +76,79 @@ def site_of(url):
     if SPOTIFY_RE.match(url or ""):
         return "spotify"
     return None
+
+
+STOPPED = {"ok": False, "stopped": True, "output": "stopped"}
+
+
+def _stopped():
+    """True once Stop was pressed for this fetch: nothing new may start (the launcher refuses too)."""
+    if jlog.cancelled():
+        log.info("stopped: the job was cancelled, not starting anything further")
+        return True
+    return False
+
+
+def _guard_partials(folder, stem):
+    """On Stop, remove what this job leaves in `folder`: files named <stem>.* that were not there when it began
+    (.part, .part-FragN, .ytdl, .temp.*, .fNNN.<ext> intermediates ...) except files it finished (jlog.keep_file).
+    Earlier files, and other songs' stems in the same folder, are never touched."""
+    job = jlog.current_job()
+    if not job or not str(stem).strip() or not str(folder).strip():     # never sweep the cwd or match every file
+        return
+    folder = Path(folder)
+    try:
+        before = {e.name for e in os.scandir(folder)}
+    except OSError:
+        before = set()
+    job.stems.append(stem)
+
+    def sweep():
+        removed = []
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            return removed
+        for e in entries:
+            if e.name in before or not e.name.startswith(stem + ".") or not e.is_file(follow_symlinks=False):
+                continue
+            if os.path.abspath(e.path) in job.keep:
+                continue
+            try:
+                os.remove(e.path)
+                removed.append(e.path)
+            except OSError:
+                pass
+        return removed
+    job.cleanups.append(sweep)
+
+
+def _guard_gallery(outdir):
+    """gallery-dl: on Stop remove the *.part files written under its base directory since this job began; the
+    files it finished stay. Another running job's own stems are skipped."""
+    job = jlog.current_job()
+    if not job:
+        return
+    since = time.time() - 2
+    base = str(outdir)
+
+    def sweep():
+        removed, others = [], jlog.other_stems(job)
+        for root, dirs, files in os.walk(base):
+            if root[len(base):].count(os.sep) >= 6:
+                dirs[:] = []
+            for name in files:
+                path = os.path.join(root, name)
+                if not name.endswith(".part") or any(name.startswith(st + ".") for st in others):
+                    continue
+                try:
+                    if os.path.getmtime(path) >= since and os.path.abspath(path) not in job.keep:
+                        os.remove(path)
+                        removed.append(path)
+                except OSError:
+                    pass
+        return removed
+    job.cleanups.append(sweep)
 
 
 def _run(cmd, timeout=None, cwd=None):
@@ -255,6 +331,8 @@ def youtube(url, mode, outdir, mp3=False):
         return {"ok": False, "output": err}
     info, meta_err, working = None, [], None
     for i, extra in enumerate(YT_STRATEGIES, 1):
+        if _stopped():
+            return dict(STOPPED)
         info, meta_err = _yt_info(url, extra)
         if info:
             working = extra
@@ -271,22 +349,30 @@ def youtube(url, mode, outdir, mp3=False):
             log.info("youtube: %s is already there as %s, nothing to download", title, there)
             return {"ok": True, "path": str(there), "files": [], "skipped": 1, "output": ""}
     outtmpl = tmpl_escape(Path(outdir) / title) + ".%(ext)s"
+    _guard_partials(outdir, title)
     last_err, ok, path = [], False, None
     order = [working] + [s for s in YT_STRATEGIES if s != working]
     for i, extra in enumerate(order, 1):
+        if _stopped():
+            return dict(STOPPED)
         ok, path, last_err = _yt_download(url, mode, outtmpl, extra, mp3)
         if ok:
             log.info("youtube download: strategy %d/%d [%s] OK -> %s", i, len(order), _sname(extra), path)
             break
         log.warning("youtube download: strategy %d/%d [%s] FAILED: %s", i, len(order), _sname(extra), _errline(last_err))
+    if _stopped() and not (ok and path):     # a download that finished before the Stop landed is a saved file
+        return dict(STOPPED)
     if not ok:
         log.error("youtube download: all %d strategies failed for %s; last error: %s", len(order), url, _errline(last_err))
         return {"ok": False, "output": _yt_explain(last_err, url)}
     if not path:
         return {"ok": True, "path": str(outdir), "output": f"downloaded into {outdir} (file name not reported)"}
     note = ""
+    jlog.keep_file(path)
     if mode == "audio":
-        res = _analyze(path)
+        res = _analyze(path) if not jlog.cancelled() else None
+        if _stopped():                       # the file is whole; only its BPM/key name is skipped
+            return {"ok": True, "path": str(path), "files": [str(path)], "output": "stopped before BPM/key detection"}
         if res:
             bpm, keys = res
             new = path.with_name(f"{path.stem} ({bpm} BPM {' '.join(keys)}){path.suffix}")
@@ -294,6 +380,7 @@ def youtube(url, mode, outdir, mp3=False):
                 log.info("youtube: rename %s -> %s", path.name, new.name)
                 path.rename(new)
                 path = new
+                jlog.keep_file(path)
             else:
                 log.warning("youtube: %s already exists, file keeps its name without BPM/keys", new.name)
         else:
@@ -591,6 +678,8 @@ def _yt_search(query, n=5):
     global _yt_working
     err = []
     for extra in _yt_order():
+        if jlog.cancelled():
+            return [], ["stopped"]
         if not _budget_take():
             err = err or ["yt-dlp run budget for this track used up"]
             break
@@ -648,6 +737,8 @@ def spotify_candidates(track, search=None, limit=3):
     slog.info("candidates for %s (%ss): %d queries %s", tl, round((track.get("duration_ms") or 0) / 1000, 1), len(qs), qs)
     with _track_budget():
         for i, q in enumerate(qs):
+            if jlog.cancelled():
+                break
             hits, last_err = search(q)
             slog.info("  query %d/%d %r: %d hit(s)%s", i + 1, len(qs), q, len(hits), f", error: {_errline(last_err)}" if last_err and not hits else "")
             need_artist = any(h.get("channel") for h in hits)      # no channel anywhere = nothing to compare the artist with
@@ -1106,6 +1197,8 @@ def _download_candidates(urls, outtmpl, mp3):
     for ui, yt in enumerate(urls, 1):
         slog.info("download: upload %d/%d %s", ui, len(urls), yt)
         for extra in _yt_order():
+            if jlog.cancelled():
+                return False, None, ["stopped"]
             if not _budget_take():
                 return False, None, last_err or ["yt-dlp run budget for this track used up"]
             ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
@@ -1144,6 +1237,7 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
     folder = Path(outdir) / safe_name(meta["folder"]) if meta.get("folder") else Path(outdir)
     stem = spotify_stem(meta)
     os.makedirs(folder, exist_ok=True)
+    _guard_partials(folder, stem)
     there = find_existing(folder, meta)
     if there:
         slog.info("track %s: already saved as %s (matched on Artists - Title), nothing to do", tl, there)
@@ -1166,6 +1260,10 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
         outtmpl = tmpl_escape(folder / stem) + ".%(ext)s"
         slog.info("track %s: downloading %d candidate upload(s) to %s", tl, len(urls), outtmpl)
         ok, path, last_err = _download_candidates(urls, outtmpl, mp3)
+        if _stopped() and not (ok and path):   # finished before the Stop landed: tag it (in-process, quick) and report it
+            return dict(STOPPED)
+        if path:
+            jlog.keep_file(path)
         if not ok or not path:
             reason = _yt_explain(last_err, urls[0])
             slog.error("track %s: FAILED after %.1fs: %s (raw: %s)", tl, time.monotonic() - t0, reason, _errline(last_err))
@@ -1177,8 +1275,13 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
     slog.log(20 if not caveat else 30, "track %s: tags %s", tl, caveat or "written")
     if caveat:
         notes.append(caveat)
-    if analyze:        # read-only analysis of the saved file; only its name changes
+    if analyze and _stopped():
+        notes.append("stopped before BPM/key detection")
+    elif analyze:      # read-only analysis of the saved file; only its name changes
         res = _analyze(path)
+        if _stopped():
+            notes.append("stopped before BPM/key detection")
+            return {"ok": True, "path": str(path), "files": [str(path)], "output": "; ".join(notes), "format": path.suffix.lower().lstrip(".")}
         if res:
             bpm, keys = res
             new = path.with_name(f"{path.stem} ({bpm} BPM {' '.join(keys)}){path.suffix}")
@@ -1186,6 +1289,7 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
                 slog.info("track %s: rename %s -> %s", tl, path.name, new.name)
                 path.rename(new)
                 path = new
+                jlog.keep_file(path)
             else:
                 slog.warning("track %s: %s already exists, keeping %s", tl, new.name, path.name)
         else:
@@ -1273,6 +1377,8 @@ def session_browsers(site):
         code, out, _ = _run([interp, "-c", _PROBE, domain, cookie] + order, timeout=90)
         found = out.strip().splitlines() if code == 0 else []
     log.info("session probe for %s: browsers holding a session: %s", site, found or "none")
+    if jlog.cancelled():        # a stopped probe knows nothing: do not cache its empty answer for the next fetch
+        return []
     _sessions[site] = found
     return found
 
@@ -1296,7 +1402,10 @@ def ytdl_available():
     global _ytdl
     if _ytdl is None:
         interp = gallery_dl_python()
-        _ytdl = bool(interp) and _run([interp, "-c", "import yt_dlp"], timeout=30)[0] == 0
+        ok = bool(interp) and _run([interp, "-c", "import yt_dlp"], timeout=30)[0] == 0
+        if jlog.cancelled():
+            return False
+        _ytdl = ok
     return _ytdl
 
 
@@ -1352,7 +1461,10 @@ def attempt(site, url, cookie_args, outdir):
     cmd = build_cmd(site, url, cookie_args, outdir)
     t0 = jlog.exec_start(log, cmd)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        proc = jlog.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    except jlog.Stopped:
+        jlog.exec_done(log, cmd, 1, t0, "", "stopped", "not started: the job was stopped")
+        return [], [], ["stopped"], 1
     except OSError as exc:
         jlog.exec_done(log, cmd, 1, t0, "", str(exc), "could not start")
         return [], [], [str(exc)], 1
@@ -1368,6 +1480,7 @@ def attempt(site, url, cookie_args, outdir):
         else:
             messages.append(line)
     proc.wait()
+    jlog.release(proc)
     jlog.exec_done(log, cmd, proc.returncode, t0, "\n".join(everything), "", f"{len(downloaded)} downloaded, {len(skipped)} skipped")
     return downloaded, skipped, messages, proc.returncode
 
@@ -1438,16 +1551,28 @@ def social(site, url, outdir):
     messages, code = [], 1
     strategies = cookie_strategies(site)
     log.info("%s: %s (%s, %s) outdir=%s, login sources to try: %s", site, url, kind, label, outdir, [n for n, _ in strategies])
+    _guard_gallery(outdir)
     for source, cookie_args in strategies:
+        if _stopped():
+            return dict(STOPPED)
         log.info("%s: trying login source [%s]", site, source)
         downloaded, skipped, messages, code = attempt(site, url, cookie_args, outdir)
+        if _stopped():
+            return dict(STOPPED)
         if downloaded or skipped:
             log.info("%s: source [%s] worked: %d downloaded, %d already there", site, source, len(downloaded), len(skipped))
             try:
                 LAST_SOURCE.write_text(source)
             except OSError:
                 pass
-            converted = sum(transcode_to_h264(Path(p)) for p in downloaded if Path(p).suffix.lower() in (".mp4", ".mkv"))
+            for p in downloaded:
+                jlog.keep_file(p)
+            converted = 0
+            for p in downloaded:
+                if Path(p).suffix.lower() in (".mp4", ".mkv"):
+                    if _stopped():
+                        return dict(STOPPED)
+                    converted += transcode_to_h264(Path(p))
             dest = Path((downloaded or skipped)[0]).parent
             n, k = len(downloaded), len(skipped)
             warn = [m.split("] ", 1)[-1] for m in messages if "[warning]" in m]

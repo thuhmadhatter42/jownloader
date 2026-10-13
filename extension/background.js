@@ -361,9 +361,9 @@ chrome.runtime.onInstalled.addListener((det) => {
     const missing = Object.entries(d.deps).filter(([, v]) => !v.present).map(([k]) => k);
     log("info", "deps", missing.length ? "missing: " + missing.join(", ") : "all dependencies present");
     if (!missing.length) return;
-    try { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: "…" }); } catch {}
+    setBadge("…");
     const r = await runSetup();
-    try { chrome.action.setBadgeText({ text: r.missing?.length ? "!" : "" }); if (r.missing?.length) chrome.action.setBadgeBackgroundColor({ color: "#d33" }); } catch {}
+    setBadge(r.missing?.length ? "!" : "", r.missing?.length ? "#d33" : undefined);
     await chrome.storage.session.set({ setupResult: { ok: r.ok, output: r.output || "", missing: r.missing || [], python: r.python || "", hints: r.hints || {} } });
   })();
 });
@@ -389,26 +389,50 @@ function sniffExt(b) {
 }
 const CHUNK = 1024 * 1024;      // bytes per host message
 const STALL_MS = 60000;         // no bytes for this long = the file failed, the slot moves on
+// ---------- Stop ----------
+// Every batch owns an AbortController (live ones in liveRuns); Stop aborts them all. A save that sees its signal
+// abort stops fetching, has the host drop its partial file, and resolves {ok:false, stopped:true}. Engine jobs
+// (a subprocess in the host) are cancelled by id: the host kills the process group and removes its partial files.
+const STOP_MSG = "stopped";
+const NEVER = new AbortController().signal;   // callers outside a batch (tests, one-offs) are never stopped
+const liveRuns = new Set();                   // AbortController per running batch
+const engineJobs = new Set();                 // host fetch ids running right now
+const stopError = () => Object.assign(new Error(STOP_MSG), { stopped: true });
+const stoppedReply = (extra = {}) => ({ ok: false, stopped: true, output: STOP_MSG, ...extra });
+// a promise that rejects when sig aborts: raced against each read, one listener per file (not one per chunk)
+function abortPromise(sig) {
+  const p = new Promise((_, rej) => { if (sig.aborted) rej(stopError()); else sig.addEventListener("abort", () => rej(stopError()), { once: true }); });
+  p.catch(() => {});
+  return p;
+}
+const sleepFor = (ms, sig = NEVER) => new Promise((resolve) => { const t = setTimeout(resolve, ms); sig.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true }); });
+const withStop = (sig, own) => sig === NEVER ? own : own ? AbortSignal.any([own, sig]) : sig;
 // Fetch url with the browser session and stream it to the host as name inside dest ("" = ~/Downloads).
 // Flow-controlled: one chunk in flight per file, the host acks each before the next is sent, so memory
 // stays bounded and every message resets the worker's idle timer. Resolves {ok, path} or {ok:false, output}.
 // Never throws.
-async function saveViaHost(url, name, dest, kind, fin = {}) {
+async function saveViaHost(url, name, dest, kind, fin = {}, sig = NEVER) {
   const id = "s" + (++hostSeq);
   let stallTimer = 0;
   log("info", "save", `${id} file: ${name} -> ${dest || "Downloads"}`, { url: logUrl(url), kind, strip: !!fin.strip, webp: fin.webp || "" });
+  const stopP = abortPromise(sig);
   const read = (reader) => Promise.race([
-    reader.read(),
+    reader.read(), stopP,
     new Promise((_, rej) => { stallTimer = setTimeout(() => rej(new Error(`stalled: no data for ${STALL_MS / 1000} s`)), STALL_MS); }),
   ]).finally(() => clearTimeout(stallTimer));
   let res, reader, first;
   try {
-    res = await fetch(url, { credentials: "include" });
+    if (sig.aborted) throw stopError();
+    res = await fetch(url, { credentials: "include", signal: withStop(sig) });
     log("debug", "save", `${id} response HTTP ${res.status} ${res.headers.get("content-type") || "?"} length=${res.headers.get("content-length") || "?"}`);
     if (!res.ok) throw new Error("HTTP " + res.status);
     reader = res.body.getReader();
     first = await read(reader);   // first chunk before "open": it decides the extension when nothing else does
-  } catch (e) { log("warn", "save", `${id} fetch failed: ${e?.message || e}`, { url: logUrl(url) }); try { reader?.cancel(); } catch {} return { ok: false, output: String(e?.message || e) }; }
+  } catch (e) {
+    try { reader?.cancel(); } catch {}
+    if (sig.aborted) { log("info", "save", `${id} stopped before any byte was written`); return stoppedReply(); }
+    log("warn", "save", `${id} fetch failed: ${e?.message || e}`, { url: logUrl(url) }); return { ok: false, output: String(e?.message || e) };
+  }
   if (first.value && looksEncrypted(first.value)) { log("warn", "save", `${id} refused: encrypted (DRM) bytes`, { url: logUrl(url) }); try { reader.cancel(); } catch {} return { ok: false, output: "protected video (DRM) — encrypted file, not saved" }; }
   if (!hasExt(name)) {
     const ext = extForMime(res.headers.get("content-type")) || (first.value ? sniffExt(first.value) : "") || { video: "mp4", image: "jpg", doc: "pdf" }[kind] || "";
@@ -420,6 +444,7 @@ async function saveViaHost(url, name, dest, kind, fin = {}) {
   try {
     let buf = new Uint8Array(0);
     const send = async (part) => {
+      if (sig.aborted) throw stopError();
       const r = await hostAsk(port, { cmd: "chunk", id, data: b64(part) });
       if (!r.ok) throw new Error(hostError(r.output));
       progress.bytes += part.length; pushProgress(false);
@@ -431,14 +456,16 @@ async function saveViaHost(url, name, dest, kind, fin = {}) {
       while (buf.length >= CHUNK) { const part = buf.subarray(0, CHUNK); buf = buf.subarray(CHUNK); await send(part); }
     }
     if (buf.length) await send(buf);
+    if (sig.aborted) throw stopError();
     const closed = await hostAsk(port, { cmd: "close", id });
     log(closed.ok ? "info" : "error", "save", `${id} closed: ${closed.ok ? `${closed.path} (${closed.bytes} bytes)` : closed.output}`);
     return closed.ok ? closed : { ok: false, output: hostError(closed.output) };
   } catch (e) {
-    log("error", "save", `${id} aborted mid-file: ${e?.message || e}`, { url: logUrl(url) });
+    const stopped = sig.aborted;
+    log(stopped ? "info" : "error", "save", `${id} ${stopped ? "stopped mid-file: partial file removed" : "aborted mid-file: " + (e?.message || e)}`, { url: logUrl(url) });
     try { reader.cancel(); } catch {}
     try { port.postMessage({ cmd: "abort", id }); } catch {}
-    return { ok: false, output: String(e?.message || e) };
+    return stopped ? stoppedReply({ cut: true }) : { ok: false, output: String(e?.message || e) };
   }
 }
 
@@ -520,23 +547,25 @@ function fetchManifestOnce(url, tabId = null) {
   return manifestCache.get(k);
 }
 // one segment (or a byte range of one); a fetch silent for STALL_MS fails the file
-async function fetchBytes(url, range) {
+async function fetchBytes(url, range, sig = NEVER) {
   // 2 retries (0.5 s, then 1.5 s) on a network error or a 5xx; a stall (STALL_MS of silence), a 4xx or a DRM refusal fails at once
   for (let attempt = 0; ; attempt++) {
-    try { return await fetchBytesOnce(url, range); }
+    if (sig.aborted) throw stopError();
+    try { return await fetchBytesOnce(url, range, sig); }
     catch (e) {
+      if (sig.aborted) throw stopError();
       if (e?.retry !== true) throw e;
       if (attempt >= 2) { log("error", "stream", `segment gave up after 3 tries: ${e.cause?.message || e.cause}`, { url: logUrl(url) }); throw e.cause; }
       log("warn", "stream", `segment retry ${attempt + 1}/2 after: ${e.cause?.message || e.cause}`, { url: logUrl(url) });
-      await new Promise((r) => setTimeout(r, attempt ? 1500 : 500));
+      await sleepFor(attempt ? 1500 : 500, sig);
     }
   }
 }
-async function fetchBytesOnce(url, range) {
-  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), STALL_MS), again = (e) => ctl.signal.aborted ? e : Object.assign(new Error("retry"), { retry: true, cause: e });
+async function fetchBytesOnce(url, range, sig = NEVER) {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), STALL_MS), again = (e) => ctl.signal.aborted || sig.aborted ? e : Object.assign(new Error("retry"), { retry: true, cause: e });
   try {
     let res;
-    try { res = await fetch(url, { credentials: "include", signal: ctl.signal, headers: range ? { Range: `bytes=${range.start}-${range.end}` } : {} }); }
+    try { res = await fetch(url, { credentials: "include", signal: withStop(sig, ctl.signal), headers: range ? { Range: `bytes=${range.start}-${range.end}` } : {} }); }
     catch (e) { throw again(e); }
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status} (${url.split("/").pop().split("?")[0].slice(0, 40)})`);
@@ -728,9 +757,10 @@ function streamName(url, title) {
 }
 // Fetch every segment of the stream's best tracks, stream them to the host as temp files, then have the
 // host join them into name.mp4 in dest. Resolves {ok, path} or {ok:false, output}. Never throws.
-async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null) {
+async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = NEVER) {
   const port = hostConnect(), ids = [];
   try {
+    if (sig.aborted) throw stopError();
     const text = await fetchManifestOnce(url, tabId);
     const isHls = text.trimStart().startsWith("#EXTM3U");
     const tracks = isHls ? await hlsTracks(url, text, tabId) : dashTracks(text, url);
@@ -744,8 +774,13 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null) {
       log("debug", "stream", `${name}: ${t.kind} track ${id}: ${parts.length} part(s), ${STREAM_AHEAD} fetched ahead`);
       const pending = [];
       for (let i = 0, k = 0; i < parts.length || pending.length; k++) {
-        while (pending.length < STREAM_AHEAD && i < parts.length) { const s = parts[i++]; pending.push(fetchBytes(s.url, s.range).then((b) => s.init ? b : decryptSeg(b, s))); }
+        while (pending.length < STREAM_AHEAD && i < parts.length) {
+          const s = parts[i++], p = fetchBytes(s.url, s.range, sig).then((b) => s.init ? b : decryptSeg(b, s));
+          p.catch(() => {});   // a Stop leaves the ones fetched ahead unawaited: never an unhandled rejection
+          pending.push(p);
+        }
         const bytes = await pending.shift();
+        if (sig.aborted) throw stopError();
         if (k === 0 && looksEncrypted(bytes)) throw new Error(DRM_MSG);
         for (let o = 0; o < bytes.length; o += CHUNK) {
           const r = await hostAsk(port, { cmd: "chunk", id, data: b64(bytes.subarray(o, o + CHUNK)) });
@@ -756,12 +791,14 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null) {
       const closed = await hostAsk(port, { cmd: "close", id });
       if (!closed.ok) throw new Error(hostError(closed.output));
     }
+    if (sig.aborted) throw stopError();
     const r = await hostAsk(port, { cmd: "join", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
     log(r.ok ? "info" : "error", "stream", `${name}: join ${r.ok ? `ok -> ${r.path} (${r.bytes} bytes)${r.output ? " — " + r.output : ""}` : "FAILED: " + r.output}`);
     return r.ok ? r : { ok: false, output: hostError(r.output) };
   } catch (e) {
-    log("error", "stream", `${name}: stream save failed: ${e?.message || e}`, { url: logUrl(url) });
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
+    if (sig.aborted) { log("info", "stream", `${name}: stopped, ${ids.length} temp track(s) removed`); return stoppedReply({ cut: ids.length > 0 }); }
+    log("error", "stream", `${name}: stream save failed: ${e?.message || e}`, { url: logUrl(url) });
     return { ok: false, output: streamError(String(e?.message || e)) };
   }
 }
@@ -805,10 +842,10 @@ function siteNorm(href, origin, safe) {
 // What the server answers for a page, asked BEFORE the tab navigates (service-worker fetch with the user's session;
 // the body is never read). Skips what must not become a page: HTTP >= 400, redirect loops/failures, anything
 // that is not HTML (a download link would stall the tab and fire the browser's own download path).
-async function siteProbe(url) {
+async function siteProbe(url, sig = NEVER) {
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), 20000);
   try {
-    const r = await fetch(url, { credentials: "include", redirect: "follow", signal: ctl.signal });
+    const r = await fetch(url, { credentials: "include", redirect: "follow", signal: withStop(sig, ctl.signal) });
     const ctype = (r.headers.get("content-type") || "").toLowerCase(), disp = r.headers.get("content-disposition") || "";
     ctl.abort();
     if (r.status >= 400) return { skip: `HTTP ${r.status}` };
@@ -825,10 +862,11 @@ function unb64(s) {
   return bytes;
 }
 // resolves once the tab has finished loading (or after a timeout, so a page that never fires "complete" can't wedge the crawl)
-function waitTabLoad(tabId, timeoutMs = 30000) {
+function waitTabLoad(tabId, timeoutMs = 30000, sig = NEVER) {
   return new Promise((resolve) => {
     let done = false;
     const timer = setTimeout(finish, timeoutMs);
+    sig.addEventListener("abort", finish, { once: true });
     function onUpdated(id, info) { if (id === tabId && info.status === "complete") finish(); }
     function finish() { if (done) return; done = true; clearTimeout(timer); chrome.tabs.onUpdated.removeListener(onUpdated); resolve(); }
     chrome.tabs.onUpdated.addListener(onUpdated);
@@ -845,7 +883,7 @@ async function siteMarkdownOf(tabId) {
 }
 // Crawls breadth-first from url (same origin only), rendering each page to a PDF (merged by the host) or
 // collecting its readable text into one Markdown file. Resolves {ok, path, ...} or {ok:false, output}.
-async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = false) {
+async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = false, sig = NEVER) {
   const port = hostConnect();
   const origin = new URL(url).origin;
   const start = siteNorm(url, origin) || url;
@@ -869,15 +907,18 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
   try {
     if (mode === "pdf") { await chrome.debugger.attach({ tabId }, "1.3"); attached = true; }
     while (queue.length && n < maxPages) {
+      if (sig.aborted) throw stopError();
       const pageUrl = queue.shift(), isStart = pageUrl === start && !n;
       // ask the server first: error pages, downloads and redirect targets already seen never become pages
-      const probe = await siteProbe(pageUrl);
+      const probe = await siteProbe(pageUrl, sig);
+      if (sig.aborted) throw stopError();
       if (probe.skip) { log("info", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: ${probe.skip}`); if (isStart) throw new Error(`${pageUrl} was not saved: ${probe.skip}`); continue; }
       const final = siteNorm(probe.final, origin);
       if (!final || (final !== pageUrl && visited.has(final))) { log("info", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: redirected to ${logUrl(probe.final)} (off-site or already seen)`); if (isStart) throw new Error(`${pageUrl} was not saved: redirected away`); continue; }
       visited.add(final);
       await chrome.tabs.update(tabId, { url: pageUrl });
-      await waitTabLoad(tabId);
+      await waitTabLoad(tabId, 30000, sig);
+      if (sig.aborted) throw stopError();
       let pageTitle = "", landedUrl = "";
       try { const t = await chrome.tabs.get(tabId); pageTitle = t.title || ""; landedUrl = t.url || ""; } catch {}
       if (/^chrome-error:/.test(landedUrl)) { log("warn", "crawl", `#${crawlId} skip ${logUrl(pageUrl)}: the page did not load (chrome-error)`); if (isStart) throw new Error(`${pageUrl} was not saved: the page did not load`); continue; }
@@ -914,14 +955,16 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
       log("debug", "crawl", `#${crawlId} ${links.length} same-site safe link(s) on page ${n}, ${queue.length - before} new, ${queue.length} queued`);
     }
   } catch (e) {
-    log("error", "crawl", `#${crawlId} failed after ${n} page(s): ${e?.message || e}`);
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
+    if (sig.aborted) { log("info", "crawl", `#${crawlId} stopped after ${n} page(s): nothing written`); return stoppedReply({ cut: n > 0 }); }
+    log("error", "crawl", `#${crawlId} failed after ${n} page(s): ${e?.message || e}`);
     return { ok: false, output: String(e?.message || e) };
   } finally {
     crawlProgress(crawlId, 0);
     if (attached) try { await chrome.debugger.detach({ tabId }); } catch {}
     if (tabId != null) try { await chrome.tabs.remove(tabId); } catch {}
   }
+  if (sig.aborted) { for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {} return stoppedReply({ cut: true }); }
   log("info", "crawl", `#${crawlId} crawled ${n} page(s), ${mode === "pdf" ? "merging PDFs" : "writing Markdown"}`);
   if (mode === "pdf") {
     const r = await hostAsk(port, { cmd: "mergepdf", id: "s" + (++hostSeq), ids, name, titles, dst: dest || "", ...fin });
@@ -950,11 +993,18 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
 // ---------- the engine: sites whose media sits behind a player API ----------
 // The page URL goes to the host, whose engine runs the site's downloader (YouTube video/audio, Instagram,
 // Twitter/X) with the browser's own session. One reply when it is done; the host keeps streaming other files.
-async function saveEngineViaHost(url, mode, dest, fin = {}, extra = {}) {
+async function saveEngineViaHost(url, mode, dest, fin = {}, extra = {}, sig = NEVER) {
+  if (sig.aborted) return stoppedReply({ notStarted: true });
   const port = hostConnect();
   const id = "s" + (++hostSeq), t0 = Date.now();
   log("info", "engine", `${id} dispatch to the host engine: ${mode} ${logUrl(url)} -> ${dest || "Downloads"}`, { mp3: !!extra.mp3, analyze: !!extra.analyze, strip: !!fin.strip, webp: fin.webp || "", song: extra.meta ? `${extra.meta.number}. ${extra.meta.artists} - ${extra.meta.title}` : undefined });
-  const r = await hostAsk(port, { cmd: "fetch", id, url, mode, dst: dest || "", ...fin, ...extra });
+  engineJobs.add(id);
+  const onStop = () => { try { port.postMessage({ cmd: "cancel", id: "c" + (++hostSeq), jobs: [id] }); } catch {} log("info", "engine", `${id} stop: asked the host to cancel it`); };
+  sig.addEventListener("abort", onStop, { once: true });
+  let r;
+  try { r = await hostAsk(port, { cmd: "fetch", id, url, mode, dst: dest || "", ...fin, ...extra }); }
+  finally { engineJobs.delete(id); sig.removeEventListener("abort", onStop); }
+  if (r.stopped || (sig.aborted && !r.ok)) { log("info", "engine", `${id} stopped after ${((Date.now() - t0) / 1000).toFixed(1)} s: the host killed it and removed its partial files`); return stoppedReply({ cut: true }); }
   log(r.ok ? "info" : "error", "engine", `${id} reply after ${((Date.now() - t0) / 1000).toFixed(1)} s: ${r.ok ? "ok " + (r.path || "") + (r.output ? " — " + r.output : "") : "FAILED: " + r.output}`);
   return r.ok ? r : { ok: false, output: hostError(r.output) };
 }
@@ -965,10 +1015,12 @@ async function saveEngineViaHost(url, mode, dest, fin = {}, extra = {}) {
 // Songs are fetched one at a time, SPOTIFY_GAP_MS apart (start to start), so YouTube never sees a burst.
 const SPOTIFY_GAP_MS = 20000;   // keep equal to engine.py's SPOTIFY_GAP_S
 let spotifyChain = Promise.resolve(), spotifyLast = 0;
-function spotifyTurn(fn) {
+function spotifyTurn(fn, sig = NEVER) {
   const run = spotifyChain.then(async () => {
+    if (sig.aborted) return stoppedReply({ notStarted: true });    // stopped while waiting its turn: never started
     const wait = spotifyLast + SPOTIFY_GAP_MS - Date.now();
-    if (wait > 0) { log("debug", "spotify", `waiting ${Math.round(wait / 1000)} s (the gap between two songs)`); await new Promise((r) => setTimeout(r, wait)); }
+    if (wait > 0) { log("debug", "spotify", `waiting ${Math.round(wait / 1000)} s (the gap between two songs)`); await sleepFor(wait, sig); }
+    if (sig.aborted) return stoppedReply({ notStarted: true });
     spotifyLast = Date.now();
     return fn();
   });
@@ -988,7 +1040,9 @@ async function spotifyList(url) {
 
 // ---------- progress (the popup's bar) ----------
 // errors = every failure of the run, one line each ("song 6 Floaty: YouTube refused the download ..."); now = what is running
-const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", errors: [], now: [], crawl: null };
+// stopping = Stop was pressed and jobs are letting go; stopped = the run ended by Stop: notStarted never began, cut were
+// cut off mid-file (their partial files removed). done/failed count only jobs that finished on their own.
+const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", errors: [], fails: [], now: [], crawl: null, stopping: false, stopped: false, notStarted: 0, cut: 0 };
 // site crawl: page n of m (m = the pages known so far, capped by "Max pages") + the URL being rendered; n = 0 clears it
 // Every crawl has its own entry (id -> {n, m, url}); the bar and badge show the sum of the crawls running, and
 // are only cleared when the last one ends. m only grows, and the bar never steps back (m is raised to hold it).
@@ -1004,16 +1058,35 @@ function crawlProgress(id, n, m, url) {
     crawlFrac = Math.max(crawlFrac, sn / sm);
     progress.crawl = { n: sn, m: sm, url: url || [...crawls.values()].pop().url };
   }
-  try {
-    if (progress.crawl) { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: String(progress.crawl.n) }); }
-    else chrome.action.setBadgeText({ text: "" });
-  } catch {}
+  if (!progress.crawl && !progress.active) setBadge("");
   pushProgress(true);
+}
+// The badge follows the run: the page number while a crawl renders, else the files still to go (4 characters fit),
+// blank when idle; endOfRun leaves "!" in red when something failed.
+let badgeNow = null;
+function setBadge(text, color = "#2563eb") {
+  if (badgeNow === text + color) return;
+  badgeNow = text + color;
+  try { chrome.action.setBadgeBackgroundColor({ color }); chrome.action.setBadgeText({ text }); } catch {}
+}
+function syncBadge() {
+  if (progress.crawl) setBadge(String(progress.crawl.n));
+  else if (progress.active) { const left = Math.max(0, progress.total - progress.done - progress.notStarted - progress.cut); setBadge(progress.stopping ? "■" : left > 9999 ? "9999" : String(left)); }
 }
 let progTimer = 0;
 function pushProgress(force) {
   if (progTimer && !force) return;
-  progTimer = setTimeout(() => { progTimer = 0; chrome.runtime.sendMessage({ type: "progress", ...progress }).catch(() => {}); }, force ? 0 : 150);
+  progTimer = setTimeout(() => { progTimer = 0; syncBadge(); chrome.runtime.sendMessage({ type: "progress", ...progress }).catch(() => {}); }, force ? 0 : 150);
+}
+// Stop: every running batch's signal aborts. Queued jobs never start, in-flight fetches abort and their partial files
+// are dropped, engine processes are killed by the host. The batches unwind on their own and the last one ends the run.
+function stopAll() {
+  if (!progress.active || !liveRuns.size) return { ok: true, idle: true };
+  progress.stopping = true;
+  log("info", "stop", `Stop pressed: ${liveRuns.size} batch(es), ${progress.now.length} job(s) in flight, ${engineJobs.size} engine job(s), ${progress.total - progress.done - progress.now.length} queued`, { now: progress.now.slice(0, 8) });
+  for (const ctl of liveRuns) ctl.abort();
+  pushProgress(true);
+  return { ok: true };
 }
 
 // ---------- a batch ----------
@@ -1096,33 +1169,46 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
   if (!jobs.length) return;
 
   if (!progress.active) {
-    Object.assign(progress, { total: 0, done: 0, failed: 0, bytes: 0, error: "", errors: [], now: [] });
-    if (!progress.crawl) try { chrome.action.setBadgeText({ text: "" }); } catch {}   // a "!" from the last run's failures
+    Object.assign(progress, { total: 0, done: 0, failed: 0, bytes: 0, error: "", errors: [], fails: [], now: [], stopping: false, stopped: false, notStarted: 0, cut: 0 });
+    if (!progress.crawl) setBadge("");   // a "!" from the last run's failures
   }
+  const ctl = new AbortController(), sig = ctl.signal;
+  liveRuns.add(ctl);
   progress.total += jobs.length; progress.active++; progress.where = dest || "Downloads"; progress.kind = kind;
   pushProgress(true);
   const queue = jobs.slice();
+  let hadStop = false;
   try {
     await Promise.all(Array.from({ length: 4 }, async () => {   // four files at a time
-      while (queue.length) {
+      while (queue.length && !sig.aborted) {
         const j = queue.shift();
         const label = jobLabel(j), t0 = Date.now();
         progress.now.push(label); pushProgress(false);
         log("info", "job", `start ${label}`, { key: j.c, url: logUrl(j.url), type: j.spotify ? "spotify" : j.engine ? "engine" : j.site ? "site" : j.stream ? "stream" : "file" });
         let r;
         try {
-          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 })) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin, srcTab) : await saveViaHost(j.url, j.filename, dest, kind, fin);
+          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 }, sig), sig) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }, sig) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow, sig) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin, srcTab, sig) : await saveViaHost(j.url, j.filename, dest, kind, fin, sig);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; log("error", "job", `${label} threw: ${e?.stack || e}`); }
         inFlight.delete(j.c);
         const at = progress.now.indexOf(label); if (at >= 0) progress.now.splice(at, 1);
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
+        if (r.stopped) {
+          // Stop: not a failure. A job still waiting its turn never started; one that had begun was cut off.
+          hadStop = true;
+          if (r.notStarted || !r.cut) progress.notStarted++; else progress.cut++;
+          log("info", "job", `stopped ${label} after ${secs} s (${r.notStarted || !r.cut ? "not started" : "cut off, partial file removed"})`, { key: j.c });
+          pushProgress(false);
+          if (opts.tabId != null) chrome.tabs.sendMessage(opts.tabId, { type: "saveResult", c: j.c, ok: false, output: "stopped" }).catch(() => {});
+          continue;
+        }
         if (!r.ok) {
           // every failure is named in the popup with its reason ("song 6 Floaty: YouTube refused the download ..."), never just counted
           const why = j.spotify ? `${label}: ${stripTitle(r.output, j.spotify.title || "")}` : r.output;
           progress.failed++; progress.error = why;
           progress.errors.push(j.spotify ? why : `${label}: ${r.output}`); if (progress.errors.length > 100) progress.errors.shift();
+          progress.fails.push({ who: label, why: j.spotify ? stripTitle(r.output, j.spotify.title || "") : String(r.output || "failed") }); if (progress.fails.length > 100) progress.fails.shift();
           log("error", "job", `FAILED ${label} after ${secs} s: ${r.output}`, { key: j.c });
         } else {
           log("info", "job", `done ${label} in ${secs} s -> ${r.path || ""}${r.output ? " — " + r.output : ""}`);
@@ -1136,9 +1222,14 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
       }
     }));
   } finally {
+    liveRuns.delete(ctl);
     for (const j of queue) inFlight.delete(j.c);
-    progress.active--; pushProgress(true);
-    if (!progress.active) endOfRun(jobs.some((j) => j.spotify));
+    if (queue.length) { progress.notStarted += queue.length; hadStop = true; log("info", "stop", `${queue.length} queued job(s) never started`); }
+    if (hadStop || sig.aborted) progress.stopped = true;
+    progress.active--;
+    if (![...liveRuns].some((c) => c.signal.aborted)) progress.stopping = false;   // a batch queued after Stop runs on
+    if (!progress.active) { progress.stopping = false; endOfRun(jobs.some((j) => j.spotify)); }
+    pushProgress(true);
     hostRelease();
   }
 }
@@ -1152,9 +1243,11 @@ const stripTitle = (out, title) => String(out || "failed").replace(new RegExp("^
 // (long, the popup usually closed) raises a notification naming the failures
 function endOfRun(hadSpotify) {
   const ok = progress.done - progress.failed;
-  log(progress.failed ? "warn" : "info", "batch", `run finished: ${ok} saved, ${progress.failed} failed of ${progress.total}`, progress.errors.slice(-5));
-  if (!progress.failed) return;
-  try { chrome.action.setBadgeBackgroundColor({ color: "#d33" }); chrome.action.setBadgeText({ text: "!" }); } catch {}
+  if (progress.stopped) log("info", "batch", `run stopped: ${ok} saved, ${progress.failed} failed, ${progress.cut} cut off, ${progress.notStarted} not started of ${progress.total}`);
+  else log(progress.failed ? "warn" : "info", "batch", `run finished: ${ok} saved, ${progress.failed} failed of ${progress.total}`, progress.errors.slice(-5));
+  if (!progress.failed) { if (!progress.crawl) setBadge(""); return; }
+  setBadge("!", "#d33");
+  if (progress.stopped) return;   // Stop was pressed: the person is looking, no notification
   if (hadSpotify) notify(ok ? `Jownloader: ${progress.failed} song${progress.failed > 1 ? "s" : ""} failed` : "Jownloader: no song was saved", progress.errors.slice(-3).join("\n"));
 }
 
@@ -1237,6 +1330,11 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       }));
     } else if (msg.type === "getProgress") {
       reply({ ...progress });
+    } else if (msg.type === "stop") {
+      reply(stopAll());
+    } else if (msg.type === "clearProgress") {      // the dock's dismiss: the last run's verdict is put away
+      if (!progress.active) { const hadFail = progress.failed > 0; Object.assign(progress, { total: 0, done: 0, failed: 0, bytes: 0, error: "", errors: [], fails: [], now: [], stopping: false, stopped: false, notStarted: 0, cut: 0 }); if (hadFail && !progress.crawl) setBadge(""); }
+      reply({ ok: true });
     } else if (msg.type === "log") {                  // popup / content script events: one file holds every side
       logFrom(sender.url?.startsWith("chrome-extension://") ? "popup" : "content", msg.entries); reply({ ok: true });
     } else if (msg.type === "openLog") {
@@ -1309,9 +1407,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     } else if (msg.type === "deps") {
       reply(await getDeps());
     } else if (msg.type === "setup") {
-      try { chrome.action.setBadgeBackgroundColor({ color: "#2f6fed" }); chrome.action.setBadgeText({ text: "…" }); } catch {}
+      setBadge("…");
       const r = await runSetup();
-      try { chrome.action.setBadgeText({ text: r.missing?.length ? "!" : "" }); if (r.missing?.length) chrome.action.setBadgeBackgroundColor({ color: "#d33" }); } catch {}
+      setBadge(r.missing?.length ? "!" : "", r.missing?.length ? "#d33" : undefined);
       reply(r);
     } else if (msg.type === "getSetupResult") {
       const { setupResult } = await chrome.storage.session.get("setupResult");

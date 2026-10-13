@@ -31,6 +31,14 @@ with the browser session; this side only writes them.
      A Spotify track also carries "meta" ({title, artists, album, number, total, duration_ms, cover, url,
      folder}) and "analyze": true|false (BPM/key into the name): the host matches it to an upload and saves
      <dst>/<folder>/NN - Artists - Title.m4a (AAC as the upload has it, never re-encoded), tagged.
+  {"cmd": "cancel", "id", "jobs": [ids]} or {"cmd": "cancel", "id", "all": true}
+     -> {"id", "ok": true, "cancelled": [ids found], "killed": n}     Stop. Ids are the ids of earlier requests:
+     a running "fetch" has its yt-dlp / gallery-dl / ffmpeg / analyzer processes killed with their children
+     (SIGTERM to the process group, SIGKILL after 3 s) and its partial files removed (finished files stay);
+     its own reply then comes once as {"id": <fetch id>, "ok": false, "stopped": true, "output": "stopped"}.
+     A cancelled fetch starts nothing further. An open streaming file is aborted (.jownloading removed), a
+     closed temp track removed; "all" does this for every running fetch, open file and temp track. Unknown ids
+     are not listed (ok stays true).
   {"cmd": "sync", "id", "dst", "folder", "tracks": [{artists, title, number}], "total", "libs": [paths]}
      -> {"id", "ok", "have": [i...], "inlib": [i...], "renamed": n, "notes": [...]}
      before a Spotify list is queued: songs already in <dst>/<folder>/ are matched on "Artists - Title" (not the
@@ -161,17 +169,67 @@ def finished(reply, msg):
 
 def fetch_async(msg):
     """The engine (yt-dlp / gallery-dl) can run for minutes: its own thread, reply when done."""
+    jid = msg.get("id")
+    if jid is not None:
+        jlog.register_job(jid)      # in the reader thread: a cancel that follows at once finds the job
+
     def run():
-        log.info("fetch thread start id=%s", msg.get("id"))
-        try:
-            r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "",
-                             msg.get("meta") or None, bool(msg.get("analyze")), bool(msg.get("mp3")))
-        except Exception as e:
-            log.exception("fetch id=%s raised", msg.get("id"))
-            r = {"ok": False, "output": str(e)}
-        r["id"] = msg.get("id")
-        send(r if msg.get("meta") else finished(r, msg))   # a Spotify song keeps its tags: "strip metadata" would erase them
+        log.info("fetch thread start id=%s", jid)
+        with jlog.job(jid) as j:
+            try:
+                r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "",
+                                 msg.get("meta") or None, bool(msg.get("analyze")), bool(msg.get("mp3")))
+            except Exception as e:
+                log.exception("fetch id=%s raised", jid)
+                r = {"ok": False, "output": str(e)}
+            if j.cancelled.is_set():        # Stop: its processes are gone; remove its partial files, then say so (once)
+                removed = jlog.run_cleanups(j)
+                log.info("cancel id=%s job=%s: fetch stopped, removed %s", jid, jid, removed or "nothing")
+                if r.get("ok") and r.get("path") and os.path.exists(r["path"]):
+                    # it finished before the cancel landed: the file is real, so it is reported (and remembered as
+                    # saved by the extension); only the finishing step is skipped
+                    r["id"] = jid
+                    log.info("cancel id=%s job=%s: the fetch had already finished (%s), reported as saved", jid, jid, r["path"])
+                    send(r)
+                    return
+                send({"id": jid, "ok": False, "stopped": True, "output": "stopped"})
+                return
+            r["id"] = jid
+            send(r if msg.get("meta") else finished(r, msg))   # a Spotify song keeps its tags: "strip metadata" would erase them
     threading.Thread(target=run, daemon=True).start()
+
+
+def cancel(msg):
+    """Stop: kill the engine processes of the named fetches (their threads then remove the partial files and
+    reply "stopped"), abort named open streaming files, remove named closed temp tracks. all:true = everything."""
+    rid, ids = msg.get("id"), list(msg.get("jobs") or [])
+    if msg.get("all"):
+        ids = list(dict.fromkeys(ids + jlog.running_jobs() + list(OPEN) + list(TEMP)))
+    cancelled, killed = [], 0
+    for jid in ids:
+        found = False
+        was, pids = jlog.cancel_job(jid, log)
+        if was:
+            found = True
+            killed += len(pids)
+            log.info("cancel id=%s job=%s: fetch marked cancelled, %d process(es) signalled", rid, jid, len(pids))
+        st = OPEN.pop(jid, None)
+        if st:
+            found = True
+            try: st["f"].close()
+            except OSError: pass
+            try: os.remove(st["path"] + ".jownloading")
+            except OSError: pass
+            log.info("cancel id=%s job=%s: open file %s.jownloading closed and removed (%d chunk(s), %d bytes)", rid, jid, st["path"], st["chunks"], st["bytes"])
+        t = TEMP.pop(jid, None)
+        if t:
+            found = True
+            try: os.remove(t)
+            except OSError: pass
+            log.info("cancel id=%s job=%s: temp track %s removed", rid, jid, t)
+        if found:
+            cancelled.append(jid)
+    return {"id": rid, "ok": True, "cancelled": cancelled, "killed": killed}
 
 
 def list_async(msg):
@@ -716,6 +774,8 @@ def main():
         for t in TEMP.values():
             try: os.remove(t)
             except OSError: pass
+        for jid in jlog.running_jobs():         # the port closed: no engine process outlives the host
+            jlog.cancel_job(jid, log)
 
 
 def serve():
@@ -767,6 +827,13 @@ def serve():
             send(r)
         elif msg.get("cmd") == "fetch":
             fetch_async(msg)
+        elif msg.get("cmd") == "cancel":
+            try:
+                r = cancel(msg)
+            except Exception as e:
+                log.exception("cancel id=%s raised", msg.get("id"))
+                r = {"id": msg.get("id"), "ok": False, "output": str(e)}
+            send(r)
         elif msg.get("cmd") == "sync":
             try:
                 r = engine.spotify_sync(msg.get("dst") or "", msg.get("folder") or "", msg.get("tracks") or [], msg.get("libs") or [], msg.get("total"))
