@@ -37,19 +37,27 @@ with sync_playwright() as p:
     check("same-file '2160p' variant → real pixels of what plays", any(l.startswith("⬇ Download ") and "×" in l and "label" not in l for l in labels), True)
     pop = ctx.new_page(); pop.goto(f"chrome-extension://{ext_id}/popup.html"); pop.wait_for_timeout(1500)
     # (the popup opened as a tab scans itself, so counts are 0 here; the scan is checked against the test page below)
-    check("popup buttons", [b.text_content().split(" (")[0] for b in pop.query_selector_all("button")][:13],
-          ["⧉ sidebar", "📁 Downloads", "×", "Download this list as audio", "+ add a library folder…", "Video / Images", "PDF", "Extra tools", "Download from this page", "Audio only + BPM/key", "Download all images", "Download all videos", "Download collected"])
-    # tabs: every control lives on its own tab
+    check("popup controls present (0.1.45 layout)", pop.evaluate("""() => ['sidebar', 'dest', 'destClear', 'spGo', 'spLibAdd', 'tabDl', 'tabPdf', 'tabTools', 'site', 'siteAudio', 'imgs', 'vids', 'docs', 'coll', 'stop', 'run']
+      .filter((id) => !document.getElementById(id))"""), [])
+    check("save rows: label + count, the row is the button", pop.evaluate("() => ['imgs', 'vids', 'docs', 'coll'].map((id) => document.getElementById(id).querySelector('.t').textContent)"), ["Images", "Videos", "Documents", "Collected"])
+    check("destination row shows the folder name", pop.evaluate("() => document.getElementById('destName').textContent"), "Downloads")
+    # views: every control lives in its own view
     SHOT = os.environ.get("JOWNLOADER_SHOTS") or SP
     os.makedirs(SHOT, exist_ok=True)
     pop.set_viewport_size({"width": 320, "height": 720})
     where = lambda ids: pop.evaluate("ids => ids.map(id => { let e = document.getElementById(id); while (e && !/^pane/.test(e.id)) e = e.parentElement; return e ? e.id : null; })", ids)
-    check("tab 1 Video / Images holds only video + image controls", where(["site", "siteAudio", "imgs", "vids", "coll", "collect", "autoVideos", "showButton", "prefix"]), ["paneDl"] * 9)
-    check("tab 2 PDF holds the site/document controls", where(["sitePdf", "siteMd", "docs", "sitePages"]), ["panePdf"] * 4)
-    check("tab 3 Extra tools holds rename + strip + WebP", where(["rnName", "rnPick", "rnGo", "rnStrip", "rnWebp", "rnPng", "strip", "webp"]), ["paneTools"] * 8)
-    check("tab labels", [pop.text_content(i) for i in ("#tabDl", "#tabPdf", "#tabTools")], ["Video / Images", "PDF", "Extra tools"])
-    check("only the Video / Images pane shows first", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [False, True, True])
-    check("tab bar fits on one line at 300px", pop.evaluate("() => [...document.querySelectorAll('.tabs button')].map(b => Math.round(b.getBoundingClientRect().height) < 30)"), [True, True, True])
+    check("view 1 This page holds everything saved from the page + the finishing switches", where(["site", "siteAudio", "imgs", "vids", "docs", "coll", "collect", "autoVideos", "showButton", "prefix", "strip", "webp", "spGo", "spBpm"]), ["paneDl"] * 14)
+    check("view 2 PDF / Markdown holds the crawl controls", where(["sitePdf", "siteMd", "sitePages"]), ["panePdf"] * 3)
+    check("view 3 Tools holds rename, clean-up, dependencies, log", where(["rnName", "rnPick", "rnGo", "rnStrip", "rnWebp", "rnPng", "depsInstall", "logOpen", "forget"]), ["paneTools"] * 9)
+    check("the run dock (with Stop) sits outside every view", where(["run", "stop", "bar", "runHead"]), [None] * 4)
+    check("view labels", [pop.text_content(i) for i in ("#tabDl", "#tabPdf", "#tabTools")], ["This page", "PDF / Markdown", "Tools"])
+    check("only This page shows first", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [False, True, True])
+    check("view switcher fits on one line", pop.evaluate("() => [...document.querySelectorAll('.seg button')].map(b => Math.round(b.getBoundingClientRect().height) < 30)"), [True, True, True])
+    check("views are a tablist (roles, aria-selected)", pop.evaluate("() => [document.querySelector('.seg').getAttribute('role'), ...['tabDl','tabPdf','tabTools'].map(i => document.getElementById(i).getAttribute('aria-selected'))]"), ["tablist", "true", "false", "false"])
+    pop.focus("#tabDl"); pop.keyboard.press("ArrowRight"); pop.wait_for_timeout(100)
+    check("arrow key moves to the next view and focuses it", pop.evaluate("() => [document.activeElement.id, document.getElementById('panePdf').hidden]"), ["tabPdf", False])
+    pop.keyboard.press("Home"); pop.wait_for_timeout(100)
+    check("Home goes back to the first view", pop.evaluate("() => document.activeElement.id"), "tabDl")
     pop.screenshot(path=SHOT + "/popup-tab1-video-images.png")
     pop.click("#tabPdf"); pop.wait_for_timeout(200)
     check("PDF tab shown, others hidden", pop.evaluate("() => ['paneDl','panePdf','paneTools'].map(i => document.getElementById(i).hidden)"), [True, False, True])
@@ -63,16 +71,17 @@ with sync_playwright() as p:
     pop.screenshot(path=SHOT + "/popup-tab2-pdf.png")
     pop.click("input[name=crawl][value=page]")
     pop.click("#tabTools"); pop.wait_for_timeout(200)
-    check("Extra tools: Batch rename heading", pop.evaluate("() => [...document.querySelectorAll('#paneTools h2')].map(h => h.textContent)"), ["Batch rename", "Strip metadata and WebP conversion", "Logs"])
+    check("Tools: section headings", pop.evaluate("() => [...document.querySelectorAll('#paneTools h2')].map(h => h.textContent)"), ["Rename files", "Clean up the selected files", "Dependencies", "Log"])
     pop.screenshot(path=SHOT + "/popup-tab3-extra-tools.png")
     pop.click("#tabDl"); pop.wait_for_timeout(200)
     check("Collect switch wording", pop.evaluate("() => document.querySelector('#collect').closest('label').querySelector('small').textContent"), "every picture shown on screen is remembered; thumbnails ignored")
     check("hidden attribute still wins over button display", pop.evaluate("() => { const b = document.getElementById('site'); return [b.hidden, getComputedStyle(b).display]; }"), [True, "none"])
     # crawl progress: a crawl in flight shows page N of M + the URL
     pop.evaluate("() => showProgress({total:1, done:0, failed:0, bytes:0, active:1, where:'Downloads', kind:'site', error:'', crawl:{n:3, m:12, url:'https://example.test/a/b'}})")
-    check("crawl progress text", pop.evaluate("() => document.getElementById('status').textContent"), "page 3 of 12\nhttps://example.test/a/b")
+    check("crawl progress text", pop.evaluate("() => [document.getElementById('runHead').textContent, document.getElementById('runMeta').textContent, document.getElementById('run').hidden]"), ["Page 3 of 12", "https://example.test/a/b", False])
     check("crawl progress bar", pop.evaluate("() => document.getElementById('fill').style.width"), "25%")
-    pop.evaluate("() => { document.getElementById('status').textContent = ''; document.getElementById('bar').hidden = true; }")
+    check("Stop shows while it runs", pop.evaluate("() => document.getElementById('stop').hidden"), False)
+    pop.evaluate("() => { document.getElementById('run').hidden = true; }")
 
     # the popup's first message must answer (a throw here hung the popup at "scanning…" once)
     first = pop.evaluate("""async () => Promise.race([new Promise(r => setTimeout(() => r('TIMEOUT'), 3000)),
@@ -101,7 +110,7 @@ with sync_playwright() as p:
     check("collected = big pictures only (no thumbs, no upscaled 200px one), link href for the wrapped one", sorted(c["url"].split("photos/")[1] for c in coll), ["id/10/400/300.jpg", "id/20/400/300.jpg", "id/40/1200/900.jpg", "id/70/400/300.jpg"])
     check("collected lightbox picture carries the header date", [c["date"] for c in coll if "id/70" in c["url"]], ["2021-07-28"])
     pop.evaluate("() => chrome.storage.sync.set({collect: false})")
-    check("popup collected button", pop.evaluate("async () => { await new Promise(r => setTimeout(r, 300)); const b = document.getElementById('coll'); return [b.textContent, b.disabled]; }"), ["Download collected (4)", False])
+    check("popup collected button", pop.evaluate("async () => { await new Promise(r => setTimeout(r, 300)); const b = document.getElementById('coll'); return [b.querySelector('.n').textContent, b.disabled, b.getAttribute('aria-label')]; }"), ["4", True, "Save all 4 collected pictures"])   # no host in this browser: every save control is off
     pop.evaluate("async () => await chrome.runtime.sendMessage({type:'clearCollected'})")
     # sized variants in one folder: the biggest wins in either arrival order
     got = pop.evaluate("""async () => { const send = (u) => chrome.runtime.sendMessage({type:'collect', url:u});
@@ -200,14 +209,14 @@ with sync_playwright() as p:
     pop.wait_for_timeout(500)   # (its turn starts when the 20 s gap after the first has passed — the stub answers at once either way)
     check("extra library folders: none by default", pop.evaluate("async () => (await chrome.storage.sync.get({spotifyLibs: null})).spotifyLibs"), None)
     pop.evaluate("() => chrome.storage.sync.set({spotifyLibs: ['/some/Music Library']})"); pop.wait_for_timeout(400)
-    check("a stored library folder shows by its name, with a remove button", pop.evaluate("() => [document.getElementById('spLibs').textContent, document.querySelectorAll('#spLibs .x').length]"), ["📚 Music Library×", 1])
+    check("a stored library folder shows by its name, with a remove button", pop.evaluate("() => [document.getElementById('spLibs').textContent, document.querySelectorAll('#spLibs .x').length]"), ["Music Library", 1])
     pop.evaluate("() => document.querySelector('#spLibs .x').click()"); pop.wait_for_timeout(400)
     check("removing it empties the setting", pop.evaluate("async () => (await chrome.storage.sync.get({spotifyLibs: null})).spotifyLibs"), [])
     sy = pop.evaluate("async () => await chrome.runtime.sendMessage({type:'spotifySync', dst:'', folder:'L', tracks:[], total:0})")
     check("list check with no host fails loud (the popup then queues nothing)", [sy["ok"], "install.sh" in sy["output"]], [False, True])
     # "Download audio as MP3": two checkboxes (Spotify block + under Audio only), one sync key `mp3`, off by default
-    check("mp3 switch: present twice, off by default", pop.evaluate("() => [...document.querySelectorAll('input.mp3')].map(b => [b.id, b.checked])"), [["spMp3", False], ["siteMp3", False]])
-    check("mp3 switch: the Video tab one sits right after the Audio only button", pop.evaluate("() => document.getElementById('siteAudio').nextElementSibling.id"), "mp3Row")
+    check("mp3 switch: present twice, off by default", pop.evaluate("() => [...document.querySelectorAll('input.mp3')].map(b => [b.id, b.checked])"), [["siteMp3", False], ["spMp3", False]])
+    check("mp3 switch: the video-link one sits right after the Audio only button", pop.evaluate("() => document.getElementById('siteAudio').nextElementSibling.id"), "mp3Row")
     pop.evaluate("() => { const c = document.getElementById('siteMp3'); c.checked = true; c.dispatchEvent(new Event('change')); }")
     pop.wait_for_timeout(300)
     check("mp3 switch: persists to sync storage under `mp3`", pop.evaluate("async () => (await chrome.storage.sync.get({mp3: false})).mp3"), True)
@@ -281,15 +290,16 @@ with sync_playwright() as p:
 
     # ---- 0.1.44: developer log (ring buffer, redaction, forwarding to the host), visible failures, the Logs row
     pop.click("#tabTools"); pop.wait_for_timeout(200)
-    check("Logs row: Open log + Copy last 200 lines live on the Extra tools tab",
+    check("Logs row: Open log + Copy last 200 lines live in the Tools view",
           pop.evaluate("() => ['logOpen', 'logCopy'].map(id => document.getElementById(id).textContent)"), ["Open log", "Copy last 200 lines"])
     check("Logs row: the file's place is shown", pop.evaluate("() => document.getElementById('logPath').textContent"), "~/Library/Logs/Jownloader/jownloader.log")
     check("Logs row: the [hidden] rule is still in the popup CSS", pop.evaluate("() => [...document.styleSheets[0].cssRules].some(r => r.cssText.replace(/\\s+/g, ' ').includes('[hidden] { display: none !important; }'))"), True)
-    pop.click("#logOpen"); pop.wait_for_function("() => /install.sh|opened/.test(document.getElementById('status').textContent)", timeout=15000)
-    check("Open log with no host: says why, in the popup", "install.sh" in pop.evaluate("() => document.getElementById('status').textContent"), True)
-    pop.evaluate("() => { document.getElementById('status').textContent = ''; }")
-    pop.click("#logCopy"); pop.wait_for_function("() => /install.sh|copied/.test(document.getElementById('status').textContent)", timeout=15000)
-    check("Copy last 200 lines with no host: says why, in the popup", "install.sh" in pop.evaluate("() => document.getElementById('status').textContent"), True)
+    pop.click("#logOpen"); pop.wait_for_function("() => /install.sh|opened/i.test(document.getElementById('toolStatus').textContent)", timeout=15000)
+    check("Open log with no host: says why, in the popup", "install.sh" in pop.evaluate("() => document.getElementById('toolStatus').textContent"), True)
+    pop.evaluate("() => { document.getElementById('toolStatus').textContent = ''; }")
+    pop.click("#logCopy"); pop.wait_for_function("() => /install.sh|copied/i.test(document.getElementById('toolStatus').textContent)", timeout=15000)
+    check("Copy last 200 lines with no host: says why, in the popup", "install.sh" in pop.evaluate("() => document.getElementById('toolStatus').textContent"), True)
+    check("no host: the alert above the views says nothing can be saved, with the fix", pop.evaluate("async () => { await showDeps(); return [document.getElementById('alert').hidden, /install\\.sh/.test(document.getElementById('alertText').textContent)]; }"), [False, True])
     pop.click("#tabDl"); pop.wait_for_timeout(200)
 
     # ring buffer: newest 2000 kept in memory and in session storage (own key, byte cap), the page-hook cache untouched
@@ -348,22 +358,95 @@ with sync_playwright() as p:
     pr = pop.evaluate("async () => { for (let i = 0; i < 160; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active && p.total) return p; await new Promise(r => setTimeout(r, 250)); } return 'still active'; }")
     check("visible: a failed song is listed with its number, title and reason", [pr["done"], pr["failed"], pr["errors"]], [1, 1, ["song 6 Floaty: YouTube refused the download (format not available)."]])
     txt = pop.evaluate("(pr) => progressText(pr)", pr)
-    check("visible: all songs failed -> the popup ends on an error line, not a quiet 'saved'", [txt.splitlines()[0], txt.splitlines()[1]], ["✗ nothing was saved: the song failed", "✗ song 6 Floaty: YouTube refused the download (format not available)."])
+    check("visible: all songs failed -> the popup ends on an error line, not a quiet 'saved'", [txt.splitlines()[0], txt.splitlines()[1]], ["Nothing was saved: the song failed", "✗ song 6 Floaty: YouTube refused the download (format not available)."])
     check("visible: a Spotify run with failures raises a notification naming them and badges the icon", [sw.evaluate("() => __notes"), sw.evaluate("async () => await chrome.action.getBadgeText({})")], [[["Jownloader: no song was saved", "song 6 Floaty: YouTube refused the download (format not available)."]], "!"])
     lg = sw.evaluate("() => logRing.map((e) => `${e.l} ${e.a} ${e.m}`)")
     check("log: the run's verdict and the failure reason are in the log", [any(l.startswith("error job FAILED song 6 Floaty after") and "format not available" in l for l in lg), any(l.startswith("warn batch run finished: 0 saved, 1 failed of 1") for l in lg)], [True, True])
-    shown = pop.evaluate("""(pr) => { showProgress(pr); return [document.getElementById('status').textContent.split('\\n')[0], document.getElementById('status').classList.contains('warn')]; }""", pr)
-    check("visible: the failed run's status line is in the warning colour", shown, ["✗ nothing was saved: the song failed", True])
+    shown = pop.evaluate("""(pr) => { showProgress(pr); return [document.getElementById('runHead').textContent, document.getElementById('runHead').className, [...document.querySelectorAll('#runErrs li')].map(l => l.textContent), document.getElementById('stop').hidden, document.getElementById('runClose').hidden]; }""", pr)
+    check("visible: the failed run's headline is in the failure colour, the failure listed, Stop gone, dismiss shown", shown, ["Nothing was saved: the song failed", "bad", ["song 6 Floaty: YouTube refused the download (format not available)."], True, False])
     many = {"total": 9, "done": 9, "failed": 8, "bytes": 0, "active": 0, "where": "Downloads", "kind": "song", "error": "x", "errors": [f"song {i} T{i}: reason {i}" for i in range(1, 9)], "now": []}
     t2 = pop.evaluate("(pr) => progressText(pr)", many).splitlines()
-    check("visible: 1 saved of 9: head says so, the last 6 failures are listed, the older ones counted", [t2[0], t2[1], len(t2), t2[-1]], ["1 song saved → Downloads (8 failed) · 0.0 MB", "… 2 earlier failures (Extra tools → Logs)", 8, "✗ song 8 T8: reason 8"])
+    check("visible: 1 saved of 9: head says so, the last 6 failures are listed, the older ones counted", [t2[0], t2[1], len(t2), t2[-1]], ["8 of 9 songs failed", "… 2 earlier failures in the log (Tools → Open log)", 8, "✗ song 8 T8: reason 8"])
+    grp = pop.evaluate("""() => { showProgress({total: 9, done: 9, failed: 8, bytes: 0, active: 0, where: '', kind: 'song', error: 'x', now: [], crawl: null,
+        errors: [], fails: [...Array(7)].map((_, i) => ({who: 'song ' + (i + 1) + ' T' + (i + 1), why: 'YouTube refused the download'})).concat([{who: 'song 9 T9', why: 'no upload matches'}])});
+      return [document.getElementById('runHead').textContent, [...document.querySelectorAll('#runErrs li')].map(l => l.textContent), document.querySelector('#runErrs li').title.split('\\n').length]; }""")
+    check("failures sharing a reason are one line with a count; the rest keep their own line", grp, ["8 of 9 songs failed", ["7 songs: YouTube refused the download", "song 9 T9: no upload matches"], 7])
+    check("no host: the save rows and buttons are off (the alert says why)", pop.evaluate("() => ['imgs', 'coll', 'sitePdf', 'site'].map((id) => document.getElementById(id).disabled)"), [True, True, True, True])
     running = pop.evaluate("(pr) => progressText(pr)", {"total": 3, "done": 1, "failed": 1, "bytes": 0, "active": 1, "where": "Downloads", "kind": "song", "error": "", "errors": ["song 1 A: boom"], "now": ["song 2 B"]}).splitlines()
-    check("visible: while running: counts, failures so far and what is in flight", running, ["1 / 3 songs saved → Downloads (1 failed) · 0.0 MB", "✗ song 1 A: boom", "now: song 2 B"])
+    check("visible: while running: counts, failures so far and what is in flight", running, ["1 of 3 songs", "✗ song 1 A: boom", "Now: song 2 B"])
+    cells = pop.evaluate("""() => { showProgress({total: 6, done: 3, failed: 1, bytes: 0, active: 1, where: '/d/Shoot', kind: 'image', error: '', errors: ['file x.jpg: HTTP 403'], now: ['file y.jpg'], crawl: null});
+      return [[...document.querySelectorAll('#bar i')].map(i => i.className).join(''), document.getElementById('runMeta').textContent, document.getElementById('bar').getAttribute('aria-valuenow')]; }""")
+    check("the tally: a cell per file — saved, failed, in flight, waiting — and the folder in the dock", cells, ["ssfa", "Shoot1 failed", "3"])
+    stp = pop.evaluate("""() => { showProgress({total: 6, done: 2, failed: 0, bytes: 0, active: 0, where: '', kind: 'image', error: '', errors: [], now: [], crawl: null, stopped: true, notStarted: 3, cut: 1});
+      return [document.getElementById('runHead').textContent, [...document.querySelectorAll('#bar i')].map(i => i.className).join(','), document.getElementById('runMeta').textContent]; }""")
+    check("stopped: 'Stopped — n saved, m not started', the rest struck through, cut-off files named", stp, ["Stopped — 2 saved, 3 not started", "s,s,x,x,x,x", "Downloads1 cut off, partial file removed"])
     # a single-link engine save that fails shows its reason too
     sw.evaluate("""() => { saveEngineViaHost = async () => ({ ok: false, output: 'YouTube is blocking the download. Sign in to YouTube in this browser, then retry.' }); }""")
     pop.evaluate("async () => await chrome.runtime.sendMessage({type:'download', kind:'video', dest:'/d', prefix:'', items:[{url:'https://www.youtube.com/watch?v=single00001', engine:true, mode:'video'}]})")
     pr = pop.evaluate("async () => { for (let i = 0; i < 60; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active && p.total) return p; await new Promise(r => setTimeout(r, 250)); } return 'still active'; }")
     check("visible: a failed single-link save lists the page and the reason", [pr["failed"], pr["errors"], pr["error"]], [1, ["video youtube.com/watch?v=single00001: YouTube is blocking the download. Sign in to YouTube in this browser, then retry."], "YouTube is blocking the download. Sign in to YouTube in this browser, then retry."])
     sw.evaluate("() => { notify = __notify; saveEngineViaHost = __orig2; }")
+
+    # ---- 0.1.45: Stop. Queued jobs never start, in-flight fetches abort, engine jobs are cancelled in the host.
+    import threading, http.server, time as _t
+    hits = []
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            hits.append(self.path)
+            self.send_response(200); self.send_header("Content-Type", "image/jpeg"); self.send_header("Content-Length", "100000"); self.end_headers()
+            try: self.wfile.flush()
+            except Exception: return
+            for _ in range(600):           # never sends a byte: a fetch that only Stop can end
+                _t.sleep(0.1)
+        def log_message(self, *a): pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 9661), Slow); srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+    items = [{"url": f"http://127.0.0.1:9661/slow{i}.jpg"} for i in range(6)]
+    pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'image', dest:'/d', prefix:'', items})", items)
+    pop.wait_for_function("async () => (await chrome.runtime.sendMessage({type:'getProgress'})).now.length === 4", timeout=10000)
+    pop.wait_for_timeout(400)
+    st = pop.evaluate("async () => { const p = await chrome.runtime.sendMessage({type:'getProgress'}); return [p.active, p.total, p.now.length, await chrome.action.getBadgeText({})]; }")
+    check("stop: before — 4 in flight of 6, the badge counts what is left", st, [1, 6, 4, "6"])
+    check("stop: the dock shows Stop while it runs", pop.evaluate("() => [document.getElementById('run').hidden, document.getElementById('stop').hidden]"), [False, False])
+    t0 = _t.time()
+    pop.click("#stop")
+    pr = pop.evaluate("async () => { for (let i = 0; i < 40; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active) return p; await new Promise(r => setTimeout(r, 100)); } return 'still active'; }")
+    took = _t.time() - t0
+    check("stop: the run ends within 3 s (in-flight fetches aborted, not waited out)", took < 3, True)
+    check("stop: nothing saved, nothing failed, 6 not started (4 aborted before any byte, 2 never began)", [pr["stopped"], pr["done"], pr["failed"], pr["notStarted"], pr["cut"]], [True, 0, 0, 6, 0])
+    check("stop: the 2 queued files were never requested", sorted(hits), sorted(f"/slow{i}.jpg" for i in range(4)))
+    pop.wait_for_timeout(400)
+    check("stop: the popup shows 'Stopped — 0 saved, 6 not started', Stop gone", pop.evaluate("() => [document.getElementById('runHead').textContent, document.getElementById('stop').hidden]"), ["Stopped — 0 saved, 6 not started", True])
+    check("stop: the badge is cleared (nothing failed)", sw.evaluate("async () => await chrome.action.getBadgeText({})"), "")
+    lg = sw.evaluate("() => logRing.map((e) => `${e.l} ${e.a} ${e.m}`)")
+    check("stop: the log has the press and the verdict", [any(l.startswith("info stop Stop pressed") for l in lg), any("run stopped: 0 saved, 0 failed, 0 cut off, 6 not started of 6" in l for l in lg)], [True, True])
+    # an engine job: the host is asked to cancel that fetch id; the reply comes back stopped (fake port stands in for the host)
+    sw.evaluate("""() => { globalThis.__hostSent = []; globalThis.__origConnect = hostConnect;
+      hostConnect = () => ({ postMessage(m) { __hostSent.push(m); if (m.cmd === 'cancel') for (const j of m.jobs || []) { const w = hostWaiters.get(j); if (w) { hostWaiters.delete(j); w({ id: j, ok: false, stopped: true, output: 'stopped' }); } } } }); }""")
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'download', kind:'video', dest:'/d', prefix:'', items:[{url:'https://www.youtube.com/watch?v=stopme00001', engine:true, mode:'video'}]})")
+    pop.wait_for_function("async () => (await chrome.runtime.sendMessage({type:'getProgress'})).now.length === 1", timeout=5000)
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'stop'})")
+    pr = pop.evaluate("async () => { for (let i = 0; i < 40; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active) return p; await new Promise(r => setTimeout(r, 100)); } return 'still active'; }")
+    sent = sw.evaluate("() => __hostSent.map((m) => [m.cmd, m.jobs || null, m.id])")
+    fid = [m[2] for m in sent if m[0] == "fetch"]
+    check("stop: the engine fetch got a host cancel naming its id", [len(fid), [m[1] for m in sent if m[0] == "cancel"]], [1, [fid[:1]]])
+    check("stop: the engine job counts as cut off, not failed", [pr["stopped"], pr["cut"], pr["failed"], pr["notStarted"]], [True, 1, 0, 0])
+    # music list: the song waiting out the 20 s gap never starts, and the wait itself ends at once
+    sw.evaluate("""() => { hostConnect = __origConnect; globalThis.__songs = []; spotifyLast = 0;
+      globalThis.__orig3 = saveEngineViaHost; saveEngineViaHost = (url, mode, dest, fin, extra, sig) => new Promise((res) => { __songs.push(url);
+        const t = setTimeout(() => res({ ok: true, path: '' }), 30000); sig.addEventListener('abort', () => { clearTimeout(t); res({ ok: false, stopped: true, output: 'stopped', cut: true }); }); }); }""")
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+    pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'song', dest:'/d', prefix:'', items})", [song2(f"https://open.spotify.com/track/stop{i}", i + 1, f"S{i}") for i in range(3)])
+    pop.wait_for_timeout(800)
+    t0 = _t.time()
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'stop'})")
+    pr = pop.evaluate("async () => { for (let i = 0; i < 40; i++) { const p = await chrome.runtime.sendMessage({type:'getProgress'}); if (!p.active) return p; await new Promise(r => setTimeout(r, 100)); } return 'still active'; }")
+    check("stop (music list): one song started and was cut off, the two waiting their turn never started, no 20 s wait", [len(sw.evaluate("() => __songs")), pr["cut"], pr["notStarted"], pr["failed"], _t.time() - t0 < 3], [1, 1, 2, 0, True])
+    check("stop: Stop with nothing running answers idle", pop.evaluate("async () => await chrome.runtime.sendMessage({type:'stop'})"), {"ok": True, "idle": True})
+    pop.evaluate("async () => await chrome.runtime.sendMessage({type:'clearProgress'})")
+    check("dismiss: the verdict is put away", pop.evaluate("async () => (await chrome.runtime.sendMessage({type:'getProgress'})).total"), 0)
+    sw.evaluate("() => { saveEngineViaHost = __orig3; }")
+    srv.shutdown()
     ctx.close()
 print("ALL GREEN" if not fails else f"{fails} FAILED")

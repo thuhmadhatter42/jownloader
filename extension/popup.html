@@ -1,98 +1,190 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Jownloader</title>
-<style>
-  body { width: 300px; box-sizing: border-box; margin: 0; padding: 12px; font: 13px system-ui, sans-serif; color: #eee; background: #1c1c1e; }
-  body.panel { width: auto; min-height: 100vh; }
-  h1 { font-size: 14px; margin: 0 0 4px; display: flex; justify-content: space-between; align-items: center; }
-  h1 button { width: auto; margin: 0; padding: 3px 8px; font: 12px system-ui; background: #2a2a2d; border: 1px solid #444; color: #ccc; }
-  body.panel h1 button { display: none; }
-  .host { color: #999; font-size: 12px; margin-bottom: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  button { display: block; width: 100%; margin: 6px 0; padding: 9px; font: 600 13px system-ui; color: #fff; background: #2f6fed; border: 0; border-radius: 6px; cursor: pointer; }
-  button:disabled { background: #444; color: #888; cursor: default; }
-  [hidden] { display: none !important; }   /* button { display: block } above would otherwise beat the attribute */
-  label { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #333; }
-  label span small { display: block; color: #888; font-weight: normal; }
-  label select { font: 12px system-ui; color: #eee; background: #2a2a2d; border: 1px solid #444; border-radius: 6px; padding: 4px 6px; }
-  .row { display: flex; gap: 6px; margin-bottom: 4px; }
-  .row input { flex: 1; min-width: 0; padding: 7px 8px; font: 12px system-ui; color: #eee; background: #2a2a2d; border: 1px solid #444; border-radius: 6px; }
-  .row input::placeholder { color: #777; }
-  .row .dest { margin: 0; padding: 7px 8px; font: 12px system-ui; text-align: left; color: #eee; background: #2a2a2d; border: 1px solid #444; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .row button:not(.x):not(.dest) { flex: 1; margin: 0; }
-  .row .x { margin: 0; width: 32px; flex: none; padding: 7px 0; background: #2a2a2d; border: 1px solid #444; color: #ccc; }
-  .foot { text-align: right; margin-top: 4px; }
-  .link { display: inline; width: auto; margin: 0; padding: 2px 4px; font: 11px system-ui; color: #888; background: none; text-decoration: underline; }
-  .status { color: #9f9; min-height: 16px; margin-top: 6px; font-size: 12px; white-space: pre-line; }
-  .warn { color: #fc6; }
-  .bar { height: 8px; margin-top: 8px; background: #2a2a2d; border: 1px solid #444; border-radius: 5px; overflow: hidden; }
-  .bar div { height: 100%; width: 0; background: #2f6fed; transition: width .15s linear; }
-  .tabs { display: flex; gap: 4px; margin: 0 0 8px; border-bottom: 1px solid #333; }
-  .tabs { gap: 2px; }
-  .tabs button { width: auto; flex: 1; margin: 0; padding: 6px 2px; font: 600 11px system-ui; white-space: nowrap; color: #999; background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; }
-  .tabs button.on { color: #fff; border-bottom-color: #2f6fed; }
-  .opt { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 0; justify-content: flex-start; }
-  .opt input[type=radio] { margin: 0 4px 0 0; }
-  h2 { font-size: 12px; margin: 12px 0 4px; padding-top: 8px; border-top: 1px solid #333; color: #ccc; }
-  #paneTools h2:first-child { border-top: 0; margin-top: 2px; padding-top: 0; }
-  label.field input { width: 64px; flex: none; padding: 5px 6px; font: 12px system-ui; color: #eee; background: #2a2a2d; border: 1px solid #444; border-radius: 6px; }
-  label.field input:disabled { opacity: .45; }
-  .files { color: #999; font-size: 12px; margin: 4px 0; }
-</style></head>
+<html lang="en"><head><meta charset="utf-8"><meta name="color-scheme" content="light dark"><title>Jownloader</title>
+<link rel="stylesheet" href="popup.css"></head>
 <body>
-  <h1>Jownloader <button id="sidebar" title="open Jownloader as a sidebar that stays open while you browse">⧉ sidebar</button></h1>
-  <div class="host" id="host">scanning…</div>
-  <div class="row"><button id="dest" class="dest" title="Downloads">📁 Downloads</button><button id="destClear" class="x" title="back to Downloads" hidden>×</button></div>
-  <div id="spotify" hidden>
-    <button id="spGo" title="every song matched to its best upload, AAC saved as-is, tagged; one folder named after the list">Download this list as audio</button>
-    <div class="files">Also count songs in these folders as already downloaded:</div>
-    <div id="spLibs"></div>
-    <div class="row"><button id="spLibAdd" class="dest" title="a folder holding one sub-folder per list; songs found there are skipped, never copied">+ add a library folder…</button></div>
-    <label><span>BPM + key in the names<small>detected from the saved file (read-only), added to each song's name</small></span><input type="checkbox" id="spBpm"></label>
-    <label><span>Download audio as MP3<small>off = the AAC saved exactly as delivered (.m4a); on = converted to MP3 (V0), tagged</small></span><input type="checkbox" id="spMp3" class="mp3"></label>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.75 4.25a1 1 0 0 1 1-1h3.1l1.5 1.5h5.9a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H2.75a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="i-image" viewBox="0 0 16 16"><rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5"/><circle cx="5.5" cy="6.25" r="1.25"/><path d="m2.25 12 3.5-3.5 2.5 2.5 2-2 3.5 3.5"/></symbol>
+  <symbol id="i-video" viewBox="0 0 16 16"><rect x="1.75" y="3.25" width="9" height="9.5" rx="1.5"/><path d="m10.75 6.5 3.5-2v7l-3.5-2"/></symbol>
+  <symbol id="i-doc" viewBox="0 0 16 16"><path d="M3.75 1.75h5.5l3 3v9.5h-8.5z"/><path d="M9.25 1.75v3h3M5.75 8.25h4.5M5.75 10.75h4.5"/></symbol>
+  <symbol id="i-stack" viewBox="0 0 16 16"><rect x="3.75" y="4.75" width="10.5" height="8.5" rx="1.25"/><path d="M1.75 11V3.25a1 1 0 0 1 1-1h8.5"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25"/><path d="M6.75 5.5v5l4-2.5z"/></symbol>
+  <symbol id="i-music" viewBox="0 0 16 16"><path d="M6 12.25V3.5l7.25-1.5v8.75"/><circle cx="4.25" cy="12.25" r="1.75"/><circle cx="11.5" cy="10.75" r="1.75"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 16 16"><rect x="1.75" y="2.75" width="12.5" height="10.5" rx="1.5"/><path d="M10 2.75v10.5"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2 1.75 13.25h12.5z"/><path d="M8 6.5v3M8 11.25v.01"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 16 16"><path d="m6 3.5 4.5 4.5L6 12.5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="m4.5 4.5 7 7M11.5 4.5l-7 7"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3.5v9M3.5 8h9"/></symbol>
+</svg>
+<div class="wrap">
+  <header>
+    <img src="icon128.png" alt="">
+    <span class="name">Jownloader</span>
+    <span class="host" id="host">reading this page…</span>
+    <button id="sidebar" class="btn quiet icon" title="Open in the side panel (stays open while you browse)" aria-label="Open in the side panel"><svg class="i"><use href="#i-panel"/></svg></button>
+  </header>
+
+  <div class="dest">
+    <span class="lbl" id="destLbl">Save to</span>
+    <button id="dest" class="btn" aria-describedby="destLbl" title="Downloads (click to choose a folder)"><svg class="i"><use href="#i-folder"/></svg><span id="destName">Downloads</span></button>
+    <button id="destClear" class="btn quiet icon" title="Back to Downloads" aria-label="Back to Downloads" hidden><svg class="i"><use href="#i-x"/></svg></button>
   </div>
-  <div class="tabs"><button id="tabDl" class="on">Video / Images</button><button id="tabPdf">PDF</button><button id="tabTools">Extra tools</button></div>
-  <div id="paneDl">
-  <div class="row"><input id="prefix" placeholder="name → name_1, _2… ([yy-mm-dd] = upload date)"></div>
-  <button id="site" hidden>Download from this page</button>
-  <button id="siteAudio" hidden title="the audio as delivered (AAC .m4a), BPM and key detected and put in the name">Audio only + BPM/key</button>
-  <label id="mp3Row" hidden><span>Download audio as MP3<small>off = the AAC saved exactly as delivered (.m4a); on = converted to MP3 (V0)</small></span><input type="checkbox" id="siteMp3" class="mp3"></label>
-  <button id="imgs" disabled>Download all images</button>
-  <button id="vids" disabled>Download all videos</button>
-  <div class="row"><button id="coll" disabled>Download collected (0)</button><button id="collClear" class="x" title="forget the collected list" hidden>×</button></div>
-  <label><span>Collect as I scroll<small>every picture shown on screen is remembered; thumbnails ignored</small></span><input type="checkbox" id="collect"></label>
-  <label><span>Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos"></label>
-  <label><span>Button on videos<small>⬇ overlay top-left of every player, shows the quality it will grab</small></span><input type="checkbox" id="showButton"></label>
+
+  <div class="alert" id="alert" role="alert" hidden>
+    <svg class="i"><use href="#i-warn"/></svg>
+    <div class="txt" id="alertText"></div>
+    <button class="btn" id="alertInstall" hidden>Install</button>
   </div>
-  <div id="panePdf" hidden>
-  <div class="opt"><label class="opt"><input type="radio" name="crawl" value="page" checked>This page only</label></div>
-  <div class="opt"><label class="opt"><input type="radio" name="crawl" value="site">Follow links on this site</label></div>
-  <label class="field" for="sitePages"><span>Max pages<small>how many pages to save when following links</small></span><input id="sitePages" type="number" min="1" value="50" disabled></label>
-  <button id="sitePdf" hidden>Save site as PDF</button>
-  <button id="siteMd" hidden>Save site as Markdown</button>
-  <button id="docs" disabled>Download all documents</button>
+
+  <div class="seg" role="tablist" aria-label="Views">
+    <button id="tabDl" class="on" role="tab" aria-selected="true" aria-controls="paneDl">This page</button>
+    <button id="tabPdf" role="tab" aria-selected="false" aria-controls="panePdf" tabindex="-1">PDF / Markdown</button>
+    <button id="tabTools" role="tab" aria-selected="false" aria-controls="paneTools" tabindex="-1">Tools</button>
   </div>
-  <div id="paneTools" hidden>
-  <h2>Batch rename</h2>
-  <div class="row"><input id="rnName" placeholder="name → name_1, _2… ([yy-mm-dd] = file date)"></div>
-  <div class="row"><button id="rnPick">Select files…</button><button id="rnClear" class="x" title="forget the selected files" hidden>×</button></div>
-  <div class="files" id="rnFiles">no files selected</div>
-  <label class="opt"><input type="checkbox" id="rnMove"><span>Move the files?</span></label>
-  <div class="row"><button id="rnDest" class="dest" disabled title="choose a folder">📁 destination</button><button id="rnDestClear" class="x" title="clear the destination" hidden>×</button></div>
-  <div class="opt"><label class="opt"><input type="radio" name="rnMode" value="move" checked disabled>move</label><label class="opt"><input type="radio" name="rnMode" value="copy" disabled>copy</label></div>
-  <button id="rnGo" disabled>Rename</button>
-  <h2>Strip metadata and WebP conversion</h2>
-  <div class="row"><button id="rnStrip" disabled title="remove all metadata from the selected files, in place">Strip metadata</button><button id="rnWebp" disabled title="convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button><button id="rnPng" disabled title="convert the selected .webp files to .png (originals removed)">WebP → PNG</button></div>
-  <label><span>Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip"></label>
-  <label><span>Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
-  <h2>Logs</h2>
-  <div class="files" id="logPath" title="the host, the engine and the extension all write here">~/Library/Logs/Jownloader/jownloader.log</div>
-  <div class="row"><button id="logOpen" title="open the log file in TextEdit">Open log</button><button id="logCopy" title="copy the last 200 lines to the clipboard">Copy last 200 lines</button></div>
-  <div class="files" id="deps">Dependencies: checking…</div>
-  <div class="files" id="depsWhy" style="white-space:pre-line" hidden></div>
-  <button id="depsInstall" hidden>Install missing dependencies</button>
+
+  <!-- ===================== This page ===================== -->
+  <div id="paneDl" role="tabpanel" aria-labelledby="tabDl">
+    <div class="sec" id="engineCard" hidden>
+      <div class="group ctx">
+        <div class="head"><svg class="i"><use href="#i-play"/></svg><span id="engineName">Video link</span></div>
+        <button id="site" class="btn primary block tall" hidden>Save this video</button>
+        <button id="siteAudio" class="btn block" hidden title="The audio as delivered (AAC .m4a), BPM and key detected and put in the name">Audio only, with BPM and key</button>
+        <label class="line" id="mp3Row" hidden style="padding:2px 0;min-height:30px"><span class="t">Save audio as MP3<small>Off: the AAC exactly as delivered (.m4a). On: converted to MP3 (V0).</small></span><input type="checkbox" id="siteMp3" class="mp3 sw" role="switch"></label>
+      </div>
+    </div>
+
+    <div class="sec" id="spotify" hidden>
+      <div class="group ctx">
+        <div class="head"><svg class="i"><use href="#i-music"/></svg><span id="spName">Music list</span><span class="sub" id="spSub"></span></div>
+        <button id="spGo" class="btn primary block tall" title="Every song matched to its best upload, saved as-is and tagged, in one folder named after the list">Download this list as audio</button>
+        <label class="line" style="padding:2px 0;min-height:30px"><span class="t">BPM and key in the names<small>Detected from the saved file and added to each song's name</small></span><input type="checkbox" id="spBpm" class="sw" role="switch"></label>
+        <label class="line" style="padding:2px 0;min-height:30px"><span class="t">Save audio as MP3<small>Off: the AAC exactly as delivered (.m4a). On: MP3 (V0), tagged.</small></span><input type="checkbox" id="spMp3" class="mp3 sw" role="switch"></label>
+        <div class="note">Songs already in these folders count as downloaded:</div>
+        <div class="libs" id="spLibs"></div>
+        <button id="spLibAdd" class="btn quiet" style="align-self:flex-start" title="A folder holding one sub-folder per list; songs found there are skipped, never copied"><svg class="i"><use href="#i-plus"/></svg>Add a library folder…</button>
+      </div>
+    </div>
+
+    <div class="sec">
+      <h2 id="saveHead">Save from this page</h2>
+      <div class="group rows" role="group" aria-labelledby="saveHead">
+        <button id="imgs" class="item" disabled><svg class="i"><use href="#i-image"/></svg><span class="t">Images</span><span class="n">–</span><span class="go">Save</span></button>
+        <button id="vids" class="item" disabled><svg class="i"><use href="#i-video"/></svg><span class="t">Videos</span><span class="n">–</span><span class="go">Save</span></button>
+        <button id="docs" class="item" disabled><svg class="i"><use href="#i-doc"/></svg><span class="t">Documents</span><span class="n">–</span><span class="go">Save</span></button>
+        <div class="item-wrap">
+          <button id="coll" class="item" disabled title="Pictures remembered while you scrolled (turn on Collect as I scroll below)"><svg class="i"><use href="#i-stack"/></svg><span class="t">Collected</span><span class="n">0</span><span class="go">Save</span></button>
+          <button id="collClear" class="x" title="Forget the collected list" aria-label="Forget the collected list" hidden><svg class="i"><use href="#i-x"/></svg></button>
+        </div>
+      </div>
+      <div class="status" id="status" role="status"></div>
+    </div>
+
+    <div class="sec">
+      <h2><label for="prefix">File names</label></h2>
+      <input id="prefix" placeholder="Original names — or type one: name_1, name_2…" aria-describedby="prefixHelp">
+      <div class="note" id="prefixHelp" style="margin:5px 2px 0">[yy-mm-dd] in the name becomes each file's date.</div>
+    </div>
+
+    <details id="browseBox">
+      <summary><svg class="i chev"><use href="#i-chev"/></svg>While browsing<span class="sum" id="browseSum"></span></summary>
+      <label class="line"><span class="t">Collect as I scroll<small>every picture shown on screen is remembered; thumbnails ignored</small></span><input type="checkbox" id="collect" class="sw" role="switch"></label>
+      <label class="line"><span class="t">Auto-download every video<small>on every page, as they appear or play</small></span><input type="checkbox" id="autoVideos" class="sw" role="switch"></label>
+      <label class="line"><span class="t">Button on videos<small>a download button on every player, showing the quality it will save</small></span><input type="checkbox" id="showButton" class="sw" role="switch"></label>
+    </details>
+    <details id="finishBox">
+      <summary><svg class="i chev"><use href="#i-chev"/></svg>Finishing<span class="sum" id="finishSum"></span></summary>
+      <label class="line"><span class="t">Strip metadata<small>EXIF, GPS, XMP and the rest removed from every file saved</small></span><input type="checkbox" id="strip" class="sw" role="switch"></label>
+      <label class="line"><span class="t">Convert WebP<small>every .webp saved becomes a .jpg (quality 100) or a .png</small></span><select id="webp"><option value="">Keep</option><option value="jpg">JPEG</option><option value="png">PNG</option></select></label>
+    </details>
   </div>
-  <div class="foot"><button id="forget" class="link" title="every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
-  <div class="bar" id="bar" hidden><div id="fill"></div></div>
-  <div class="status" id="status"></div>
-  <script src="popup.js"></script>
-  <script src="spotify.js"></script>
+
+  <!-- ===================== PDF / Markdown ===================== -->
+  <div id="panePdf" role="tabpanel" aria-labelledby="tabPdf" hidden>
+    <div class="sec">
+      <h2 id="crawlHead">What to save</h2>
+      <div class="group" role="radiogroup" aria-labelledby="crawlHead">
+        <label class="choice"><input type="radio" name="crawl" value="page" checked>This page only</label>
+        <label class="choice"><input type="radio" name="crawl" value="site">Follow links on this site</label>
+        <label class="line" for="sitePages"><span class="t">Max pages<small>how many pages to save when following links</small></span><input id="sitePages" type="number" min="1" value="50" disabled></label>
+      </div>
+    </div>
+    <div class="row-btns">
+      <button id="sitePdf" class="btn primary tall" hidden>Save as PDF</button>
+      <button id="siteMd" class="btn tall" hidden>Save as Markdown</button>
+    </div>
+    <div class="status" id="pdfStatus" role="status"></div>
+    <div class="note" id="pdfNone" style="margin:8px 2px 0" hidden>Only web pages (http/https) can be saved as PDF or Markdown.</div>
+    <div class="note" style="margin:8px 2px 0">Pages are rendered in a background tab and merged into one file, named after the first page.</div>
+  </div>
+
+  <!-- ===================== Tools ===================== -->
+  <div id="paneTools" role="tabpanel" aria-labelledby="tabTools" hidden>
+    <div class="sec">
+      <h2>Rename files</h2>
+      <div class="group">
+        <div class="line stack">
+          <input id="rnName" placeholder="New name: trip → trip_1, trip_2…" aria-label="New name ([yy-mm-dd] becomes each file's date)" title="[yy-mm-dd] in the name becomes each file's date">
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="rnPick" class="btn">Select files…</button>
+            <span class="note" id="rnFiles" style="flex:1;min-width:0">no files selected</span>
+            <button id="rnClear" class="btn quiet icon" title="Forget the selected files" aria-label="Forget the selected files" hidden><svg class="i"><use href="#i-x"/></svg></button>
+          </div>
+        </div>
+        <label class="line"><span class="t">Move them to another folder</span><input type="checkbox" id="rnMove" class="sw" role="switch"></label>
+        <div class="line">
+          <button id="rnDest" class="btn" disabled title="choose a folder" style="flex:1;min-width:0;justify-content:flex-start"><svg class="i"><use href="#i-folder"/></svg><span id="rnDestName">Destination</span></button>
+          <button id="rnDestClear" class="btn quiet icon" title="Clear the destination" aria-label="Clear the destination" hidden><svg class="i"><use href="#i-x"/></svg></button>
+          <div class="choices-inline" role="radiogroup" aria-label="Move or copy"><label><input type="radio" name="rnMode" value="move" checked disabled>move</label><label><input type="radio" name="rnMode" value="copy" disabled>copy</label></div>
+        </div>
+        <div class="pad"><button id="rnGo" class="btn primary block" disabled>Rename</button></div>
+      </div>
+    </div>
+    <div class="sec">
+      <h2>Clean up the selected files</h2>
+      <div class="row-btns">
+        <button id="rnStrip" class="btn" disabled title="Remove all metadata from the selected files, in place">Strip metadata</button>
+        <button id="rnWebp" class="btn" disabled title="Convert the selected .webp files to .jpg (originals removed)">WebP → JPEG</button>
+        <button id="rnPng" class="btn" disabled title="Convert the selected .webp files to .png (originals removed)">WebP → PNG</button>
+      </div>
+    </div>
+    <div class="sec">
+      <h2>Dependencies</h2>
+      <div class="group">
+        <div class="pad">
+          <div id="deps">checking…</div>
+          <div class="note" id="depsWhy" style="white-space:pre-line;margin-top:6px" hidden></div>
+          <button id="depsInstall" class="btn primary" style="margin-top:8px" hidden>Install missing dependencies</button>
+        </div>
+      </div>
+    </div>
+    <div class="sec">
+      <h2>Log</h2>
+      <div class="group">
+        <div class="pad">
+          <div class="note" id="logPath" title="the host, the engine and the extension all write here">~/Library/Logs/Jownloader/jownloader.log</div>
+          <div class="row-btns" style="margin-top:8px"><button id="logOpen" class="btn" title="Open the log file in TextEdit">Open log</button><button id="logCopy" class="btn" title="Copy the last 200 lines to the clipboard">Copy last 200 lines</button></div>
+        </div>
+      </div>
+    </div>
+    <div class="status" id="toolStatus" role="status"></div>
+    <div class="foot"><span id="savedNote">Saved files are skipped while they are still in their folder.</span><button id="forget" class="link" title="Every URL saved so far is skipped while its file is still in its folder; this wipes that memory">forget saved (0)</button></div>
+  </div>
+</div>
+
+<section class="dock" id="run" aria-labelledby="runHead" hidden>
+  <div class="top">
+    <div class="hd">
+      <div id="runHead"></div>
+      <div id="runMeta"></div>
+    </div>
+    <button id="stop" class="btn stop" title="Stop: nothing new starts, files in flight are cut off and removed, finished files stay"><span class="sq"></span>Stop</button>
+    <button id="runClose" class="btn quiet icon" title="Dismiss" aria-label="Dismiss" hidden><svg class="i"><use href="#i-x"/></svg></button>
+  </div>
+  <div class="bar" id="bar" role="progressbar" aria-label="Files in this run" aria-valuemin="0"><div id="fill"></div></div>
+  <div id="runNow"></div>
+  <ul id="runErrs" aria-label="Failures"></ul>
+  <div class="sr" id="runSay" aria-live="polite"></div>
+</section>
+<script src="popup.js"></script>
+<script src="spotify.js"></script>
 </body></html>

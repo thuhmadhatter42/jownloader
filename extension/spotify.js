@@ -4,7 +4,7 @@
 (() => {
   const SP = /^https?:\/\/open\.spotify\.com\/(?:intl-[a-z]{2,5}(?:-[a-z]{2,4})?\/)?(track|album|playlist|artist)\/[A-Za-z0-9]+/i;
   const el = (id) => document.getElementById(id);
-  const say = (t) => { el("status").textContent = t; };
+  const say = (t, tone) => { if (typeof globalThis.say === "function") globalThis.say(t, tone); else el("status").textContent = t; };   // the popup's status line (popup.js); alone, the bare element
   const plog = (...a) => { if (typeof jlog === "function") jlog(...a); };   // the developer log (popup.js); absent when this file runs alone
   let list = null, tabId = null;
 
@@ -16,9 +16,10 @@
   function showLibs(libs) {
     el("spLibs").textContent = "";
     for (const lib of libs) {
-      const row = document.createElement("div"); row.className = "row";
-      const name = document.createElement("button"); name.className = "dest"; name.disabled = true; name.textContent = "📚 " + libName(lib); name.title = lib;
-      const x = document.createElement("button"); x.className = "x"; x.textContent = "×"; x.title = "stop counting this folder";
+      const row = document.createElement("div"); row.className = "lib";
+      const name = document.createElement("span"); name.textContent = libName(lib); name.title = lib;
+      const x = document.createElement("button"); x.className = "x"; x.title = "Stop counting this folder"; x.setAttribute("aria-label", "Stop counting " + libName(lib));
+      x.innerHTML = '<svg class="i" aria-hidden="true"><use href="#i-x"/></svg>';
       x.onclick = () => chrome.storage.sync.set({ spotifyLibs: libs.filter((l) => l !== lib) });
       row.append(name, x); el("spLibs").append(row);
     }
@@ -38,15 +39,17 @@
     if (!SP.test(tab?.url || "")) return;
     tabId = tab.id;
     el("spotify").hidden = false;
-    el("spGo").textContent = label(); el("spGo").disabled = true;
+    el("spGo").textContent = "Reading the list…"; el("spGo").disabled = true;
     list = await chrome.runtime.sendMessage({ type: "spotifyList", url: tab.url }).catch(() => null);
-    if (!list?.ok) { say(list?.output || "native host not reachable — run native/install.sh"); plog("error", "spotify", "list failed: " + (list?.output || "host not reachable")); list = null; return; }
+    if (!list?.ok) { el("spGo").textContent = label(); say(list?.output || "native host not reachable — run native/install.sh", "warn"); plog("error", "spotify", "list failed: " + (list?.output || "host not reachable")); list = null; return; }
+    el("spName").textContent = list.name || "Music list"; el("spName").title = list.name || "";
     plog("info", "spotify", `list shown: ${list.kind} "${list.name}", ${list.tracks.length} song(s)${list.truncated ? " (may be cut short)" : ""}`);
     if (list.truncated && list.kind === "playlist") {     // exactly 100 songs is not "100+": ask the open page how many it has
       const n = await chrome.tabs.sendMessage(tabId, { type: "spotifyCount" }).catch(() => null);
       if (Number.isInteger(n) && n <= list.tracks.length) list.truncated = false;
     }
     el("spGo").textContent = label(); el("spGo").disabled = false;
+    el("spSub").textContent = { track: "Song", album: "Album", playlist: "Playlist", artist: "Artist" }[list.kind] || "";
     if (list.note) say(list.note);
   }
 

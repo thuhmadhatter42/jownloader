@@ -18,6 +18,7 @@ Rules the whole log follows:
   - every subprocess is logged by run(): full argv, cwd, return code, duration, the tail of its output
   - a logging failure never breaks the host: this module swallows its own errors
 """
+import contextlib
 import fcntl
 import json
 import logging
@@ -25,6 +26,7 @@ import logging.handlers
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -230,26 +232,198 @@ def exec_done(log, cmd, rc, t0, out="", err="", note="", ok_tail=5):
         tail_block(log, lvl, "stdout", out, n, 1000 if rc else 300)
 
 
+# ------------------------------------------------------------------------------------------- jobs / cancel
+# One mechanism for Stop: a fetch runs as a "job" (its request id). Every subprocess it starts (yt-dlp, gallery-dl,
+# ffmpeg, the analyzer ...) is launched by popen() below in its OWN session, so a cancel can signal the whole process
+# group, children included, and is registered on the job. A cancelled job starts nothing new: popen() refuses, and the
+# engine's retry loops ask cancelled(). Partial files are removed by the job's cleanup callbacks (see engine.py).
+class Stopped(Exception):
+    """popen() refused to start a process: the current job was cancelled."""
+
+
+class Job:
+    def __init__(self, jid):
+        self.id = jid
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
+        self.procs = set()
+        self.cleanups = []      # callables () -> [removed paths]; run once the job's processes are gone
+        self.stems = []         # output-name stems this job writes (so another job's sweep leaves them alone)
+        self.keep = set()       # finished files, never swept
+        self.t0 = time.time()
+
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+_tls = threading.local()
+KILL_GRACE = 3.0                # seconds between SIGTERM and SIGKILL of a cancelled job's process group
+
+
+def register_job(jid):
+    """The job for this request id (created on first call). The host registers it in its reader thread, before the
+    worker thread starts, so a cancel that follows at once always finds it."""
+    with JOBS_LOCK:
+        j = JOBS.get(jid)
+        if j is None:
+            j = JOBS[jid] = Job(jid)
+        return j
+
+
+@contextlib.contextmanager
+def job(jid):
+    """Bind the current thread to the job `jid` (None = an unregistered job nobody can cancel)."""
+    j = register_job(jid) if jid is not None else Job(None)
+    _tls.job = j
+    try:
+        yield j
+    finally:
+        _tls.job = None
+        with JOBS_LOCK:
+            if jid is not None and JOBS.get(jid) is j:
+                del JOBS[jid]
+
+
+def current_job():
+    return getattr(_tls, "job", None)
+
+
+def cancelled():
+    j = current_job()
+    return bool(j and j.cancelled.is_set())
+
+
+def on_cleanup(fn):
+    j = current_job()
+    if j:
+        j.cleanups.append(fn)
+
+
+def keep_file(path):
+    """A finished file of the current job: a cancel never sweeps it."""
+    j = current_job()
+    if j:
+        j.keep.add(os.path.abspath(str(path)))
+
+
+def other_stems(j):
+    with JOBS_LOCK:
+        return [st for o in JOBS.values() if o is not j for st in o.stems]
+
+
+def run_cleanups(j):
+    """Remove the job's partial files (after its processes are gone). Returns the paths removed."""
+    removed = []
+    for fn in list(j.cleanups):
+        try:
+            removed += fn() or []
+        except Exception:
+            logging.getLogger("jownloader.jobs").exception("cleanup for job %s raised", j.id)
+    return removed
+
+
+def _signal_group(pid, sig):
+    try:
+        os.killpg(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _escalate(pid):
+    time.sleep(KILL_GRACE)
+    _signal_group(pid, signal.SIGKILL)      # stragglers of the group that ignored SIGTERM (no-op if it is empty)
+
+
+def kill_proc(p, grace=KILL_GRACE):
+    """SIGTERM p's whole process group; SIGKILL whatever is left after `grace` s. True when a signal was sent."""
+    if p.poll() is not None and not _signal_group(p.pid, 0):
+        return False
+    sent = _signal_group(p.pid, signal.SIGTERM)
+    threading.Thread(target=_escalate, args=(p.pid,), daemon=True).start()
+    return sent
+
+
+def cancel_job(jid, log=None):
+    """Mark job `jid` cancelled and kill its processes. Returns (found, [pids signalled])."""
+    with JOBS_LOCK:
+        j = JOBS.get(jid)
+    if j is None:
+        return False, []
+    j.cancelled.set()
+    with j.lock:
+        procs = list(j.procs)
+    pids = []
+    for p in procs:
+        if kill_proc(p):
+            pids.append(p.pid)
+            if log:
+                log.info("cancel job=%s: killed pid %d (process group, SIGKILL in %gs if still alive)", jid, p.pid, KILL_GRACE)
+    return True, pids
+
+
+def running_jobs():
+    with JOBS_LOCK:
+        return list(JOBS)
+
+
+def popen(cmd, **kw):
+    """subprocess.Popen in its own session, registered on the current job. Raises Stopped when the job was cancelled."""
+    j = current_job()
+    if j and j.cancelled.is_set():
+        raise Stopped()
+    p = subprocess.Popen(cmd, start_new_session=True, **kw)
+    if j:
+        with j.lock:
+            j.procs.add(p)
+            late = j.cancelled.is_set()
+        if late:                    # the cancel landed between the check and the registration
+            kill_proc(p)
+    return p
+
+
+def release(p):
+    j = current_job()
+    if j:
+        with j.lock:
+            j.procs.discard(p)
+
+
 def run(cmd, log, timeout=None, cwd=None, input=None, env=None, ok_tail=5):
     """subprocess.run(capture_output, text) with the full log. Returns (returncode, stdout, stderr); never raises:
     a command that cannot start or times out is rc 1 with the reason in stderr. ok_tail = how many output lines of a
-    successful run are logged (a failure always logs 30)."""
+    successful run are logged (a failure always logs 30). A cancelled job's command is not started (rc 1, "stopped")
+    and one already running is killed with its children (see cancel_job)."""
     t0 = exec_start(log, cmd, cwd, timeout)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, input=input, env=env)
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout.decode("utf-8", "replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = e.stderr.decode("utf-8", "replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
-        exec_done(log, cmd, 1, t0, out, err, f"TIMED OUT after {timeout}s")
-        return 1, out, (err + "\n" if err else "") + f"timed out after {timeout}s"
+        p = popen(cmd, stdin=subprocess.PIPE if input is not None else None, stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE, text=True, cwd=cwd, env=env)
+    except Stopped:
+        exec_done(log, cmd, 1, t0, "", "stopped", "not started: the job was stopped")
+        return 1, "", "stopped"
     except (OSError, subprocess.SubprocessError) as e:
         exec_done(log, cmd, 1, t0, "", str(e), "could not start")
         return 1, "", str(e)
-    exec_done(log, cmd, p.returncode, t0, p.stdout, p.stderr, ok_tail=ok_tail)
-    return p.returncode, p.stdout, p.stderr
+    try:
+        try:
+            out, err = p.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _signal_group(p.pid, signal.SIGKILL)
+            out, err = p.communicate()
+            out, err = out or "", err or ""
+            exec_done(log, cmd, 1, t0, out, err, f"TIMED OUT after {timeout}s")
+            return 1, out, (err + "\n" if err else "") + f"timed out after {timeout}s"
+        except (OSError, subprocess.SubprocessError) as e:
+            _signal_group(p.pid, signal.SIGKILL)
+            exec_done(log, cmd, 1, t0, "", str(e), "could not run")
+            return 1, "", str(e)
+    finally:
+        release(p)
+    if cancelled():
+        _signal_group(p.pid, signal.SIGKILL)        # a cancelled job leaves no group member behind
+    exec_done(log, cmd, p.returncode, t0, out, err, "stopped" if cancelled() else "", ok_tail=ok_tail)
+    return p.returncode, out, err
 
 
-# ------------------------------------------------------------------------------------- native messages
 def _short(v, n=200):
     return _trunc(repr(v) if not isinstance(v, str) else v, n)
 

@@ -18,27 +18,35 @@ you already have.
   (from the page markup), else the page's date, else today.
 - **Never twice** — every saved URL is remembered and skipped while its file is still in its
   folder. Trash the file and it downloads again. Nothing is ever overwritten (`name (2).ext`).
-- **Batch rename** tab — forgot the prefix? Type it, pick the files in one Finder dialog, and they
+- **Rename files** (Tools) — forgot the prefix? Type it, pick the files in one Finder dialog, and they
   become `trip_1.mp4, trip_2.mp4 …` (oldest first, numbering continues where that folder's downloads
-  left off; `[date]` tokens take each file's modification date). Tick *Move the files?* to send them
+  left off; `[date]` tokens take each file's modification date). Switch on *Move them to another folder* to send them
   to another folder instead, moved or copied. Nothing is ever overwritten.
-- **Popup or side panel** — the panel stays open and rescans as you browse.
+- **Popup or side panel** — the panel stays open and rescans as you browse. One page, three views:
+  *This page* (what the page offers, with counts, plus the finishing switches), *PDF / Markdown* and *Tools*;
+  the folder everything lands in is always shown at the top.
+- **Stop** — whatever is running (a batch, a Spotify list, a site crawl, a stream) has a Stop button in the
+  run panel at the bottom of the popup and the side panel. Nothing new starts, files in flight are cut off and
+  their partial files removed (the host kills a running yt-dlp / gallery-dl / ffmpeg), finished files stay:
+  *Stopped — 12 saved, 30 not started*. Running again skips what was saved.
+- **One running view** — n of m, a cell per file (saved, failed, in flight, waiting), what is downloading
+  now, and every failure with its reason; the toolbar badge counts the files still to go.
 - **Uses your login** — files are fetched by the browser itself, so anything you can see, it can save.
 - **Streams too** — an HLS / DASH player (`.m3u8` / `.mpd`) is saved as one `.mp4`: best variant, segments
   fetched in order with your session, joined by `ffmpeg` (without it the raw tracks are kept and the
   popup says so). Clear-key AES-128 HLS is handled; DRM is refused.
-- **YouTube, Instagram, Twitter/X** — on those pages the button reads *Download this video / this post /
+- **YouTube, Instagram, Twitter/X** — on those pages the button reads *Save this video / this post /
   everything from @name* and the whole thing comes down through the site's own API with your browser
   session: YouTube as H.264 + AAC `.mp4` (QuickTime-native), or *Audio only*: the upload's AAC
   saved exactly as delivered (`.m4a`, never re-encoded; Opus stays `.opus`), with the BPM and top-3 keys
-  detected and written into the name (`Song (128.0 BPM Am C F).m4a`) — switch on **Download audio as MP3**
-  (right under the button, and in the Spotify block) to get an MP3 (V0) instead; an Instagram post,
+  detected and written into the name (`Song (128.0 BPM Am C F).m4a`) — switch on **Save audio as MP3**
+  (right under the button, and on the Spotify card) to get an MP3 (V0) instead; an Instagram post,
   reel or carousel, or a whole profile (posts, reels, highlights, avatar) into `<username>/`, 1080p
   video converted from VP9 to H.264; a tweet's media or a user's media timeline into `<name>/`.
 - **Strip metadata** switch — EXIF, GPS, XMP and every other tag removed from each file as it is saved
   (images via exiftool, audio and video via ffmpeg, streams copied not re-encoded).
 - **Convert WebP** switch — every `.webp` saved becomes a `.jpg` at quality 100, or a `.png`.
-  Both are also actions in the Batch tab for files already on disk.
+  Both are also actions in Tools → *Clean up the selected files* for files already on disk.
 
 ## Spotify links → tagged audio
 
@@ -50,7 +58,7 @@ the upload carries it — AAC in `.m4a`, never re-encoded (if an upload only has
 `.opus`). Files land in one folder per list: `<destination>/<list name>/NN - Artists - Title.m4a`, tagged
 with title, artist, album, track number, release year and the song's own album art. A song nothing
 matches is reported by name and the rest carry on. Songs are fetched one at a time, 20 s apart.
-With **Download audio as MP3** on, songs are converted to MP3 (V0) and tagged with ID3 (title, artist,
+With **Save audio as MP3** on, songs are converted to MP3 (V0) and tagged with ID3 (title, artist,
 album, track, year, cover) as `.mp3` instead; the switch is shared with the *Audio only* button.
 
 - A playlist longer than the embed page's 100 songs is read off the open page by scrolling it.
@@ -160,7 +168,7 @@ was rejected).
 ~/Library/Logs/Jownloader/jownloader.log      (5 files of 5 MB: jownloader.log, .1 … .5)
 ```
 
-- Extra tools → **Logs** in the popup: **Open log** opens the file in TextEdit, **Copy last 200 lines**
+- Tools → **Log** in the popup: **Open log** opens the file in TextEdit, **Copy last 200 lines**
   puts the tail on the clipboard (paste it into a bug report).
 - The level is `debug` by default. Quiet it with `JOWN_LOG=info` (or `warning`, `error`) in the
   environment the host starts with, for example `launchctl setenv JOWN_LOG info` and then restart the browser.
