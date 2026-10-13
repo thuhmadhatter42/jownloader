@@ -24,13 +24,16 @@ with the browser session; this side only writes them.
      Several pages -> merged with pypdf into one PDF named after the first page's title (else dst/<name>.pdf).
      No pypdf (or "split") -> one PDF per page named by its title in dst/<name>/ (never 001.pdf).
      Never overwrites: name (2).pdf.
-  {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?, "mp3"?} -> {"id", "ok", "path", "files", "output"}
+  {"cmd": "fetch", "id", "url", "mode", "dst", "strip"?, "webp"?, "mp3"?, "cookies"?} -> {"id", "ok", "path", "files", "output"}
      a site the engine handles (YouTube, Instagram, Twitter/X — engine.py): runs in a thread so the
      port keeps streaming other files meanwhile. mode "video" | "audio". Audio is the upload's AAC saved
      as delivered (.m4a); "mp3": true converts it to MP3 V0 instead (single links and Spotify songs alike).
      A Spotify track also carries "meta" ({title, artists, album, number, total, duration_ms, cover, url,
      folder}) and "analyze": true|false (BPM/key into the name): the host matches it to an upload and saves
      <dst>/<folder>/NN - Artists - Title.m4a (AAC as the upload has it, never re-encoded), tagged.
+     "cookies": the browser's own session for that site as cookies.txt text (the extension reads it with
+     chrome.cookies). It goes to a private temp file (0700 dir, 0600 file) used as the first login source of
+     that one job and deleted when the job ends (done, failed, stopped, host exit); never logged, never kept.
   {"cmd": "cancel", "id", "jobs": [ids]} or {"cmd": "cancel", "id", "all": true}
      -> {"id", "ok": true, "cancelled": [ids found], "killed": n}     Stop. Ids are the ids of earlier requests:
      a running "fetch" has its yt-dlp / gallery-dl / ffmpeg / analyzer processes killed with their children
@@ -178,7 +181,8 @@ def fetch_async(msg):
         with jlog.job(jid) as j:
             try:
                 r = engine.fetch(msg.get("url") or "", msg.get("mode") or "video", msg.get("dst") or "",
-                                 msg.get("meta") or None, bool(msg.get("analyze")), bool(msg.get("mp3")))
+                                 msg.get("meta") or None, bool(msg.get("analyze")), bool(msg.get("mp3")),
+                                 cookies=msg.get("cookies") or None)
             except Exception as e:
                 log.exception("fetch id=%s raised", jid)
                 r = {"ok": False, "output": str(e)}

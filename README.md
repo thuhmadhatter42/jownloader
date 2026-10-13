@@ -105,6 +105,10 @@ What the extension asks for, and why:
 - **`nativeMessaging`**: to talk to the local host that writes files. The host runs only on your Mac.
 - **`tabs`, `webNavigation`, `webRequest`, `storage`, `sidePanel`, `notifications`**: following the
   active tab, remembering what was already saved, the side panel and the finish notification.
+- **`cookies`**: for a download the engine runs (a video link, a music-list song, a social post), the
+  extension reads that site's session cookies and hands them to the local download tool for that one job,
+  in a private temp file that is deleted when the job ends. They are never stored by the extension, never
+  logged, and nothing leaves the machine.
 - **Cookies**: for pages that need a login, the download tools (`yt-dlp`, `gallery-dl`) may read your
   browser's cookies for that site, locally, on your Mac, and only to make that one request. They are not
   copied, stored or sent anywhere else.

@@ -447,6 +447,47 @@ with sync_playwright() as p:
     pop.evaluate("async () => await chrome.runtime.sendMessage({type:'clearProgress'})")
     check("dismiss: the verdict is put away", pop.evaluate("async () => (await chrome.runtime.sendMessage({type:'getProgress'})).total"), 0)
     sw.evaluate("() => { saveEngineViaHost = __orig3; }")
+
+    # 0.1.46: the browser's own session goes to the host for a YouTube job (fake cookies in THIS test profile only), and
+    # "no host" means Chrome's own errors - never text that came back inside a host reply.
+    sw.evaluate("""async () => {
+      const exp = Math.floor(Date.now() / 1000) + 86400, mk = (u, domain, name, value, extra = {}) => chrome.cookies.set({ url: u, domain, name, value, path: '/', secure: true, expirationDate: exp, ...extra });
+      await mk('https://www.youtube.com/', '.youtube.com', 'SID', 'FAKEYT1');
+      await mk('https://www.youtube.com/', '.youtube.com', 'HSID', 'FAKEYT2', { httpOnly: true });
+      await mk('https://accounts.google.com/', '.google.com', 'NID', 'FAKEGOOG');
+      await mk('https://example.test/', 'example.test', 'OTHER', 'FAKEOTHER');
+      globalThis.__origHC = hostConnect; globalThis.__origHA = hostAsk; globalThis.__msgs = [];
+      hostConnect = () => ({ postMessage() {} });
+      hostAsk = async (port, msg) => { __msgs.push(msg); return globalThis.__reply || { id: msg.id, ok: true, path: '/d/x.mp4' }; };
+    }""")
+    first = lambda url, extra="{}": sw.evaluate(f"async () => {{ __msgs.length = 0; await saveEngineViaHost({json.dumps(url)}, 'video', '/d', {{}}, {extra}); return __msgs[0]; }}")
+    m = first("https://www.youtube.com/watch?v=abc")
+    ck = m.get("cookies", "")
+    lines = ck.splitlines()
+    check("cookies: a YouTube job carries a cookies.txt with a Netscape header", lines[:1], ["# Netscape HTTP Cookie File"])
+    rows = sorted(l.split("\t") for l in lines[1:])
+    check("cookies: YouTube and Google cookies in cookies.txt column order (domain, subdomains, path, secure, expiry, name, value)",
+          [[r[0], r[1], r[2], r[3], r[5], r[6]] for r in rows], sorted([[".google.com", "TRUE", "/", "TRUE", "NID", "FAKEGOOG"], [".youtube.com", "TRUE", "/", "TRUE", "SID", "FAKEYT1"], ["#HttpOnly_.youtube.com", "TRUE", "/", "TRUE", "HSID", "FAKEYT2"]]))
+    check("cookies: expiry is epoch seconds, other sites' cookies are not sent", [rows[0][4].isdigit() and int(rows[0][4]) > 1_000_000_000, "FAKEOTHER" in ck, "example.test" in ck], [True, False, False])
+    check("cookies: sent on the fetch message itself (cmd fetch, same job)", [m.get("cmd"), m.get("url")], ["fetch", "https://www.youtube.com/watch?v=abc"])
+    check("cookies: a music.youtube.com link and a youtu.be link get them too", [bool(first(u).get("cookies")) for u in ("https://music.youtube.com/watch?v=abc", "https://youtu.be/abc")], [True, True])
+    check("cookies: a Spotify song (matched on YouTube) gets them", bool(first("https://open.spotify.com/track/abc", "{ meta: { number: 1, artists: 'A', title: 'T' } }").get("cookies")), True)
+    check("cookies: any other site's engine job (no cookies stored for it) sends none", ["cookies" in first(u) for u in ("https://www.instagram.com/p/x/", "https://example.com/v")], [False, False])
+    leak = sw.evaluate("""async () => JSON.stringify([logRing, await chrome.storage.local.get(null), await chrome.storage.sync.get(null), await chrome.storage.session.get(null)])""")
+    check("cookies: only counts reach the log; no value is in the log ring or any chrome.storage area", [("FAKEYT1" in leak), ("FAKEGOOG" in leak), ("FAKEYT2" in leak), ("cookies.txt from the browser: 3 cookies for 2 domains" in leak)], [False, False, False, True])
+    # a host reply's own words are shown as they are; Chrome's own errors are the "not installed" message
+    shown = lambda text: sw.evaluate("t => hostError(t)", text)
+    NI = "native host not installed — run native/install.sh"
+    check("no-host: text from inside a host reply ('403: Forbidden', 'not found', 'disconnected') is shown as itself",
+          [shown(t) for t in ("ERROR: unable to download: HTTP Error 403: Forbidden", "Download failed: file not found", "the site disconnected us")],
+          ["ERROR: unable to download: HTTP Error 403: Forbidden", "Download failed: file not found", "the site disconnected us"])
+    check("no-host: Chrome's own native-messaging errors still say the host is not installed",
+          [shown(t) for t in ("Specified native messaging host not found.", "Access to the specified native messaging host is forbidden.", "Native host has exited.", "Error when communicating with the native messaging host.", "native host disconnected")], [NI] * 5)
+    sw.evaluate("() => { globalThis.__reply = { id: 'x', ok: false, output: 'Clip: ERROR: HTTP Error 403: Forbidden' }; }")
+    r403 = sw.evaluate("async () => (await saveEngineViaHost('https://www.youtube.com/watch?v=abc', 'video', '/d')).output")
+    check("no-host: a failed job whose reply says 403: Forbidden shows that text, not the install hint", r403, "Clip: ERROR: HTTP Error 403: Forbidden")
+    sw.evaluate("""async () => { globalThis.__reply = null; hostConnect = __origHC; hostAsk = __origHA;
+      for (const [u, n, d] of [['https://www.youtube.com/', 'SID', '.youtube.com'], ['https://www.youtube.com/', 'HSID', '.youtube.com'], ['https://accounts.google.com/', 'NID', '.google.com'], ['https://example.test/', 'OTHER', 'example.test']]) await chrome.cookies.remove({ url: u, name: n }); }""")
     srv.shutdown()
     ctx.close()
 print("ALL GREEN" if not fails else f"{fails} FAILED")

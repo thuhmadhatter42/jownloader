@@ -434,6 +434,8 @@ def summarize(msg):
     for k, v in (msg or {}).items():
         if k in ("data", "entries"):
             parts.append(f"{k}=<{len(v)}{' b64 chars' if k == 'data' else ' entries'}>")
+        elif k == "cookies" and isinstance(v, str):
+            parts.append(f"cookies=<{v.count(chr(10)) + 1 if v else 0} line(s), values never logged>")
         elif isinstance(v, str):
             parts.append(f"{k}={_trunc(v, 300)!r}")
         elif isinstance(v, (bool, int, float)) or v is None:
