@@ -211,7 +211,7 @@ runpy.run_path({HOST!r}, run_name="__main__")
     text = read_log(L)
     check("7: the chosen candidate", urls, ["https://y/good"])
     check("7: queries are logged", bool(re.search(r"spotify: candidates for Some Artist - Floaty \(200\.0s\): 3 queries \[", text)), True)
-    check("7: an accepted hit shows its score parts", bool(re.search(r"ACCEPT score=8 .*https://y/good: duration gap 1\.0s \+4, main artist in channel \+1, '- Topic' channel \+3", text)) or bool(re.search(r"ACCEPT score=9 .*https://y/good", text)), True)
+    check("7: an accepted hit shows its score parts", bool(re.search(r"ACCEPT score=11 .*https://y/good: duration gap 1\.0s \+4, main artist in channel \+1, main artist in the upload's title \+2, '- Topic' channel \+3, 'official audio' \+1", text)), True)
     check("7: rejection reasons: duration, title, artist", [bool(re.search(r"REJECT .*https://y/long: duration off by 200s", text)), bool(re.search(r"REJECT .*https://y/other: title 'floaty' is not in the upload's title", text)),
                                                             bool(re.search(r"REJECT .*https://y/slow: none of the artists", text))], [True, True, True])
     check("7: the final choice is logged with its score", bool(re.search(r"candidates for Some Artist - Floaty: chosen \[\('https://y/good', \d+\)\]", text)), True)

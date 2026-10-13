@@ -1,7 +1,7 @@
 # Browser-session cookies test (0.1.46): the extension hands a site's cookies to the host as cookies.txt text for ONE
 # fetch. Drives native/jownloader_host.py over its stdio port with a stand-in yt-dlp (no network, no browser, and
 # never a real cookie store: HOME is an empty temp folder, only FAKE cookies are used). Checks that the text lands in
-# a private temp file (dir 0700, file 0600), that `--cookies <file>` is the FIRST strategy of the job, that the file is
+# a private temp file (dir 0700, file 0600), that `--cookies <file>` is the THIRD strategy of the job (after the two no-login ones), that the file is
 # gone after success, failure, Stop and host exit, and that no cookie value ever reaches the log.
 # Run: python3 tests/cookies_test.py
 import glob, json, os, queue, shutil, struct, subprocess, sys, tempfile, threading, time
@@ -54,6 +54,8 @@ if [ -n "$C" ]; then
   echo "$C" >> "$FAKE_STATE/cookiepath"; cp "$C" "$FAKE_STATE/seen-cookies"
 fi
 MODE=$(cat "$FAKE_STATE/mode")
+# 0.1.47: the two no-login strategies come first; YouTube's bot gate refuses them, so only the job's own cookies.txt gets through
+if [ "$MODE" != fail ] && [ -z "$C" ]; then echo "ERROR: Sign in to confirm you're not a bot" >&2; exit 1; fi
 if [ $INFO = 1 ]; then echo '{"title":"Clip"}'; exit 0; fi
 if [ "$MODE" = fail ]; then echo "ERROR: unable to download video data: HTTP Error 403: Forbidden" >&2; exit 1; fi
 B="${T%.%(ext)s}"
@@ -131,8 +133,10 @@ try:
     r = h.wait("f1")
     check("success: the fetch is ok", bool(r and r.get("ok")), True)
     argv = first_cookies_argv()
-    check("success: every yt-dlp call of the job carries --cookies <file> as its first strategy", [("--cookies " in a) for a in argv], [True] * len(argv))
-    check("success: the very first call (the info lookup) used it", bool(argv) and "--dump-json" in argv[0] and "--cookies " in argv[0], True)
+    check("success: the first two calls are the no-login strategies (yt-dlp default, then web_embedded) and carry no --cookies",
+          [("--cookies " in x) for x in argv[:2]] + ["player_client=web_embedded" in argv[0], "player_client=web_embedded" in argv[1]], [False, False, False, True])
+    check("success: --cookies <file> is the THIRD strategy tried (the info lookup)", len(argv) > 2 and "--dump-json" in argv[2] and "--cookies " in argv[2], True)
+    check("success: every call after it carries --cookies <file>", [("--cookies " in x) for x in argv[2:]], [True] * len(argv[2:]))
     check("success: the cookie file was 0600 and its folder 0700 while yt-dlp ran", [set(state("filemode")), set(state("dirmode"))], [{"600"}, {"700"}])
     seen = open(os.path.join(STATE, "seen-cookies")).read() if os.path.exists(os.path.join(STATE, "seen-cookies")) else ""
     check("success: yt-dlp saw the cookies.txt exactly as sent", seen, COOKIES)

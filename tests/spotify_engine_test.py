@@ -286,7 +286,9 @@ try:
     engine._dead_stores.clear(); engine._dead_logged.clear()
     try:
         engine.YT_STRATEGIES, engine._yt_working = real_strats, None
-        check("0.1.46: only Brave (its data folder exists) and the plain strategies are usable", [engine._store_of(x) for x in engine._yt_strategies()], ["brave", None, None, None])
+        check("0.1.46: only Brave (its data folder exists) and the plain strategies are usable (no-login ones first)", [engine._store_of(x) for x in engine._yt_strategies()], [None, None, "brave"])
+        check("0.1.47: the two no-login strategies lead: yt-dlp default, then web_embedded", engine._yt_strategies()[:2], [[], ["--extractor-args", "youtube:player_client=web_embedded"]])
+        check("0.1.47: android and web clients are gone", [x for x in real_strats if x[:1] == ["--extractor-args"] and "web_embedded" not in x[1]], [])
         seen_args = []
         def refusing(*a):
             seen_args.append(a)
@@ -312,16 +314,36 @@ try:
         # a job's own cookie file leads the order and is never remembered as 'the working strategy'
         with engine.job_cookies("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tFAKE\n") as cf:
             order = engine._yt_order()
-            check("0.1.46: --cookies <file> is FIRST in the strategy order of that job", [order[0], len(order)], [["--cookies", cf], 4])
+            check("0.1.47: --cookies <file> is THIRD in the strategy order of that job (after the two no-login ones)", [order[:2], order[2], len(order)], [[[], ["--extractor-args", "youtube:player_client=web_embedded"]], ["--cookies", cf], 3])   # 3: Brave's store is dead by now
             engine._remember(["--cookies", cf], "download")
             check("0.1.46: ...and is never remembered as the working strategy", engine._yt_working, None)
         check("0.1.46: ...and is gone from the order after the job", all(x[:1] != ["--cookies"] for x in engine._yt_order()), True)
+        # 0.1.47 (a): a transient 403 on the media is retried once with the SAME strategy, then succeeds
+        got_extra = []
+        def flaky(yt, outtmpl, extra, mp3=False):
+            got_extra.append(list(extra))
+            if len(got_extra) == 1:
+                return False, None, ["ERROR: unable to download video data: HTTP Error 403: Forbidden"]
+            return True, os.path.join(d, "flaky.m4a"), []
+        real_native = engine._yt_download_native
+        engine._yt_download_native = flaky
+        with engine._track_budget():
+            ok, path, err = engine._download_candidates(["https://u.test/flaky"], os.path.join(d, "t47") + ".%(ext)s", False)
+        check("0.1.47: a transient 403 on the media is retried once with the same strategy, then succeeds", [ok, len(got_extra), got_extra[0] == got_extra[1]], [True, 2, True])
+        engine._yt_download_native = real_native
     finally:
         engine._dead_stores.clear(); engine._dead_logged.clear()
         if real_home is None: os.environ.pop("HOME", None)
         else: os.environ["HOME"] = real_home
         restore()
         engine.YT_STRATEGIES, engine._yt_working = [[]], None
+
+    # 0.1.47 (b): the scorer credits the main artist named in the upload's title; a cover by a stranger stays out
+    dg = {"title": "You Should Be Dancing", "artists": "Dee Gees", "duration_ms": 232000}
+    sc = engine.spotify_score(dg, {"title": "Dee Gees | You Should Be Dancing", "channel": "Foo Fighters", "duration": 242})
+    check("0.1.47: an upload titled 'Dee Gees | You Should Be Dancing' (10 s off) is accepted, score >= 3", sc is not None and sc >= 3, True)
+    sc2 = engine.spotify_score(dg, {"title": "You Should Be Dancing (COVER)", "channel": "Some Band", "duration": 233})
+    check("0.1.47: a '(COVER)' upload by an unrelated channel at 233 s is still rejected", sc2 is None or sc2 < engine.MIN_SCORE, True)
 
     # 28 (by id): two songs of one artist whose titles are the same symbol are told apart by the Spotify track id in the file
     if have_mutagen:

@@ -261,17 +261,18 @@ print(json.dumps([note, str(f["TIT2"]), str(f["TPE1"]), str(f["TALB"]), str(f["T
     saved_yt, calls = engine._yt, []
     def age_gate(*a):
         calls.append(a)
-        if "youtube:player_client=android" in a:
+        if "youtube:player_client=web_embedded" in a:
             return 0, json.dumps({"id": "abc", "title": "Queen - Bohemian Rhapsody", "channel": "Queen", "duration": 354, "url": "https://www.youtube.com/watch?v=abc"}) + "\n", ""
         return 1, "", "ERROR: Sign in to confirm your age"
     engine._yt, engine._yt_working = age_gate, None
     try:
         hits, err = engine._yt_search("q")
         first = calls[0]
-        check("search: Brave's cookies are the first thing tried", ("--cookies-from-browser", "brave") == (first[first.index("--cookies-from-browser")], first[first.index("--cookies-from-browser") + 1]), True)
-        check("search: an age-gate failure falls through the cookie strategies to one that works", [len(hits), hits[0]["url"], len(calls) > 3], [1, "https://www.youtube.com/watch?v=abc", True])
+        check("search: the plain yt-dlp default (no cookie flag, no client) is the first thing tried", [("--cookies-from-browser" in first), ("--extractor-args" in first)], [False, False])
+        check("search: web_embedded is tried second", "youtube:player_client=web_embedded" in calls[1], True)
+        check("search: an age-gate failure falls through the strategies to one that works", [len(hits), hits[0]["url"], len(calls) >= 2], [1, "https://www.youtube.com/watch?v=abc", True])
         calls.clear(); engine._yt_search("q2")
-        check("search: the strategy that worked goes first next time", "youtube:player_client=android" in calls[0], True)
+        check("search: the strategy that worked goes first next time", "youtube:player_client=web_embedded" in calls[0], True)
     finally:
         engine._yt, engine._yt_working = saved_yt, None
     import http.server, threading
