@@ -216,16 +216,20 @@ def tmpl_unescape(text):
 
 
 # ══════════════════════════════════════════════════════════════════════════════ YouTube
-# Strategies tried silently in order until one works (YouTube's sign-in / bot gate).
+# Strategies tried silently in order until one works (YouTube's sign-in / bot gate). Measured 2026-10-13 on 163 songs:
+# yt-dlp's own default clients save almost everything, a 403 on the media itself is transient (the same command again
+# saves it), web_embedded saves what default refuses; android / web / ios / mweb / tv no longer return audio at all.
+# The job's browser session (--cookies) comes after the two no-login ones, for sign-in / age gates.
 YT_STRATEGIES = [
+    [],
+    ["--extractor-args", "youtube:player_client=web_embedded"],
     ["--cookies-from-browser", "brave"],
     ["--cookies-from-browser", "firefox"],
     ["--cookies-from-browser", "safari"],
     ["--cookies-from-browser", "chrome"],
-    ["--extractor-args", "youtube:player_client=android"],
-    ["--extractor-args", "youtube:player_client=web"],
-    [],
 ]
+YT_NO_LOGIN = 2             # the first two strategies need no session
+TRANSIENT_403_RE = re.compile(r"unable to download video data: HTTP Error 403", re.I)
 # QuickTime-compatible: H.264 video + AAC audio in MP4; falls back to any mp4, then anything.
 YT_VIDEO_FORMAT = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4]/b"
 
@@ -353,7 +357,8 @@ def _note_store_failure(extra, lines):
 def _yt_strategies():
     """The strategies of one pass: the browser's own session first (when the extension sent it), then the usable rest."""
     cf = _job_cookie_file()
-    return ([["--cookies", cf]] if cf else []) + [s for s in YT_STRATEGIES if _strategy_usable(s)]
+    own = [["--cookies", cf]] if cf else []
+    return YT_STRATEGIES[:YT_NO_LOGIN] + own + [s for s in YT_STRATEGIES[YT_NO_LOGIN:] if _strategy_usable(s)]
 
 
 # ---- which error the user is shown: YouTube's own refusal > network > anything else > cookie-store trouble
@@ -508,6 +513,10 @@ def youtube(url, mode, outdir, mp3=False):
         if _stopped():
             return dict(STOPPED)
         ok, path, last_err = _yt_download(url, mode, outtmpl, extra, mp3)
+        if not ok and TRANSIENT_403_RE.search(" ".join(last_err)) and not _stopped():
+            log.warning("youtube download: strategy %d/%d [%s] got a 403 on the media (transient): same run again",
+                        i, len(order), _sname(extra))
+            ok, path, last_err = _yt_download(url, mode, outtmpl, extra, mp3)
         if ok:
             log.info("youtube download: strategy %d/%d [%s] OK -> %s", i, len(order), _sname(extra), path)
             break
@@ -754,11 +763,13 @@ def spotify_score_why(track, cand, strict=False, artist_required=True):
             return None, f"duration off by {gap:.0f}s (track {want_s:.0f}s, upload {got_s:.0f}s; the limit is {SPOTIFY_MAX_GAP_S}s)"
         if (strict or symbols_only) and gap > 3:
             return None, f"duration off by {gap:.1f}s; the {'strict last-resort query' if strict else 'symbol-only title'} needs 3s or less"
-        pts = 4 if gap <= 3 else 2 if gap <= 8 else 0
+        pts = 4 if gap <= 3 else 2 if gap <= 8 else 1 if gap <= 15 else 0
         score += pts
         parts.append(f"duration gap {gap:.1f}s {pts:+d}")
     if main_artist and main_artist in channel:
         score += 1; parts.append("main artist in channel +1")
+    if main_artist and re.search(rf"(^|\W){re.escape(main_artist)}(\W|$)", ctitle):
+        score += 2; parts.append("main artist in the upload's title +2")
     if channel.endswith("- topic"):
         score += 3; parts.append("'- Topic' channel +3")
     if "official audio" in ctitle:
@@ -774,11 +785,11 @@ def spotify_score_why(track, cand, strict=False, artist_required=True):
 
 def spotify_score(track, cand, strict=False, artist_required=True):
     """Score one search hit for a track (higher is better); None = never acceptable.
-    cand = {title, channel, duration (s)}. Length is the main signal (+4 within 3 s, +2 within 8 s, hard
+    cand = {title, channel, duration (s)}. Length is the main signal (+4 within 3 s, +2 within 8 s, +1 within 15 s, hard
     reject beyond SPOTIFY_MAX_GAP_S); the upload's title must contain the track's title as whole words (a title
     of three letters or fewer must BE a piece of it); a listed artist must be named in the upload's title or channel
     (artist_required; spotify_match drops it only when none of the hits carries any channel at all);
-    'Artist - Topic' channels and 'official audio' score up; live / remix / cover / sped up / slowed / karaoke /
+    'Artist - Topic' channels, the main artist named in the upload's title and 'official audio' score up; live / remix / cover / sped up / slowed / karaoke /
     instrumental score down unless the track's own title says so. A hit with no length is never accepted (live
     streams, 77-minute sets). A symbol-only title has no words to match, so the symbols themselves must be in the
     upload's title and the length within 3 s. strict (the shortened last-resort query) also needs length within 3 s:
@@ -828,12 +839,11 @@ def _network_down(lines):
 
 
 def _yt_order():
-    """One pass of strategies: this job's browser session, the last one that worked, then the usable rest."""
+    """One pass of strategies: the last one that worked, then the usable rest in YT_STRATEGIES order (the job's
+    browser session right after the no-login ones)."""
     base = _yt_strategies()
-    own = [s for s in base if s[:1] == ["--cookies"]]
-    rest = [s for s in base if s[:1] != ["--cookies"]]
-    w = _yt_working if _yt_working in rest else None
-    return own + ([w] if w is not None else []) + [s for s in rest if s != w]
+    w = _yt_working if _yt_working in base else None
+    return ([w] if w is not None else []) + [s for s in base if s != w]
 
 
 def _remember(extra, where):
@@ -1377,6 +1387,10 @@ def _download_candidates(urls, outtmpl, mp3):
             if not _budget_take():
                 return False, None, best or last_err or ["yt-dlp run budget for this track used up"]
             ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
+            if not ok and TRANSIENT_403_RE.search(" ".join(last_err)) and not jlog.cancelled() and _budget_take():
+                slog.warning("download: upload %d/%d strategy [%s] got a 403 on the media (transient): same run again",
+                             ui, len(urls), _sname(extra))
+                ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
             if ok and path:
                 _remember(extra, "download")
                 slog.info("download: upload %d/%d strategy [%s] OK -> %s", ui, len(urls), _sname(extra), path)
