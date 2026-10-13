@@ -489,5 +489,9 @@ with sync_playwright() as p:
     sw.evaluate("""async () => { globalThis.__reply = null; hostConnect = __origHC; hostAsk = __origHA;
       for (const [u, n, d] of [['https://www.youtube.com/', 'SID', '.youtube.com'], ['https://www.youtube.com/', 'HSID', '.youtube.com'], ['https://accounts.google.com/', 'NID', '.google.com'], ['https://example.test/', 'OTHER', 'example.test']]) await chrome.cookies.remove({ url: u, name: n }); }""")
     srv.shutdown()
+    # last: two queued songs hold the queue (20 s Spotify gap), so nothing after this may wait on a job
+    r = pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'song', dest:'/d', prefix:'', items})",
+                     [song("https://open.spotify.com/track/bbb", "Dup list", 1), song("https://open.spotify.com/track/bbb", "Dup list", 2)])
+    check("0.1.48: a song the list holds twice (positions 1 and 2) = two jobs", r, {"queued": 2, "skipped": 0, "unusable": 0})
     ctx.close()
 print("ALL GREEN" if not fails else f"{fails} FAILED")

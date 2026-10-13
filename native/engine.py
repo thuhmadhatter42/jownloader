@@ -1233,6 +1233,20 @@ def find_existing(folder, track):
     return match_files(_scan(folder), [track]).get(0)
 
 
+_LEAD_NUM = re.compile(r"^(\d{1,4})\s*(?:-\s+|_)")      # the same number prefix _NUM_PREFIX strips
+
+
+def find_at_position(folder, track):
+    """A list song's own file: this track AND the list position it holds (its 'NNN - ' number), else None. A song the
+    list holds twice is two positions and so two files; spotify_sync has already renamed every file to its position."""
+    try:
+        want = int(track.get("number"))
+    except (TypeError, ValueError):
+        return find_existing(folder, track)
+    at = [(p, k) for p, k in _scan(folder) if (m := _LEAD_NUM.match(os.path.basename(p))) and int(m.group(1)) == want]
+    return match_files(at, [track]).get(0)
+
+
 def library_folder_name(name):
     """A list name as a library tool writes it to disk."""
     return re.sub(r'[/\\?%*:|"<>]', "-", name or "").strip()
@@ -1433,9 +1447,9 @@ def spotify_track(meta, outdir, analyze=False, mp3=False):
     stem = spotify_stem(meta)
     os.makedirs(folder, exist_ok=True)
     _guard_partials(folder, stem)
-    there = find_existing(folder, meta)
+    there = find_at_position(folder, meta) if meta.get("folder") and meta.get("number") else find_existing(folder, meta)
     if there:
-        slog.info("track %s: already saved as %s (matched on Artists - Title), nothing to do", tl, there)
+        slog.info("track %s: already saved as %s (matched on position + Artists - Title), nothing to do", tl, there)
         return {"ok": True, "path": there, "files": [], "skipped": 1, "output": ""}
     with _track_budget():
         urls, msg = spotify_candidates(meta)

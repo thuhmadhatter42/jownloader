@@ -345,6 +345,23 @@ try:
     lq = engine.spotify_queries({"title": "My Hero - Live at the Pantages Theatre, Los Angeles, CA - August 2006", "artists": "Foo Fighters"})
     check("0.1.47: a live version is searched with its whole title first, then the core title",
           lq[:2], ["Foo Fighters - My Hero - Live at the Pantages Theatre, Los Angeles, CA - August 2006", "Foo Fighters - my hero"])
+    # 0.1.48: a song the list holds twice is two positions = two files, in list order
+    dd = tempfile.mkdtemp(prefix="jown-dup-")
+    try:
+        sh = {"title": "Shame Shame", "artists": "Foo Fighters"}
+        lst = [dict(sh, number=1), {"title": "Other", "artists": "Foo Fighters", "number": 2}, dict(sh, number=3)]
+        open(os.path.join(dd, "07 - Foo Fighters - Shame Shame.m4a"), "wb").write(b"x")
+        sy = engine.spotify_sync(os.path.dirname(dd), os.path.basename(dd), lst)
+        check("0.1.48: one file of a song listed twice serves the FIRST position only; the second is still to download",
+              [sy["have"], sorted(os.listdir(dd))], [[0], ["01 - Foo Fighters - Shame Shame.m4a"]])
+        check("0.1.48: find_at_position: position 1 has its file, position 3 does not",
+              [bool(engine.find_at_position(dd, lst[0])), engine.find_at_position(dd, lst[2])], [True, None])
+        open(os.path.join(dd, "03 - Foo Fighters - Shame Shame.m4a"), "wb").write(b"x")
+        sy = engine.spotify_sync(os.path.dirname(dd), os.path.basename(dd), lst)
+        check("0.1.48: with both files there, both positions are had and keep their own numbers",
+              [sy["have"], sorted(os.listdir(dd))], [[0, 2], ["01 - Foo Fighters - Shame Shame.m4a", "03 - Foo Fighters - Shame Shame.m4a"]])
+    finally:
+        shutil.rmtree(dd, ignore_errors=True)
     check("0.1.47: 'Live Wire' and '- Remastered 2011' get no extra query",
           [len(engine.spotify_queries({"title": t, "artists": "X"})) for t in ("Live Wire", "Everlong - Remastered 2011")], [3, 3])
     sc2 = engine.spotify_score(dg, {"title": "You Should Be Dancing (COVER)", "channel": "Some Band", "duration": 233})

@@ -1176,10 +1176,11 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
     for (const raw of items) {
       const it = typeof raw === "string" ? { url: raw } : raw;
       if (!it.url || !/^https?:/.test(it.url)) { unusable++; log("info", "dedupe", "unusable (not an http/https URL): " + logUrl(it.url)); continue; }
-      // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder)
+      // a page saved as video AND as audio = two files; a Spotify song in two lists = two files (one per list folder),
+      // and a song a list holds twice = two files (one per position, in list order)
       const mode = it.mode || "video";
       const c = it.site ? siteCanon(it.url) + "#site-" + (it.mode || "pdf") + (it.follow ? "-follow" : "")
-        : it.engine ? engineCanon(it.url) + "#" + mode + (it.spotify ? ":" + (it.spotify.folder || "") : mode === "audio" && settings.mp3 ? "-mp3" : "")
+        : it.engine ? engineCanon(it.url) + "#" + mode + (it.spotify ? ":" + (it.spotify.folder || "") + (it.spotify.folder && it.spotify.number ? "#" + it.spotify.number : "") : mode === "audio" && settings.mp3 ? "-mp3" : "")
         : canon(it.url);
       const alts = it.engine && !it.spotify ? engineAlts(it.url, mode, settings.mp3, c) : [];
       if (seen.has(c) || inFlight.has(c)) { skipped++; log("info", "dedupe", `skip: ${seen.has(c) ? "the same item twice in this batch" : "already downloading right now"}`, { key: c }); continue; }
