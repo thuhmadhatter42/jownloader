@@ -279,6 +279,50 @@ try:
     restore()
     engine.YT_STRATEGIES = [[]]
 
+    # 0.1.46: strategy hygiene + headline error. A browser that is not installed is never tried; one whose cookie store the
+    # host cannot read is tried once, remembered, and its run does not eat the track's budget, so uploads 2 and 3 get a turn.
+    fakehome = os.path.join(d, "fakehome"); os.makedirs(os.path.join(fakehome, "Library/Application Support/BraveSoftware/Brave-Browser"))
+    real_home = os.environ.get("HOME"); os.environ["HOME"] = fakehome
+    engine._dead_stores.clear(); engine._dead_logged.clear()
+    try:
+        engine.YT_STRATEGIES, engine._yt_working = real_strats, None
+        check("0.1.46: only Brave (its data folder exists) and the plain strategies are usable", [engine._store_of(x) for x in engine._yt_strategies()], ["brave", None, None, None])
+        seen_args = []
+        def refusing(*a):
+            seen_args.append(a)
+            if "--cookies-from-browser" in a:
+                return 1, "", 'ERROR: could not find brave cookies database in "/x/Brave-Browser"'
+            return 1, "", "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+        engine._yt = refusing
+        urls = ["https://u.test/one", "https://u.test/two", "https://u.test/three"]
+        with engine._track_budget():
+            ok, path, err = engine._download_candidates(urls, os.path.join(d, "t46") + ".%(ext)s", False)
+        per_url = [sum(1 for a in seen_args if a[-1] == u) for u in urls]
+        check("0.1.46: no firefox / safari / chrome cookie run was ever started", [a for a in seen_args if "--cookies-from-browser" in a and a[a.index("--cookies-from-browser") + 1] != "brave"], [])
+        check("0.1.46: the unreadable Brave store was run once, then remembered as dead", [sum(1 for a in seen_args if "--cookies-from-browser" in a), sorted(engine._dead_stores)], [1, ["brave"]])
+        check("0.1.46: uploads 2 and 3 got their turn inside the budget (the dead store's run was refunded)", [x > 0 for x in per_url], [True, True, True])
+        check("0.1.46: the error handed back is YouTube's refusal, not the cookie store's", ["403" in " ".join(err), "cookies database" in " ".join(err)], [True, False])
+        cookie_err = ['ERROR: could not find firefox cookies database in "/x"']
+        refused = ["ERROR: HTTP Error 403: Forbidden"]
+        net = ["ERROR: urlopen error [Errno 8] nodename nor servname provided"]
+        best = engine._keep_err(engine._keep_err(engine._keep_err([], cookie_err), refused), cookie_err)
+        check("0.1.46: a later cookie-store error never replaces YouTube's refusal as the headline", best, refused)
+        check("0.1.46: YouTube's refusal outranks a network error, which outranks the cookie store", [engine._keep_err(net, refused), engine._keep_err(cookie_err, net)], [refused, net])
+        check("0.1.46: the headline text never names the cookie store when YouTube refused", "firefox" in engine._yt_explain(best), False)
+        # a job's own cookie file leads the order and is never remembered as 'the working strategy'
+        with engine.job_cookies("# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t0\tSID\tFAKE\n") as cf:
+            order = engine._yt_order()
+            check("0.1.46: --cookies <file> is FIRST in the strategy order of that job", [order[0], len(order)], [["--cookies", cf], 4])
+            engine._remember(["--cookies", cf], "download")
+            check("0.1.46: ...and is never remembered as the working strategy", engine._yt_working, None)
+        check("0.1.46: ...and is gone from the order after the job", all(x[:1] != ["--cookies"] for x in engine._yt_order()), True)
+    finally:
+        engine._dead_stores.clear(); engine._dead_logged.clear()
+        if real_home is None: os.environ.pop("HOME", None)
+        else: os.environ["HOME"] = real_home
+        restore()
+        engine.YT_STRATEGIES, engine._yt_working = [[]], None
+
     # 28 (by id): two songs of one artist whose titles are the same symbol are told apart by the Spotify track id in the file
     if have_mutagen:
         base = os.path.join(d, "s28id"); L = os.path.join(base, "L"); os.makedirs(L)

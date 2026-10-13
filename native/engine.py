@@ -28,6 +28,7 @@ Everything it decides or runs is written to the developer log (jlog.py: ~/Librar
 Usage from a shell (for tests): python3 engine.py <url> [out-dir] [video|audio] [--mp3]
 """
 
+import atexit
 import contextlib
 import fcntl
 import glob
@@ -38,6 +39,8 @@ import secrets
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unicodedata
 import urllib.request
@@ -231,6 +234,152 @@ def _yt(*args):
     return _run(["yt-dlp"] + list(args), timeout=3600)
 
 
+# ---- the browser's own session, handed over by the extension for one job
+# The extension reads the signed-in cookies with chrome.cookies and sends them as cookies.txt text. They live in a
+# private temp file (0700 dir, 0600 file) for the length of that one job and are deleted when it ends, however it ends.
+_job = threading.local()
+_TEMP_DIRS = set()
+_TEMP_LOCK = threading.Lock()
+
+
+def cookie_stats(text):
+    """(cookie count, domain count) of a Netscape cookies.txt text; no value is ever read out."""
+    n, doms = 0, set()
+    for line in (text or "").splitlines():
+        line = line[len("#HttpOnly_"):] if line.startswith("#HttpOnly_") else line
+        parts = line.split("\t")
+        if line.startswith("#") or len(parts) < 7:
+            continue
+        n += 1
+        doms.add(parts[0].lstrip("."))
+    return n, len(doms)
+
+
+def _drop_temp_dir(d):
+    with _TEMP_LOCK:
+        _TEMP_DIRS.discard(d)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def job_cookies(text):
+    """Write `text` (cookies.txt) to a private temp file for this thread's job; yields its path or None.
+    The file is removed in `finally` (success, failure, Stop) and at host exit."""
+    n, m = cookie_stats(text) if text else (0, 0)
+    if not n:
+        yield None
+        return
+    d = tempfile.mkdtemp(prefix="jownloader-cookies-")
+    os.chmod(d, 0o700)
+    with _TEMP_LOCK:
+        _TEMP_DIRS.add(d)
+    try:
+        fd, path = tempfile.mkstemp(suffix=".txt", dir=d)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(path, 0o600)
+        log.info("cookies.txt from the browser: %d cookies for %d domains (private temp file, removed when the job ends)", n, m)
+        _job.cookies = path
+        try:
+            yield path
+        finally:
+            _job.cookies = None
+    finally:
+        _drop_temp_dir(d)
+
+
+@atexit.register
+def _sweep_temp_dirs():
+    for d in list(_TEMP_DIRS):
+        _drop_temp_dir(d)
+
+
+def _job_cookie_file():
+    return getattr(_job, "cookies", None)
+
+
+# ---- cookie-store strategies that cannot work are not tried
+_BROWSER_DIRS = {
+    "brave": ["Library/Application Support/BraveSoftware/Brave-Browser"],
+    "firefox": ["Library/Application Support/Firefox"],
+    "chrome": ["Library/Application Support/Google/Chrome"],
+    "safari": ["Library/Cookies/Cookies.binarycookies", "Library/Containers/com.apple.Safari"],
+}
+_dead_stores = {}          # browser -> why; for the rest of this host process
+_dead_logged = set()
+STORE_FAIL_RE = re.compile(r"could not find .{0,40}cookies? database|operation not permitted", re.I)
+
+
+def _store_of(extra):
+    return extra[1] if len(extra) > 1 and extra[0] == "--cookies-from-browser" else None
+
+
+def _strategy_usable(extra):
+    b = _store_of(extra)
+    if not b:
+        return True
+    if b in _dead_stores:
+        if b not in _dead_logged:
+            _dead_logged.add(b)
+            log.info("cookie store [%s] skipped for the rest of this host process: %s", b, _dead_stores[b])
+        return False
+    rels = _BROWSER_DIRS.get(b)
+    if rels is not None:
+        home = Path.home()
+        try:
+            present = any((home / r).exists() for r in rels)
+        except OSError:
+            present = False
+        if not present:
+            if b not in _dead_logged:
+                _dead_logged.add(b)
+                log.info("cookie store [%s] skipped: %s is not installed (no data folder)", b, b)
+            return False
+    return True
+
+
+def _note_store_failure(extra, lines):
+    """A cookie-store strategy that failed because the store cannot be read is remembered as dead (logged once).
+    Returns True for such a failure (it never reached YouTube)."""
+    b = _store_of(extra)
+    if not (b and STORE_FAIL_RE.search(" ".join(lines or []))):
+        return False
+    if b not in _dead_stores:
+        _dead_stores[b] = _errline(lines)
+        log.warning("cookie store [%s] cannot be read by the host (%s): not tried again in this host process", b, _errline(lines))
+    return True
+
+
+def _yt_strategies():
+    """The strategies of one pass: the browser's own session first (when the extension sent it), then the usable rest."""
+    cf = _job_cookie_file()
+    return ([["--cookies", cf]] if cf else []) + [s for s in YT_STRATEGIES if _strategy_usable(s)]
+
+
+# ---- which error the user is shown: YouTube's own refusal > network > anything else > cookie-store trouble
+COOKIE_ERR_RE = re.compile(r"cookies? database|operation not permitted|cookies-from-browser|keyring", re.I)
+YT_REFUSAL_RE = re.compile(r"\b403\b|forbidden|requested format|sign in|confirm your age|age.restrict|private video|"
+                           r"unavailable|not available|removed|not a bot|copyright|terminated|does not exist", re.I)
+
+
+def _err_rank(lines):
+    line = _errline(lines)
+    if COOKIE_ERR_RE.search(line):
+        return 3
+    if YT_REFUSAL_RE.search(line):
+        return 0
+    if _yt_explain(lines).startswith("Network error"):
+        return 1
+    return 2
+
+
+def _keep_err(best, new):
+    """The more meaningful of two attempts' error lines (a later one wins a tie)."""
+    if not new:
+        return best
+    return new if not best or _err_rank(new) <= _err_rank(best) else best
+
+
 def _yt_info(url, extra):
     code, out, err = _yt("--dump-json", "--no-playlist", *extra, url)
     if code != 0 or not out.strip():
@@ -329,19 +478,22 @@ def youtube(url, mode, outdir, mp3=False):
     if err:
         log.error("youtube: %s", err)
         return {"ok": False, "output": err}
-    info, meta_err, working = None, [], None
-    for i, extra in enumerate(YT_STRATEGIES, 1):
+    info, meta_err, working, best = None, [], None, []
+    strategies = _yt_strategies()
+    for i, extra in enumerate(strategies, 1):
         if _stopped():
             return dict(STOPPED)
         info, meta_err = _yt_info(url, extra)
         if info:
             working = extra
-            log.info("youtube info: strategy %d/%d [%s] OK, title=%r", i, len(YT_STRATEGIES), _sname(extra), info.get("title"))
+            log.info("youtube info: strategy %d/%d [%s] OK, title=%r", i, len(strategies), _sname(extra), info.get("title"))
             break
-        log.warning("youtube info: strategy %d/%d [%s] FAILED: %s", i, len(YT_STRATEGIES), _sname(extra), _errline(meta_err))
+        log.warning("youtube info: strategy %d/%d [%s] FAILED: %s", i, len(strategies), _sname(extra), _errline(meta_err))
+        _note_store_failure(extra, meta_err)
+        best = _keep_err(best, meta_err)
     if not info:
-        log.error("youtube info: all %d strategies failed for %s; last error: %s", len(YT_STRATEGIES), url, _errline(meta_err))
-        return {"ok": False, "output": _yt_explain(meta_err, url)}
+        log.error("youtube info: all %d strategies failed for %s; shown error: %s", len(strategies), url, _errline(best or meta_err))
+        return {"ok": False, "output": _yt_explain(best or meta_err, url)}
     title = safe_name(info.get("title") or ("audio" if mode == "audio" else "video"))
     if mode == "audio":      # a re-download of a song whose BPM-named file is already there: that file is the song
         there = _bpm_named(Path(outdir), title, mp3)
@@ -350,8 +502,8 @@ def youtube(url, mode, outdir, mp3=False):
             return {"ok": True, "path": str(there), "files": [], "skipped": 1, "output": ""}
     outtmpl = tmpl_escape(Path(outdir) / title) + ".%(ext)s"
     _guard_partials(outdir, title)
-    last_err, ok, path = [], False, None
-    order = [working] + [s for s in YT_STRATEGIES if s != working]
+    last_err, ok, path, best = [], False, None, []
+    order = [working] + [s for s in strategies if s != working]
     for i, extra in enumerate(order, 1):
         if _stopped():
             return dict(STOPPED)
@@ -360,11 +512,13 @@ def youtube(url, mode, outdir, mp3=False):
             log.info("youtube download: strategy %d/%d [%s] OK -> %s", i, len(order), _sname(extra), path)
             break
         log.warning("youtube download: strategy %d/%d [%s] FAILED: %s", i, len(order), _sname(extra), _errline(last_err))
+        _note_store_failure(extra, last_err)
+        best = _keep_err(best, last_err)
     if _stopped() and not (ok and path):     # a download that finished before the Stop landed is a saved file
         return dict(STOPPED)
     if not ok:
-        log.error("youtube download: all %d strategies failed for %s; last error: %s", len(order), url, _errline(last_err))
-        return {"ok": False, "output": _yt_explain(last_err, url)}
+        log.error("youtube download: all %d strategies failed for %s; shown error: %s", len(order), url, _errline(best or last_err))
+        return {"ok": False, "output": _yt_explain(best or last_err, url)}
     if not path:
         return {"ok": True, "path": str(outdir), "output": f"downloaded into {outdir} (file name not reported)"}
     note = ""
@@ -649,6 +803,12 @@ def _budget_take():
     return True
 
 
+def _budget_refund():
+    """A run that never reached YouTube (the cookie store could not be read) does not count against the track."""
+    if _budget is not None:
+        _budget["left"] += 1
+
+
 @contextlib.contextmanager
 def _track_budget():
     global _budget
@@ -668,20 +828,35 @@ def _network_down(lines):
 
 
 def _yt_order():
-    return ([_yt_working] if _yt_working is not None else []) + [s for s in YT_STRATEGIES if s != _yt_working]
+    """One pass of strategies: this job's browser session, the last one that worked, then the usable rest."""
+    base = _yt_strategies()
+    own = [s for s in base if s[:1] == ["--cookies"]]
+    rest = [s for s in base if s[:1] != ["--cookies"]]
+    w = _yt_working if _yt_working in rest else None
+    return own + ([w] if w is not None else []) + [s for s in rest if s != w]
+
+
+def _remember(extra, where):
+    """The strategy that worked is tried first next time - never a job's own temp cookie file (it is gone by then)."""
+    global _yt_working
+    if extra[:1] == ["--cookies"]:
+        return
+    if _yt_working != extra:
+        slog.info("%s: strategy [%s] now remembered as the working one (was [%s])", where, _sname(extra), _sname(_yt_working) if _yt_working is not None else "none")
+    _yt_working = extra
 
 
 def _yt_search(query, n=5):
     """Top n hits as [{title, channel, duration, url}] via yt-dlp (cookie strategies, last good one first).
     A search that ran and found nothing, an offline machine and a spent run budget all end the loop: another
     cookie store would not change the answer."""
-    global _yt_working
-    err = []
+    err, best = [], []
     for extra in _yt_order():
         if jlog.cancelled():
             return [], ["stopped"]
         if not _budget_take():
-            err = err or ["yt-dlp run budget for this track used up"]
+            err = best or err or ["yt-dlp run budget for this track used up"]
+            best = err
             break
         code, out, e = _yt("--dump-json", "--flat-playlist", "--no-warnings", *extra, f"ytsearch{n}:{query}")
         hits = []
@@ -694,9 +869,7 @@ def _yt_search(query, n=5):
                 hits.append({"title": d.get("title") or "", "channel": d.get("channel") or d.get("uploader") or "",
                              "duration": d.get("duration"), "url": d.get("url") or f"https://www.youtube.com/watch?v={d['id']}"})
         if code == 0 and hits:
-            if _yt_working != extra:
-                slog.info("search: strategy [%s] now remembered as the working one (was [%s])", _sname(extra), _sname(_yt_working) if _yt_working is not None else "none")
-            _yt_working = extra
+            _remember(extra, "search")
             slog.info("search %r: strategy [%s] OK, %d hit(s)", query, _sname(extra), len(hits))
             return hits, []
         if code == 0:
@@ -704,10 +877,13 @@ def _yt_search(query, n=5):
             return [], []
         err = (out + e).splitlines()
         slog.warning("search %r: strategy [%s] FAILED: %s", query, _sname(extra), _errline(err))
+        if _note_store_failure(extra, err):
+            _budget_refund()
+        best = _keep_err(best, err)
         if _network_down(err):
             slog.error("search %r: the network looks down, not trying other strategies", query)
             break
-    return [], err
+    return [], best or err
 
 
 def _tl(track):
@@ -1192,20 +1368,17 @@ def _download_candidates(urls, outtmpl, mp3):
     """Try each acceptable upload in turn (best first), each with the cookie strategies, inside the per-track run
     budget. A failure that belongs to the upload (removed, private, region-blocked) moves to the next upload; one
     that belongs to the connection ends the attempt. Returns (ok, path, error lines)."""
-    global _yt_working
-    last_err = []
+    last_err, best = [], []
     for ui, yt in enumerate(urls, 1):
         slog.info("download: upload %d/%d %s", ui, len(urls), yt)
         for extra in _yt_order():
             if jlog.cancelled():
                 return False, None, ["stopped"]
             if not _budget_take():
-                return False, None, last_err or ["yt-dlp run budget for this track used up"]
+                return False, None, best or last_err or ["yt-dlp run budget for this track used up"]
             ok, path, last_err = _yt_download_native(yt, outtmpl, extra, mp3)
             if ok and path:
-                if _yt_working != extra:
-                    slog.info("download: strategy [%s] now remembered as the working one (was [%s])", _sname(extra), _sname(_yt_working) if _yt_working is not None else "none")
-                _yt_working = extra
+                _remember(extra, "download")
                 slog.info("download: upload %d/%d strategy [%s] OK -> %s", ui, len(urls), _sname(extra), path)
                 return True, path, []
             if ok:
@@ -1213,14 +1386,17 @@ def _download_candidates(urls, outtmpl, mp3):
                 return False, None, ["the download finished but no file was found"]
             text = " ".join(last_err).lower()
             slog.warning("download: upload %d/%d strategy [%s] FAILED: %s", ui, len(urls), _sname(extra), _errline(last_err))
+            if _note_store_failure(extra, last_err):
+                _budget_refund()
+            best = _keep_err(best, last_err)
             if _network_down(last_err):
                 slog.error("download: the network looks down, giving up on this song")
-                return False, None, last_err
+                return False, None, best
             if "requested format" not in text and re.search(r"private video|not available|unavailable|removed|blocked|copyright|terminated|does not exist", text):
                 slog.warning("download: the failure belongs to the upload itself, moving to the next upload")
                 break           # this upload is out; the next candidate gets its turn
-    slog.error("download: no upload could be downloaded; last error: %s", _errline(last_err))
-    return False, None, last_err
+    slog.error("download: no upload could be downloaded; shown error: %s", _errline(best or last_err))
+    return False, None, best or last_err
 
 
 def spotify_track(meta, outdir, analyze=False, mp3=False):
@@ -1385,6 +1561,8 @@ def session_browsers(site):
 
 def cookie_strategies(site):
     out = []
+    if _job_cookie_file():
+        out.append(("browser session", ["--cookies", _job_cookie_file()]))
     if COOKIES_TXT.exists():
         out.append(("cookies.txt", ["--cookies", str(COOKIES_TXT)]))
     found = session_browsers(site)
@@ -1665,9 +1843,15 @@ def finish(paths, strip=False, webp=False):
 
 
 # ══════════════════════════════════════════════════════════════════════════════ entry
-def fetch(url, mode="video", outdir="", meta=None, analyze=False, mp3=False):
-    """Run the engine for a page URL; the whole call and its outcome are in the log."""
+def fetch(url, mode="video", outdir="", meta=None, analyze=False, mp3=False, cookies=None):
+    """Run the engine for a page URL; the whole call and its outcome are in the log. cookies = the browser's
+    cookies.txt text for this one job (see job_cookies)."""
     t0 = time.monotonic()
+    with job_cookies(cookies):
+        return _fetch_logged(url, mode, outdir, meta, analyze, mp3, t0)
+
+
+def _fetch_logged(url, mode, outdir, meta, analyze, mp3, t0):
     log.info("fetch: %s site=%s mode=%s outdir=%s analyze=%s mp3=%s%s", url, site_of(url), mode, outdir or "~/Downloads", analyze, mp3,
              f" meta={jlog.summarize({'meta': meta})}" if meta else "")
     r = _fetch(url, mode, outdir, meta, analyze, mp3)

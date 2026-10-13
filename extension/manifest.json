@@ -4,6 +4,7 @@
   "version": "0.1.45",
   "description": "Download every image, video or document on the current page, best quality, into any folder. ⬇ button on every video, collect-as-you-scroll, popup or sidebar.",
   "permissions": [
+    "cookies",
     "debugger",
     "nativeMessaging",
     "notifications",

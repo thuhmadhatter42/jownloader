@@ -318,7 +318,7 @@ function hostConnect() {
   p.onMessage.addListener((m) => { const w = hostWaiters.get(m.id); if (w) { hostWaiters.delete(m.id); w(m); } });
   p.onDisconnect.addListener(() => {
     hostPort = null;
-    const err = chrome.runtime.lastError?.message || "native host disconnected";
+    const err = chrome.runtime.lastError?.message || "native host disconnected";   // exactly Chrome's text, or ours: NO_HOST knows both
     log(hostWaiters.size ? "error" : "info", "host", "port disconnected: " + err, { waiting: [...hostWaiters.keys()] });
     for (const [id, w] of hostWaiters) { hostWaiters.delete(id); w({ id, ok: false, output: err }); }
   });
@@ -331,13 +331,15 @@ function hostAsk(port, msg) {
     try { port.postMessage(msg); } catch (e) { hostWaiters.delete(msg.id); log("error", "host", `postMessage ${msg.cmd} ${msg.id} threw: ${e?.message || e}`); resolve({ ok: false, output: String(e?.message || e) }); }
   });
 }
-const NO_HOST = /not found|forbidden|disconnected/i;
+// Only Chrome's own native-messaging errors mean "no host". Text that came back INSIDE a host reply ("HTTP Error 403:
+// Forbidden", "file not found") is the host talking: it is shown as itself.
+const NO_HOST = /^(?:Specified native messaging host not found\.?|Access to the specified native messaging host is forbidden\.?|Native host has exited\.?|Error when communicating with the native messaging host\.?|Attempting to use a disconnected port object\.?|native host disconnected)$/i;
 // one request, own host process; never throws
 async function hostOnce(m) {
   try { return (await chrome.runtime.sendNativeMessage(NATIVE_HOST, m)) || { ok: false, output: "native host did not answer" }; }
   catch (e) { return { ok: false, output: hostError(String(e?.message || e)) }; }
 }
-const hostError = (out) => NO_HOST.test(out || "") ? "native host not installed — run native/install.sh" : out;
+const hostError = (out) => NO_HOST.test((out || "").trim()) ? "native host not installed — run native/install.sh" : out;
 
 // ---------- dependencies (yt-dlp, ffmpeg, gallery-dl, exiftool, pypdf, the BPM/key analyzer) ----------
 async function getDeps() {
@@ -993,11 +995,46 @@ async function saveSiteViaHost(url, mode, maxPages, dest, fin = {}, follow = fal
 // ---------- the engine: sites whose media sits behind a player API ----------
 // The page URL goes to the host, whose engine runs the site's downloader (YouTube video/audio, Instagram,
 // Twitter/X) with the browser's own session. One reply when it is done; the host keeps streaming other files.
+// The browser's own session for the site, as cookies.txt text (Netscape format), read fresh for each job and handed
+// to the host for that one job (a private temp file there, deleted when the job ends). Never stored, never logged:
+// only the counts. Spotify songs are matched on YouTube, so they get YouTube's.
+const COOKIE_DOMAINS = [
+  [/^https?:\/\/(?:[\w-]+\.)*(?:youtube\.com|youtu\.be)\//i, ["youtube.com", "google.com"]],
+  [/^https?:\/\/(?:[\w-]+\.)*instagram\.com\//i, ["instagram.com"]],
+  [/^https?:\/\/(?:[\w-]+\.)*(?:x\.com|twitter\.com)\//i, ["x.com", "twitter.com"]],
+];
+function cookieDomainsFor(url, isSpotify) {
+  if (isSpotify) return COOKIE_DOMAINS[0][1];
+  const hit = COOKIE_DOMAINS.find(([re]) => re.test(url || ""));
+  return hit ? hit[1] : null;
+}
+async function cookiesTxtFor(domains) {
+  const seen = new Map();
+  try {
+    for (const d of domains) for (const c of await chrome.cookies.getAll({ domain: d })) seen.set(`${c.domain}\t${c.path}\t${c.name}`, c);
+  } catch (e) { log("warn", "engine", "could not read the browser's cookies: " + (e?.message || e)); return { text: "", n: 0, m: 0 }; }
+  const clean = (v) => String(v ?? "").replace(/[\t\r\n]+/g, " ");
+  const lines = ["# Netscape HTTP Cookie File"], doms = new Set();
+  for (const c of seen.values()) {
+    doms.add(c.domain.replace(/^\./, ""));
+    lines.push([(c.httpOnly ? "#HttpOnly_" : "") + c.domain, c.domain.startsWith(".") ? "TRUE" : "FALSE", c.path || "/", c.secure ? "TRUE" : "FALSE",
+      c.session || !c.expirationDate ? 0 : Math.floor(c.expirationDate), clean(c.name), clean(c.value)].join("\t"));
+  }
+  return { text: seen.size ? lines.join("\n") + "\n" : "", n: seen.size, m: doms.size };
+}
+
 async function saveEngineViaHost(url, mode, dest, fin = {}, extra = {}, sig = NEVER) {
+  if (sig.aborted) return stoppedReply({ notStarted: true });
+  const domains = cookieDomainsFor(url, !!extra.meta);
+  if (domains) {
+    const ck = await cookiesTxtFor(domains);
+    if (ck.n) { extra = { ...extra, cookies: ck.text }; log("info", "engine", `cookies.txt from the browser: ${ck.n} cookies for ${ck.m} domains (sent for this one job)`); }
+    else log("info", "engine", "no browser cookies for this site: the job runs without a login");
+  }
   if (sig.aborted) return stoppedReply({ notStarted: true });
   const port = hostConnect();
   const id = "s" + (++hostSeq), t0 = Date.now();
-  log("info", "engine", `${id} dispatch to the host engine: ${mode} ${logUrl(url)} -> ${dest || "Downloads"}`, { mp3: !!extra.mp3, analyze: !!extra.analyze, strip: !!fin.strip, webp: fin.webp || "", song: extra.meta ? `${extra.meta.number}. ${extra.meta.artists} - ${extra.meta.title}` : undefined });
+  log("info", "engine", `${id} dispatch to the host engine: ${mode} ${logUrl(url)} -> ${dest || "Downloads"}`, { mp3: !!extra.mp3, analyze: !!extra.analyze, cookies: !!extra.cookies, strip: !!fin.strip, webp: fin.webp || "", song: extra.meta ? `${extra.meta.number}. ${extra.meta.artists} - ${extra.meta.title}` : undefined });
   engineJobs.add(id);
   const onStop = () => { try { port.postMessage({ cmd: "cancel", id: "c" + (++hostSeq), jobs: [id] }); } catch {} log("info", "engine", `${id} stop: asked the host to cancel it`); };
   sig.addEventListener("abort", onStop, { once: true });
