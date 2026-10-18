@@ -489,6 +489,17 @@ with sync_playwright() as p:
     sw.evaluate("""async () => { globalThis.__reply = null; hostConnect = __origHC; hostAsk = __origHA;
       for (const [u, n, d] of [['https://www.youtube.com/', 'SID', '.youtube.com'], ['https://www.youtube.com/', 'HSID', '.youtube.com'], ['https://accounts.google.com/', 'NID', '.google.com'], ['https://example.test/', 'OTHER', 'example.test']]) await chrome.cookies.remove({ url: u, name: n }); }""")
     srv.shutdown()
+    # 0.1.49 (finding 63): hostRelease() leaves the port up while a request (setup / list read) still waits on it
+    r63 = sw.evaluate("""async () => {
+      const o = { hp: hostPort, gp: progress.active }; let drops = 0; const out = {};
+      hostPort = { disconnect() { drops++; }, postMessage() {} }; progress.active = 0;
+      hostWaiters.set('s-pending', () => {});
+      hostRelease(); out.whileWaiting = [drops, hostPort !== null];
+      hostWaiters.delete('s-pending');
+      hostRelease(); out.afterReply = [drops, hostPort === null];
+      hostPort = o.hp; progress.active = o.gp; return out; }""")
+    check("63: a pending setup/list request keeps the host port up", r63["whileWaiting"], [0, True])
+    check("63: once nothing waits, hostRelease closes the port as before", r63["afterReply"], [1, True])
     # last: two queued songs hold the queue (20 s Spotify gap), so nothing after this may wait on a job
     r = pop.evaluate("async items => await chrome.runtime.sendMessage({type:'download', kind:'song', dest:'/d', prefix:'', items})",
                      [song("https://open.spotify.com/track/bbb", "Dup list", 1), song("https://open.spotify.com/track/bbb", "Dup list", 2)])

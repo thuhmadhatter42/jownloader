@@ -561,7 +561,8 @@ SPOTIFY_EMBED_CAP = 100        # the embed page lists at most this many tracks o
 SPOTIFY_GAP_S = 20             # the extension waits this long between two tracks of a list (see background.js)
 EMBED_DIR_ENV = "JOWNLOADER_EMBED_DIR"   # tests: read <dir>/<kind>.html instead of the network
 SPOTIFY_MAX_GAP_S = 15         # an upload this far from the track's length is never the track
-_NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S)
+# any attribute order, extra attributes (crossorigin, nonce…), either quote style, id= matched as a whole word
+_NEXT_DATA = re.compile(r'<script\b[^>]*?\bid\s*=\s*(["\']?)__NEXT_DATA__\1[^>]*>(.*?)</script\s*>', re.S | re.I)
 _yt_working = None             # the cookie strategy that last worked, tried first for the next track
 
 
@@ -588,7 +589,7 @@ def _spotify_embed(kind, sid):
     if not m:
         slog.error("embed %s/%s: the page has no __NEXT_DATA__ block (%d chars): %r", kind, sid, len(html), html[:200])
         raise ValueError("the page had no track data")
-    return json.loads(m.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+    return json.loads(m.group(2))["props"]["pageProps"]["state"]["data"]["entity"]
 
 
 def _best_image(entity):

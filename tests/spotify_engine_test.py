@@ -411,5 +411,30 @@ finally:
         srv.shutdown()
     shutil.rmtree(d, ignore_errors=True)
     shutil.rmtree(_LOGDIR, ignore_errors=True)
+# 0.1.49 (finding 67): the embed's __NEXT_DATA__ script tag is found in either attribute order, with extra attributes
+import importlib, time as _time
+importlib.reload(engine)   # real _spotify_embed, reading fixtures from disk
+_blob = json.dumps({"props": {"pageProps": {"state": {"data": {"entity": {"name": "T"}}}}}})
+_ed = tempfile.mkdtemp(prefix="jown-embed-")
+os.environ[engine.EMBED_DIR_ENV] = _ed
+for _label, _tag in (("id first", '<script id="__NEXT_DATA__" type="application/json">'),
+                     ("type first", '<script type="application/json" id="__NEXT_DATA__">'),
+                     ("extra attribute", '<script id="__NEXT_DATA__" type="application/json" crossorigin="anonymous">'),
+                     ("single quotes, nonce first", "<script nonce='x' type='application/json' id='__NEXT_DATA__'>")):
+    write(_ed, "track.html", f"<html><head><script>var a=1;</script>{_tag}{_blob}</script></head></html>")
+    _t0 = _time.monotonic()
+    try:
+        _got = engine._spotify_embed("track", "x")
+    except Exception as e:
+        _got = repr(e)
+    check(f"67: embed parse, {_label}", [_got, _time.monotonic() - _t0 < 2], [{"name": "T"}, True])
+write(_ed, "track.html", "<html><script id=\"other\">x</script>" + "<script " * 2000 + "</html>")
+_t0 = _time.monotonic()
+try:
+    engine._spotify_embed("track", "x"); _got = "parsed"
+except ValueError as e:
+    _got = str(e)
+check("67: a page with no data block fails fast with the plain message", [_got, _time.monotonic() - _t0 < 2], ["the page had no track data", True])
+del os.environ[engine.EMBED_DIR_ENV]; shutil.rmtree(_ed, ignore_errors=True)
 print("ALL GREEN" if not fails else f"{fails} FAILED")
 sys.exit(1 if fails else 0)

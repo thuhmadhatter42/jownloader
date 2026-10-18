@@ -324,7 +324,8 @@ function hostConnect() {
   });
   return (hostPort = p);
 }
-function hostRelease() { if (hostPort && !progress.active) { log("info", "host", "port released: no batch is running"); try { hostPort.disconnect(); } catch {} hostPort = null; keyCache.clear(); } }
+function hostRelease() { if (hostPort && !progress.active && !hostWaiters.size) {   // never while a request (setup, a list read) still waits on this port
+   log("info", "host", "port released: no batch is running"); try { hostPort.disconnect(); } catch {} hostPort = null; keyCache.clear(); } }
 function hostAsk(port, msg) {
   return new Promise((resolve) => {
     hostWaiters.set(msg.id, resolve);
