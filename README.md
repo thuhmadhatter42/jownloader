@@ -37,7 +37,7 @@ you already have.
   popup says so). Clear-key AES-128 HLS is handled; DRM is refused.
 - **YouTube, Instagram, Twitter/X** — on those pages the button reads *Save this video / this post /
   everything from @name* and the whole thing comes down through the site's own API with your browser
-  session: YouTube as H.264 + AAC `.mp4` (QuickTime-native), or *Audio only*: the upload's AAC
+  session: YouTube at its best resolution as a QuickTime-playable `.mp4` (H.264 + AAC as is; 1440p/4K, which exist only as VP9/AV1, are re-encoded to HEVC with the Mac's hardware encoder), or *Audio only*: the upload's AAC
   saved exactly as delivered (`.m4a`, never re-encoded; Opus stays `.opus`), with the BPM and top-3 keys
   detected and written into the name (`Song (128.0 BPM Am C F).m4a`) — switch on **Save audio as MP3**
   (right under the button, and on the Spotify card) to get an MP3 (V0) instead; an Instagram post,

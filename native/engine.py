@@ -5,8 +5,8 @@ The extension fetches ordinary files itself. For sites that hide their media beh
 (YouTube, Instagram, Twitter/X) it hands the page URL to this module instead, and the host runs it:
 
   fetch(url, mode, outdir)   mode "video" (default) or "audio" (AAC as delivered, MP3 V0 with mp3=True; BPM/key in the name)
-      youtube.com / youtu.be   -> yt-dlp; video = H.264 + AAC in .mp4 (QuickTime-native — a naive
-                                  bestvideo+bestaudio yields VP9/Opus that QuickTime cannot decode);
+      youtube.com / youtu.be   -> yt-dlp; video = the best resolution, in .mp4 QuickTime plays: H.264 + AAC
+                                  as downloaded, else (1440p/4K are VP9/AV1 only) re-encoded to HEVC;
                                   audio = the upload's own AAC saved as-is (.m4a, never re-encoded; Opus stays
                                   Opus), or MP3 V0 when mp3=True; analysed (analyze.py) and renamed
                                   "Title (BPM key1 key2 key3).m4a", link logged to "(y-m-d) Youtube DL LINKS.txt"
@@ -230,8 +230,12 @@ YT_STRATEGIES = [
 ]
 YT_NO_LOGIN = 2             # the first two strategies need no session
 TRANSIENT_403_RE = re.compile(r"unable to download video data: HTTP Error 403", re.I)
-# QuickTime-compatible: H.264 video + AAC audio in MP4; falls back to any mp4, then anything.
-YT_VIDEO_FORMAT = "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[ext=mp4]/b"
+# The true best picture: highest resolution, then frame rate, and only among equals H.264 + AAC (plays in QuickTime
+# as downloaded). H.264 stops at 1080p on YouTube; 1440p / 2160p are VP9 or AV1 only, so those are re-encoded to
+# HEVC after the download (_yt_to_hevc). -S fields are checked in order, ties fall through to yt-dlp's defaults.
+YT_VIDEO_FORMAT = "bv*+ba/b"
+YT_VIDEO_SORT = "res,fps,vcodec:avc1,acodec:mp4a"
+HEVC_QUALITY = "65"         # hevc_videotoolbox -q:v (0-100): near-transparent for VP9/AV1 sources
 
 
 def _yt(*args):
@@ -411,7 +415,7 @@ def _yt_download(url, mode, outtmpl, extra, mp3=False):
     if mode == "audio":
         args = audio_args(mp3)
     else:
-        args = ["-f", YT_VIDEO_FORMAT, "--merge-output-format", "mp4"]
+        args = ["-f", YT_VIDEO_FORMAT, "-S", YT_VIDEO_SORT, "--merge-output-format", "mp4"]
     code, out, err = _yt(*args, "-o", outtmpl, "--no-playlist", "--quiet", "--no-progress",
                          "--print", "after_move:filepath", *extra, url)
     if code != 0:
@@ -425,6 +429,95 @@ def _yt_download(url, mode, outtmpl, extra, mp3=False):
         matches = sorted(base.glob(f"{glob.escape(stem)}.*"), key=lambda p: p.stat().st_mtime, reverse=True)
         path = matches[0] if matches else None
     return True, path, []
+
+
+_encoders_cache = None
+
+
+def _encoders():
+    """The names of ffmpeg's encoders (cached for the process)."""
+    global _encoders_cache
+    if _encoders_cache is None:
+        code, out, _ = _run(["ffmpeg", "-hide_banner", "-encoders"], timeout=30)
+        _encoders_cache = set(re.findall(r"^\s*[VAS][A-Z.]{5}\s+(\S+)", out or "", re.M)) if code == 0 else set()
+    return _encoders_cache
+
+
+def _streams(path):
+    """(video codec, audio codec or '', height) of a file via ffprobe, or None when it cannot be read."""
+    code, out, _ = _run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name,height",
+                         "-of", "json", str(path)], timeout=60)
+    try:
+        st = json.loads(out)["streams"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    v = next((x for x in st if x.get("codec_type") == "video"), None)
+    a = next((x for x in st if x.get("codec_type") == "audio"), None)
+    if code != 0 or not v:
+        return None
+    return v.get("codec_name") or "", (a or {}).get("codec_name") or "", int(v.get("height") or 0)
+
+
+def _hevc_plan(vcodec, acodec, encoders):
+    """What makes a download QuickTime-playable. (None, '') = it already is (H.264/HEVC + AAC, or no audio).
+    Otherwise (ffmpeg output args, note): H.264/HEVC video is only remuxed (Opus audio to AAC); anything else
+    (VP9, AV1) is re-encoded to HEVC with the hardware encoder, else libx265. (False, note) = no encoder at all."""
+    keep_video = vcodec in ("h264", "hevc")
+    audio = ["-an"] if not acodec else ["-c:a", "copy"] if acodec == "aac" else ["-c:a", "aac", "-b:a", "256k"]
+    if keep_video and acodec in ("", "aac"):
+        return None, ""
+    tail = audio + ["-movflags", "+faststart"]
+    if keep_video:
+        return ["-c:v", "copy"] + (["-tag:v", "hvc1"] if vcodec == "hevc" else []) + tail, "audio converted to AAC"
+    if "hevc_videotoolbox" in encoders:
+        return ["-c:v", "hevc_videotoolbox", "-q:v", HEVC_QUALITY, "-tag:v", "hvc1"] + tail, f"re-encoded {vcodec} to HEVC"
+    if "libx265" in encoders:
+        return ["-c:v", "libx265", "-crf", "18", "-preset", "medium", "-tag:v", "hvc1"] + tail, f"re-encoded {vcodec} to HEVC (software)"
+    return False, f"saved as {vcodec}: no HEVC encoder in ffmpeg, so QuickTime may not play it"
+
+
+def _yt_to_hevc(path):
+    """Make a finished video download QuickTime-playable (see _hevc_plan). The file is replaced atomically under the
+    same name; on a failure or Stop the original stays. Returns a caveat for the result ('' when nothing to say)."""
+    path = Path(path)
+    probe = _streams(path)
+    if not probe:
+        log.warning("hevc: %s could not be probed, left as downloaded", path.name)
+        return ""
+    vcodec, acodec, height = probe
+    enc = _encoders()
+    plan, note = _hevc_plan(vcodec, acodec, enc)
+    log.info("hevc: %s video=%s audio=%s height=%d -> %s", path.name, vcodec, acodec or "none", height, note or "no re-encode needed")
+    if plan is None:
+        return ""
+    if plan is False:
+        return note
+    tmp = path.with_name(f"{path.stem}.hevc.tmp.mp4")        # <stem>.* so _guard_partials sweeps it on Stop
+    t0 = time.monotonic()
+    cmd = lambda p: ["ffmpeg", "-y", "-v", "error", "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?", *p, str(tmp)]
+    code, _, err = _run(cmd(plan))
+    if code != 0 and "hevc_videotoolbox" in plan and "libx265" in enc and not jlog.cancelled():
+        log.warning("hevc: hardware encoder failed (%s), trying libx265", _errline((err or "").splitlines()))
+        plan, note = _hevc_plan(vcodec, acodec, enc - {"hevc_videotoolbox"})
+        code, _, err = _run(cmd(plan))
+    if jlog.cancelled():
+        log.info("hevc: stopped, the downloaded %s stays as it was", path.name)
+        _drop(tmp)
+        return "stopped before the HEVC re-encode: kept as downloaded"
+    if code != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        log.error("hevc: ffmpeg failed: %s", _errline((err or "").splitlines()))
+        _drop(tmp)
+        return f"saved as {vcodec}: the HEVC re-encode failed, so QuickTime may not play it"
+    os.replace(tmp, path)
+    log.info("hevc: %s done in %.1fs, %.1f MB", path.name, time.monotonic() - t0, path.stat().st_size / 1e6)
+    return note
+
+
+def _drop(tmp):
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
 
 
 def _yt_explain(lines, url=""):
@@ -532,6 +625,8 @@ def youtube(url, mode, outdir, mp3=False):
         return {"ok": True, "path": str(outdir), "output": f"downloaded into {outdir} (file name not reported)"}
     note = ""
     jlog.keep_file(path)
+    if mode != "audio" and path.suffix.lower() == ".mp4":
+        note = _yt_to_hevc(path)
     if mode == "audio":
         res = _analyze(path) if not jlog.cancelled() else None
         if _stopped():                       # the file is whole; only its BPM/key name is skipped

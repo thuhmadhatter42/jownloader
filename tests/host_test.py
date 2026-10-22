@@ -1,6 +1,7 @@
 # Native-host rename test: drives native/jownloader_host.py over its stdio protocol with real files in a
 # temp folder (no Finder dialog, no browser). Run: python3 tests/host_test.py
-import json, os, select, struct, subprocess, sys, tempfile, time, shutil
+import json, os, re, select, struct, subprocess, sys, tempfile, time, shutil
+from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOST = os.path.join(os.path.dirname(HERE), "native", "jownloader_host.py")
 # the developer log of every host / engine this test starts goes to a temp folder, never ~/Library/Logs
@@ -201,7 +202,36 @@ try:
         check(f"_yt_download audio mp3={mp3}: conversion args {'present' if mp3 else 'absent'}", [("--audio-quality" in a), a[a.index("--audio-format") + 1], a[a.index("-f") + 1]], [mp3, "mp3" if mp3 else "best", "bestaudio/best" if mp3 else "bestaudio[ext=m4a]/bestaudio"])
     seen.clear(); engine._yt_download("https://example.test/v", "video", d + "/x.%(ext)s", [], True)
     check("_yt_download video: the mp3 flag never touches video", "--audio-format" in seen[0], False)
+    check("_yt_download video: best resolution first, H.264 only breaks ties (no avc1-only selector)",
+          [seen[0][seen[0].index("-f") + 1], seen[0][seen[0].index("-S") + 1].split(",")[:3]], ["bv*+ba/b", ["res", "fps", "vcodec:avc1"]])
     engine._yt = orig_yt
+
+    # the HEVC decision: what is kept, what is remuxed, what is re-encoded and with which encoder
+    both, soft, none = {"hevc_videotoolbox", "libx265"}, {"libx265"}, set()
+    check("hevc plan: H.264 + AAC at its best height is left alone (no re-encode)", engine._hevc_plan("h264", "aac", both), (None, ""))
+    check("hevc plan: HEVC + AAC and H.264 without audio are left alone", [engine._hevc_plan("hevc", "aac", both)[0], engine._hevc_plan("h264", "", both)[0]], [None, None])
+    p, note = engine._hevc_plan("vp9", "opus", both)
+    check("hevc plan: VP9 + Opus -> hardware HEVC, hvc1 tag, AAC 256k, faststart",
+          [p[p.index("-c:v") + 1], p[p.index("-q:v") + 1], p[p.index("-tag:v") + 1], p[p.index("-c:a") + 1], p[p.index("-b:a") + 1], "+faststart" in p, "libx265" in p],
+          ["hevc_videotoolbox", engine.HEVC_QUALITY, "hvc1", "aac", "256k", True, False])
+    p, _ = engine._hevc_plan("av1", "aac", both)
+    check("hevc plan: AV1 + AAC -> HEVC with the audio copied", [p[p.index("-c:v") + 1], p[p.index("-c:a") + 1], "-b:a" in p], ["hevc_videotoolbox", "copy", False])
+    p, note = engine._hevc_plan("vp9", "aac", soft)
+    check("hevc plan: no hardware encoder -> libx265 crf 18 medium, hvc1", [p[p.index("-c:v") + 1], p[p.index("-crf") + 1], p[p.index("-preset") + 1], p[p.index("-tag:v") + 1]], ["libx265", "18", "medium", "hvc1"])
+    check("hevc plan: no HEVC encoder at all -> False with a caveat naming the codec", [engine._hevc_plan("vp9", "aac", none)[0], "vp9" in engine._hevc_plan("vp9", "aac", none)[1]], [False, True])
+    p, note = engine._hevc_plan("h264", "opus", both)
+    check("hevc plan: H.264 + Opus -> video copied, only the audio becomes AAC", [p[p.index("-c:v") + 1], p[p.index("-c:a") + 1]], ["copy", "aac"])
+    # and the file side, with real ffmpeg: a VP9/Opus mp4 becomes HEVC hvc1 + AAC under the same name; a stop keeps the original
+    if shutil.which("ffmpeg") and shutil.which("ffprobe") and {"libvpx-vp9", "libopus"} <= set(re.findall(r"^\s*[VAS][A-Z.]{5}\s+(\S+)", subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout, re.M)):
+        hv = os.path.join(d, "hevc"); os.makedirs(hv)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=2", "-f", "lavfi", "-i", "sine=duration=2",
+                        "-c:v", "libvpx-vp9", "-c:a", "libopus", hv + "/Clip.mp4"], check=True)
+        engine._encoders_cache = None
+        note = engine._yt_to_hevc(Path(hv) / "Clip.mp4")
+        got = engine._streams(Path(hv) / "Clip.mp4")
+        tag = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_tag_string", "-of", "csv=p=0", hv + "/Clip.mp4"], capture_output=True, text=True).stdout.strip()
+        check("hevc file: VP9 + Opus mp4 -> hevc + aac, tag hvc1, same name, no temp left, the note says why",
+              [got[:2], tag, sorted(os.listdir(hv)), "HEVC" in note], [("hevc", "aac"), "hvc1", ["Clip.mp4"], True])
 
     # the file side needs mutagen (native/.venv): tags written into a real m4a, never overwritten
     if os.path.exists(venv_py) and subprocess.run([venv_py, "-c", "import mutagen"], capture_output=True).returncode == 0:
