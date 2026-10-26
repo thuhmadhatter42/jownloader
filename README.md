@@ -120,15 +120,26 @@ What the extension asks for, and why:
 Files are written by a small native-messaging host, a Python script the browser launches on demand.
 That is what makes "any folder, no dialog" possible; Chrome's own download API can't do it.
 
-1. Clone this repo somewhere it can stay (the browser calls the host by absolute path).
-2. `bash native/install.sh` — registers the host with Brave, Chrome and Chromium and installs the
-   engine's tools: `yt-dlp`, `ffmpeg`, `gallery-dl`, `exiftool` and the BPM/key
-   analyzer (`essentia-tensorflow`, or `librosa` where no wheel exists). `--no-deps` skips that part.
-   Needs `python3` on the system path; macOS provides it with the Xcode Command Line Tools
-   (`xcode-select --install`).
-3. `brave://extensions` (or `chrome://extensions`) → **Developer mode** on → **Load unpacked** →
-   choose the `extension/` folder.
-4. Pin Jownloader from the puzzle-piece menu.
+Paste this into Terminal (it asks for your Mac password once, and installs everything else itself:
+Apple's Command Line Tools if missing, the code in `~/Applications/Jownloader`, Homebrew, the tools below):
+
+```
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/thuhmadhatter42/jownloader/master/install)"
+```
+
+Then the one step a script cannot do (a browser will not load an unpacked extension on its own): the
+installer copies the `extension` folder path to the clipboard, highlights the folder in Finder and opens
+`brave://extensions` (or `chrome://extensions`) — turn on **Developer mode**, drag the `extension` folder onto
+the page (or **Load unpacked**, Cmd+Shift+G, Cmd+V), and pin Jownloader from the puzzle-piece menu.
+
+To update, run the same command again (the code is replaced; `native/.venv` is kept).
+
+By hand instead: clone this repo somewhere it can stay (the browser calls the host by absolute path) and run
+`bash native/install.sh` — it registers the host with Brave, Chrome and Chromium and installs the
+engine's tools: `yt-dlp`, `ffmpeg`, `gallery-dl`, `exiftool` and the BPM/key
+analyzer (`essentia-tensorflow`, or `librosa` where no wheel exists). `--no-deps` skips that part.
+It needs `python3` on the system path; macOS provides it with the Xcode Command Line Tools
+(`xcode-select --install`). Then load `extension/` as above.
 
 If you move the folder, run `native/install.sh` again. If the host isn't reachable, every file in a
 batch fails with a message saying so; nothing is saved silently anywhere else.

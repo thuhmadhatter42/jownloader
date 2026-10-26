@@ -254,6 +254,8 @@ ensure_deps() {
 
     if ! command -v brew &>/dev/null; then
         echo "▸ Installing Homebrew..."
+        # password already cached (the one-command installer asks up front): no "Press RETURN" pause
+        sudo -n true 2>/dev/null && export NONINTERACTIVE=1
         /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
         load_brew
         command -v brew &>/dev/null || echo "  Homebrew could not be installed here (it needs an admin account) — continuing with pipx / by hand; the list at the end says what is missing and how to get it"

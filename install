@@ -1,0 +1,126 @@
+#!/bin/bash
+# One-command Jownloader install for a stock Mac (curl, tar and bash 3.2 are all it needs):
+#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/thuhmadhatter42/jownloader/master/install)"
+# The bash -c "$(curl ...)" form (like Homebrew's) keeps stdin on the terminal, so password prompts work.
+# Steps: Command Line Tools (headless) -> download the repo as a tarball (no git) -> native/install.sh ->
+# point at the one browser step that cannot be scripted. Running it again updates the code in place and
+# keeps the Mac's local state (native/.venv and friends).
+# Test hooks: JOWN_TARBALL (path or URL), JOWN_DEST, JOWN_NO_DEPS=1 (install.sh --no-deps),
+# JOWN_NO_BROWSER=1 (no clipboard / Finder / browser), JOWN_DRY_CLT=1 (stop where CLT would be installed).
+set -e
+
+REPO_TAR="https://codeload.github.com/thuhmadhatter42/jownloader/tar.gz/refs/heads/master"
+TARBALL="${JOWN_TARBALL:-$REPO_TAR}"
+DEST="${JOWN_DEST:-$HOME/Applications/Jownloader}"
+CLT_MARK="/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress"
+KEEPALIVE_PID=""
+TMP=""
+
+say()  { echo "▸ $*"; }
+die()  { echo "error: $*" >&2; exit 1; }
+cleanup() {
+  [ -n "$KEEPALIVE_PID" ] && kill "$KEEPALIVE_PID" 2>/dev/null
+  [ -n "$TMP" ] && [ -d "$TMP" ] && rm -rf "$TMP"
+  [ -e "$CLT_MARK" ] && [ -n "${CLT_MARK_MINE-}" ] && sudo -n rm -f "$CLT_MARK" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+
+[ "$(uname -s)" = Darwin ] || die "this installer is for macOS"
+
+# Are the Command Line Tools really usable? Never runs /usr/bin/python3: without the tools that is a shim that
+# pops the GUI install dialog. Runs the tools' own python3 instead.
+clt_ok() {
+  local p
+  p="$(xcode-select -p 2>/dev/null)" || return 1
+  [ -x "$p/usr/bin/python3" ] && "$p/usr/bin/python3" -c 'import sys' >/dev/null 2>&1
+}
+
+# sudo once, up front, kept alive for the long steps. Only called when something below needs it.
+SUDO_READY=""
+need_sudo() {
+  [ -n "$SUDO_READY" ] && return 0
+  say "Your Mac password is asked once, so Apple's developer tools and Homebrew can install."
+  sudo -v || return 1
+  SUDO_READY=1
+  ( while true; do sudo -n true 2>/dev/null; sleep 50; kill -0 "$$" 2>/dev/null || exit 0; done ) &
+  KEEPALIVE_PID=$!
+}
+
+install_clt() {
+  local label=""
+  if [ -n "$JOWN_DRY_CLT" ]; then say "(dry run) would install the Command Line Tools here"; return 0; fi
+  need_sudo || die "an administrator password is needed to install Apple's Command Line Tools"
+  say "Installing Apple's Command Line Tools (a few minutes)..."
+  # Homebrew's own trick: this marker makes softwareupdate list the tools as an installable update
+  touch "$CLT_MARK" && CLT_MARK_MINE=1
+  label="$(/usr/sbin/softwareupdate -l 2>/dev/null | grep -B 1 -E 'Command Line Tools' \
+           | awk -F'*' '/^ *\*/ {print $2}' | sed -e 's/^ *Label: //' -e 's/^ *//' | sort -V | tail -n1)" || true
+  if [ -n "$label" ]; then
+    sudo /usr/sbin/softwareupdate -i "$label" --verbose || true
+    sudo /usr/bin/xcode-select --switch /Library/Developer/CommandLineTools 2>/dev/null || true
+  fi
+  sudo -n rm -f "$CLT_MARK" 2>/dev/null; CLT_MARK_MINE=""
+  if ! clt_ok; then
+    say "Click Install in the dialog that just opened; this continues by itself when it finishes."
+    /usr/bin/xcode-select --install >/dev/null 2>&1 || true
+    while ! clt_ok; do sleep 5; done
+  fi
+}
+
+if clt_ok; then say "Command Line Tools: present"; else install_clt; fi
+[ -n "$JOWN_DRY_CLT" ] && ! clt_ok && { say "dry run stops here"; exit 0; }
+
+# ---- download (no git): extract beside the target, then swap, so a failed download changes nothing ----
+mkdir -p "$(dirname "$DEST")"
+TMP="$(mktemp -d "$(dirname "$DEST")/.jownloader-install.XXXXXX")"
+say "Downloading Jownloader..."
+case "$TARBALL" in
+  http://*|https://*) curl -fsSL "$TARBALL" -o "$TMP/src.tar.gz" || die "download failed ($TARBALL)" ;;
+  *) cp "$TARBALL" "$TMP/src.tar.gz" || die "cannot read $TARBALL" ;;
+esac
+mkdir "$TMP/new"
+tar -xzf "$TMP/src.tar.gz" -C "$TMP/new" --strip-components=1 || die "the download is not a valid archive"
+[ -f "$TMP/new/native/install.sh" ] && [ -f "$TMP/new/extension/manifest.json" ] || die "the download is missing Jownloader's files"
+
+if [ -d "$DEST" ]; then
+  say "Updating $DEST (your local setup is kept)"
+  # per-Mac state: the venv, yt-dlp update stamp, cookie source, optional cookies.txt
+  for f in .venv .cookie-source .last-ytdlp-upgrade cookies.txt; do
+    [ -e "$DEST/native/$f" ] && mv "$DEST/native/$f" "$TMP/new/native/$f"
+  done
+  mv "$DEST" "$TMP/old"
+  mv "$TMP/new" "$DEST" || { mv "$TMP/old" "$DEST"; die "could not replace $DEST"; }
+else
+  mv "$TMP/new" "$DEST"
+fi
+say "Installed in $DEST"
+
+# ---- Homebrew + tools + host registration (native/install.sh) ----
+if [ -z "$JOWN_NO_DEPS" ] && ! command -v brew >/dev/null 2>&1 \
+   && [ ! -x /opt/homebrew/bin/brew ] && [ ! -x /usr/local/bin/brew ]; then
+  need_sudo || echo "note: no administrator rights — Homebrew will be skipped; the list at the end says what is missing"
+fi
+say "Setting up the downloader's tools (the first run takes several minutes)..."
+if [ -n "$JOWN_NO_DEPS" ]; then bash "$DEST/native/install.sh" --no-deps; else bash "$DEST/native/install.sh"; fi
+
+# ---- the one browser step ----
+EXT="$DEST/extension"
+if [ -n "$JOWN_NO_BROWSER" ]; then
+  say "Skipping the browser step (JOWN_NO_BROWSER)"
+else
+  if [ -d "/Applications/Brave Browser.app" ]; then APP="Brave Browser"; PAGE="brave://extensions"
+  elif [ -d "/Applications/Google Chrome.app" ]; then APP="Google Chrome"; PAGE="chrome://extensions"
+  else APP=""; PAGE="chrome://extensions"; fi
+  printf '%s' "$EXT" | pbcopy
+  open -R "$EXT" 2>/dev/null || true
+  if [ -n "$APP" ]; then open -a "$APP" "$PAGE" 2>/dev/null || true; fi
+  echo
+  [ -z "$APP" ] && echo "Install Brave or Chrome first, then open $PAGE in it."
+  echo "Last step, in ${APP:-your browser} ($PAGE; paste that into the address bar if it did not open):"
+  echo "  1. Turn on Developer mode (top right)."
+  echo "  2. Drag the highlighted 'extension' folder onto the page (or Load unpacked, Cmd+Shift+G, Cmd+V, Return)."
+  echo "  3. Pin Jownloader from the puzzle-piece menu."
+fi
+echo
+echo "Done. To update later, run the same command again."
