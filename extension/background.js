@@ -560,7 +560,7 @@ async function fetchBytes(url, range, sig = NEVER) {
     catch (e) {
       if (sig.aborted) throw stopError();
       if (e?.retry !== true) throw e;
-      if (attempt >= 2) { log("error", "stream", `segment gave up after 3 tries: ${e.cause?.message || e.cause}`, { url: logUrl(url) }); throw e.cause; }
+      if (attempt >= 2) { log("error", "stream", `segment gave up after 3 tries: ${e.cause?.message || e.cause}`, { url: logUrl(url) }); try { e.cause.gaveUp = true; } catch {} throw e.cause; }
       log("warn", "stream", `segment retry ${attempt + 1}/2 after: ${e.cause?.message || e.cause}`, { url: logUrl(url) });
       await sleepFor(attempt ? 1500 : 500, sig);
     }
@@ -573,7 +573,7 @@ async function fetchBytesOnce(url, range, sig = NEVER) {
     try { res = await fetch(url, { credentials: "include", signal: withStop(sig, ctl.signal), headers: range ? { Range: `bytes=${range.start}-${range.end}` } : {} }); }
     catch (e) { throw again(e); }
     if (!res.ok) {
-      const err = new Error(`HTTP ${res.status} (${url.split("/").pop().split("?")[0].slice(0, 40)})`);
+      const err = Object.assign(new Error(`HTTP ${res.status} (${url.split("/").pop().split("?")[0].slice(0, 40)})`), { status: res.status });
       throw res.status >= 500 ? again(err) : err;
     }
     let b;
@@ -615,7 +615,7 @@ function parseHls(text, base) {
 }
 const DRM_MSG = "protected video (DRM) — encrypted stream, not saved";
 // tracks to fetch for an HLS URL: [{kind, ext, init, segs, label}]
-async function hlsTracks(url, text, tabId) {
+async function hlsTracks(url, text, tabId, fresh = false) {   // fresh: ask the server for every playlist again (never the page's copy or the cache)
   const m = parseHls(text, url), tracks = [];
   if (m.master) {
     if (!m.variants.length) throw new Error("empty master playlist");
@@ -626,7 +626,7 @@ async function hlsTracks(url, text, tabId) {
     if (a) tracks.push({ kind: "audio", url: a.url });   // a rendition with a URI is a separate playlist (muxed audio has none)
   } else tracks.push({ kind: "video", url, parsed: m });
   for (const t of tracks) {
-    const p = t.parsed || parseHls(await fetchManifestOnce(t.url, tabId), t.url);
+    const p = t.parsed || parseHls(fresh ? await fetchText(t.url) : await fetchManifestOnce(t.url, tabId), t.url);
     if (p.master) throw new Error("nested master playlist");
     if (p.live) throw new Error("live stream — it has no end to save yet");
     if (!p.segs.length) throw new Error("empty playlist");
@@ -764,12 +764,43 @@ function looksLikeToken(s) {
 function cleanTitle(t) {
   return String(t || "").replace(/\s+[|\-–—:]\s+[^|\-–—:]*$/, "").replace(/[\/\\:*?"<>|\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").replace(/^[\s.]+|[\s.]+$/g, "").slice(0, 120).trim();
 }
-function streamName(url, title) {
+// "Watch X Season 1 - Free Episodes ..." -> "X Season 1": the leading "Watch " and a trailing "Free ..." tail are boilerplate
+function nameFromTitle(t) {
+  const s = cleanTitle(String(t || "").replace(/\s+(?:[-–—|:]\s*)?Free\b.*$/i, "").replace(/^\s*Watch\s+/i, ""));
+  return s || cleanTitle(t);
+}
+// S01E04 from a /tv/<id>/<season>/<episode> style URL path or a season=&episode= / s=&e= query; first URL that has one wins
+function episodeTag(urls) {
+  for (const raw of urls) {
+    let u; try { u = new URL(raw); } catch { continue; }
+    const m = /\/(?:tv|series|shows?|episodes?)s?\/[^/?#]+\/(\d{1,3})\/(\d{1,4})(?:[/?#]|$)/i.exec(u.pathname + "/");
+    let se = m && [m[1], m[2]];
+    if (!se) {
+      const q = (...ks) => { for (const k of ks) { const v = u.searchParams.get(k); if (/^\d{1,4}$/.test(v || "")) return v; } return null; };
+      const a = q("season", "s"), b = q("episode", "ep", "e");
+      if (a != null && b != null) se = [a, b];
+    }
+    if (se) return `S${se[0].padStart(2, "0")}E${se[1].padStart(2, "0")}`;
+  }
+  return "";
+}
+// the frame that played this manifest first, then the page's other frames, then the top page
+async function streamEpisode(tabId, url, title) {
+  if (tabId == null || /\bS\d{1,3}\s*E\d{1,4}\b/i.test(title || "")) return "";
+  try {
+    const frames = (await chrome.webNavigation.getAllFrames({ tabId })) || [];
+    const mine = (await getMedia(tabId))[normalizeMediaUrl(url)]?.frame;
+    const top = frames.find((f) => f.frameId === 0)?.url || (await chrome.tabs.get(tabId).catch(() => null))?.url || "";
+    return episodeTag([...frames.filter((f) => f.frameId === mine).map((f) => f.url), ...frames.filter((f) => f.frameId !== mine && f.frameId !== 0).map((f) => f.url), top]);
+  } catch { return ""; }
+}
+function streamName(url, title, ep = "") {
   try {
     const parts = decodeURIComponent(new URL(url).pathname).split("/").filter(Boolean).map((p) => p.replace(/\.(m3u8|mpd)$/i, ""));
     for (let i = parts.length - 1; i >= 0; i--) { const s = sanitize(parts[i]); if (s.length > 2 && !STREAM_NOISE.test(s) && !looksLikeToken(s)) return s; }
   } catch {}
-  return cleanTitle(title) || "video";
+  const n = nameFromTitle(title);
+  return n ? (ep ? `${n} ${ep}` : n) : "video";
 }
 // Fetch every segment of the stream's best tracks, stream them to the host as temp files, then have the
 // host join them into name.mp4 in dest. Resolves {ok, path} or {ok:false, output}. Never throws.
@@ -783,22 +814,52 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = 
     log("info", "stream", `${name}: ${isHls ? "HLS" : "DASH"} manifest, ${tracks.length} track(s) to fetch`, { url: logUrl(url), tracks: tracks.map((t) => ({ kind: t.kind, label: t.label, ext: t.ext, segments: t.segs.length, init: !!t.init })) });
     const totalParts = tracks.reduce((n, t) => n + t.segs.length + (t.init ? 1 : 0), 0) || 1;
     let partsDone = 0;
+    const caveats = [];   // saved, but not whole: shown beside the finished file
     on({ frac: 0 }, true);
     for (const t of tracks) {
       const id = "s" + (++hostSeq);
       const opened = await hostAsk(port, { cmd: "open", id, name: `${name}.${t.kind}.${t.ext}`, dst: dest || "", temp: true });
       if (!opened.ok) throw new Error(hostError(opened.output));
       ids.push(id);
-      const parts = [...(t.init ? [{ ...t.init, init: true }] : []), ...t.segs];
+      let parts = [...(t.init ? [{ ...t.init, init: true }] : []), ...t.segs];
       log("debug", "stream", `${name}: ${t.kind} track ${id}: ${parts.length} part(s), ${STREAM_AHEAD} fetched ahead`);
-      const pending = [];
-      for (let i = 0, k = 0; i < parts.length || pending.length; k++) {
-        while (pending.length < STREAM_AHEAD && i < parts.length) {
-          const s = parts[i++], p = fetchBytes(s.url, s.range, sig).then((b) => s.init ? b : decryptSeg(b, s));
-          p.catch(() => {});   // a Stop leaves the ones fetched ahead unawaited: never an unhandled rejection
-          pending.push(p);
+      const pending = [], tailN = Math.max(3, Math.ceil(parts.length * 0.01));
+      let refreshed = false, endAt = parts.length;
+      const launch = (idx) => {
+        const s = parts[idx], p = fetchBytes(s.url, s.range, sig).then((b) => s.init ? b : decryptSeg(b, s));
+        p.catch(() => {});   // a Stop leaves the ones fetched ahead unawaited: never an unhandled rejection
+        return { idx, p };
+      };
+      for (let i = 0, k = 0; i < endAt || pending.length; k++) {
+        while (pending.length < STREAM_AHEAD && i < endAt) pending.push(launch(i++));
+        const cur = pending.shift();
+        let bytes;
+        try { bytes = await cur.p; }
+        catch (e) {
+          if (sig.aborted) throw stopError();
+          const st = e?.status, why = String(e?.message || e);
+          // 1. the URL may just have expired: ask for the manifest ONCE more; the same part under a new URL = carry on from it
+          if (!refreshed && (st === 403 || st === 404 || st === 410 || e?.gaveUp === true)) {
+            refreshed = true;
+            try {
+              const text2 = await fetchText(url), nt = (isHls ? await hlsTracks(url, text2, tabId, true) : dashTracks(text2, url)).find((x) => x.kind === t.kind);
+              const np = nt ? [...(nt.init ? [{ ...nt.init, init: true }] : []), ...nt.segs] : [];
+              if (np.length > cur.idx && np[cur.idx].url !== parts[cur.idx].url) {
+                log("info", "stream", `${name}: part ${cur.idx + 1} failed (${why}); manifest re-read, carrying on from its new URL`);
+                parts = np; endAt = np.length; pending.length = 0; i = cur.idx; k--; continue;
+              }
+              log("warn", "stream", `${name}: part ${cur.idx + 1} failed (${why}); manifest re-read, same URL`);
+            } catch (e2) { if (sig.aborted) throw stopError(); log("warn", "stream", `${name}: manifest re-read failed: ${e2?.message || e2}`); }
+          }
+          // 2. the manifest lists a part or two past the real end: the track ends there
+          if ((st === 404 || st === 410) && !parts[cur.idx].init && cur.idx >= parts.length - tailN && cur.idx >= parts.length / 2) {
+            const missing = parts.length - cur.idx;
+            caveats.push(`${t.kind}: last ${missing} segment${missing > 1 ? "s" : ""} missing from the server`);
+            log("warn", "stream", `${name}: ${t.kind} track ends at part ${cur.idx}/${parts.length}: ${why}`);
+            endAt = cur.idx; pending.length = 0; i = endAt; continue;
+          }
+          throw new Error(`server stopped at ${tracks.length > 1 ? t.kind + " " : ""}part ${cur.idx + 1}/${parts.length}: ${why}`);
         }
-        const bytes = await pending.shift();
         if (sig.aborted) throw stopError();
         if (k === 0 && looksEncrypted(bytes)) throw new Error(DRM_MSG);
         for (let o = 0; o < bytes.length; o += CHUNK) {
@@ -815,7 +876,7 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = 
     on({ frac: 0.97, phase: "joining" }, true);
     const r = await hostAsk(port, { cmd: "join", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
     log(r.ok ? "info" : "error", "stream", `${name}: join ${r.ok ? `ok -> ${r.path} (${r.bytes} bytes)${r.output ? " — " + r.output : ""}` : "FAILED: " + r.output}`);
-    return r.ok ? r : { ok: false, output: hostError(r.output) };
+    return r.ok ? (caveats.length ? { ...r, output: [r.output, ...caveats].filter(Boolean).join(" — ") } : r) : { ok: false, output: hostError(r.output) };
   } catch (e) {
     for (const id of ids) try { port.postMessage({ cmd: "abort", id }); } catch {}
     if (sig.aborted) { log("info", "stream", `${name}: stopped, ${ids.length} temp track(s) removed`); return stoppedReply({ cut: ids.length > 0 }); }
@@ -1227,7 +1288,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         : canon(it.url);
       const alts = it.engine && !it.spotify ? engineAlts(it.url, mode, settings.mp3, c) : [];
       if (seen.has(c) || inFlight.has(c)) { skipped++; log("info", "dedupe", `skip: ${seen.has(c) ? "the same item twice in this batch" : "already downloading right now"}`, { key: c }); continue; }
-      seen.add(c); cands.push({ alts, url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: (it.stream && topTitle) || it.title || "", spotify: it.spotify || null, c });
+      seen.add(c); cands.push({ alts, url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: (it.stream && topTitle) || it.title || "", ep: "", spotify: it.spotify || null, c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
@@ -1240,10 +1301,11 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
       if (keep.has(j.c)) { skipped++; log("info", "dedupe", `skip: saved before, ${saved[j.c].path ? "its file is still at " + saved[j.c].path : "no path was recorded"}`, { key: j.c }); }
       else { jobs.push(j); inFlight.add(j.c); log("info", "dedupe", `queue: ${saved[j.c] ? "saved before but its file is gone (" + (saved[j.c].path || "?") + "), downloading again" : "new"}`, { key: j.c }); }
     }
+    if (!prefix) for (const j of jobs) if (j.stream) j.ep = await streamEpisode(srcTab, j.url, j.title);
     let n = prefix ? await nextCounter(dest, typed(prefix), jobs.length) : 0;
     // a stream's name carries no extension: the host names the joined file (.mp4); a site job is named
     // from the hostname, inside saveSiteViaHost
-    for (const j of jobs) j.filename = j.engine || j.site ? "" : j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
+    for (const j of jobs) j.filename = j.engine || j.site ? "" : j.stream ? (prefix ? `${typed(expandDate(prefix, j.date))}_${n++}` : streamName(j.url, j.title, j.ep)) : filenameFor(j.url, kind, j.mime, { prefix, n: n++, date: j.date });
   });
   log("info", "batch", `queued ${jobs.length}, skipped ${skipped}, unusable ${unusable}`);
   onQueued({ queued: jobs.length, skipped, unusable });

@@ -15,7 +15,9 @@ def check(label, got, want):
     print(f"{'ok  ' if ok else 'FAIL'} {label}: {got}" + ("" if ok else f"   want {want}"))
 
 with sync_playwright() as p:
-    ctx = p.chromium.launch_persistent_context(SP + "/prof", headless=False, channel="chromium",
+    os.makedirs(SP + "/log", exist_ok=True)
+    clean_env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}; clean_env["JOWN_LOG_DIR"] = SP + "/log"   # never the owner's real log; no harness PYTHONPATH in a child
+    ctx = p.chromium.launch_persistent_context(SP + "/prof", headless=False, channel="chromium", env=clean_env,
         args=[f"--disable-extensions-except={EXT}", f"--load-extension={EXT}", "--window-position=2000,2000"])
     sw = ctx.service_workers[0] if ctx.service_workers else ctx.wait_for_event("serviceworker")
     ext_id = sw.url.split("/")[2]

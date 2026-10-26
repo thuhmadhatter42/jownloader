@@ -13,7 +13,9 @@ EXT_ID = open(ROOT + "/native/EXTENSION_ID").read().strip()
 PORT = int(os.environ.get("JOWN_HTTP_PORT", 9336))     # fixture server
 CDP = int(os.environ.get("JOWN_CDP_PORT", 9337))        # Brave's debugging port
 subprocess.run([HERE + "/make_streams.sh", FIX], check=True)
-os.makedirs(OUT, exist_ok=True)
+os.makedirs(OUT, exist_ok=True); os.makedirs(RUN + "/log", exist_ok=True)
+# the browser (and the native host it launches) gets its own log dir and no harness PYTHONPATH: never the owner's real log
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}; CLEAN_ENV["JOWN_LOG_DIR"] = RUN + "/log"
 open(FIX + "/page.html", "w").write("""<!doctype html><title>Stream Page - Test Site</title><video id=v></video><script>
 (async () => { for (const u of ["hls_fmp4/master.m3u8", "hls_fmp4/v1.m3u8", "hls_fmp4/v10.m4s", "dash/stream.mpd", "dash/init-stream0.m4s"]) await fetch(u);
 document.title = "loaded " + document.title; })();</script>""")
@@ -21,6 +23,8 @@ document.title = "loaded " + document.title; })();</script>""")
 # (whatever its headers, from whoever) is a 403. hits[path] = [answered, refused].
 TOKEN = "lR6E4J4mXVpswQ9zT3kYb7NfH2dGcA5uWj8xE1oLrP4vSiM6yB0tZqKnD7aFgUeCh3XlRw9JmV2bTs5O"[:80]   # a random-looking stream id, as a signed stream URL carries
 hits = {}
+TOKEN2 = TOKEN[::-1]   # a second random-looking stream id (the episode-name case)
+rot = {}     # /rot/index.m3u8 GETs seen: the first answer lists a dead URL for part 2, the next (the re-read) a live one
 flaky = {}   # /flaky/ segment path -> GETs seen: index1 = 503 then ok; index2 = 502, dropped connection, ok; index3 = dropped connection, ok
 class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
@@ -32,6 +36,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 h[1] += 1; self.send_error(403, "token already used"); return
             h[0] += 1
         if path.startswith("/" + TOKEN + "/") and path.endswith(".ts"): time.sleep(0.4)   # a slow stream: progress is observable mid-save
+        if path == "/rot/index.m3u8":
+            rot[path] = n = rot.get(path, 0) + 1
+            body = open(FIX + "/hls_ts/index.m3u8").read().replace("index1.ts", "index1.ts" if n > 1 else "old-token/index1.ts").encode()
+            self.send_response(200); self.send_header("Content-Type", "application/vnd.apple.mpegurl"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+        if path.startswith("/tv/"): path = self.path = "/frame.html"
         if path.startswith("/flaky/") and path.endswith(".ts"):
             n = flaky[path] = flaky.get(path, 0) + 1
             if path.endswith("index1.ts") and n == 1: self.send_error(503, "try later"); return
@@ -45,7 +54,7 @@ srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), functools.partial(Han
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 proc = subprocess.Popen(["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", f"--user-data-dir={PROF}", f"--remote-debugging-port={CDP}",
     f"--load-extension={EXT}", "--block-new-web-contents", "--no-first-run", "--window-position=1200,100", "--window-size=900,600", "about:blank"],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    env=CLEAN_ENV, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 fails = 0
 def check(label, got, want):
     global fails
@@ -204,6 +213,49 @@ try:
         while time.time() - t0 < 90 and not (btn().startswith("✓") or btn().startswith("✗")): time.sleep(0.2)
         check("saving the same title again never overwrites: (2)", os.path.exists(OUT + "/My Great Clip (2).mp4"), True)
         pg.close()
+        # ---- 0.1.54: a stream's tail / middle failing ----
+        def one(url, prefix=""):
+            global items
+            items = [{"url": url, "stream": True}]
+            pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+            return batch(prefix)
+        ts = open(FIX + "/hls_ts/index.m3u8").read()
+        # (1) the manifest lists one segment past the real end (404): the track ends there, saved with a caveat
+        os.makedirs(FIX + "/tail", exist_ok=True)
+        for f in glob.glob(FIX + "/hls_ts/*.ts"): shutil.copy(f, FIX + "/tail")
+        open(FIX + "/tail/index.m3u8", "w").write(ts.replace("#EXT-X-ENDLIST", "#EXTINF:1.000000,\nindex99.ts\n#EXT-X-ENDLIST"))
+        rt, prt = one(base + "tail/index.m3u8", "jtail")
+        ft = glob.glob(OUT + "/jtail_*")
+        check("tail 404: saved, not failed", [prt["done"], prt["failed"]], [1, 0])
+        check("tail 404: caveat names what is missing", prt["error"], "video: last 1 segment missing from the server")
+        check("tail 404: the file plays, ~the real 4 s", len(ft) == 1 and 3.8 <= probe(ft[0])[0] <= 4.3, True)
+        # (2) a middle part 404s on its old URL; the re-read manifest gives a working one
+        os.makedirs(FIX + "/rot", exist_ok=True)
+        for f in glob.glob(FIX + "/hls_ts/*.ts"): shutil.copy(f, FIX + "/rot")
+        rr, prr = one(base + "rot/index.m3u8", "jrot")
+        fr = glob.glob(OUT + "/jrot_*")
+        check("re-read: saved whole, no error", [prr["done"], prr["failed"], prr["error"], len(fr) == 1 and 3.8 <= probe(fr[0])[0] <= 4.3], [1, 0, "", True])
+        check("re-read: the manifest was fetched exactly twice", rot.get("/rot/index.m3u8"), 2)
+        # (3) a middle part stays 404: fails, saying which part of how many
+        os.makedirs(FIX + "/dead", exist_ok=True)
+        for f in glob.glob(FIX + "/hls_ts/*.ts"): shutil.copy(f, FIX + "/dead")
+        open(FIX + "/dead/index.m3u8", "w").write(ts.replace("index1.ts", "gone/index1.ts"))
+        rd, prd = one(base + "dead/index.m3u8", "jdead")
+        check("dead middle part: failed, names part N/M", [prd["done"], prd["failed"], "server stopped at part 2/4: HTTP 404" in prd["error"], glob.glob(OUT + "/jdead*")], [1, 1, True, []])
+        # (4) a token-URL stream played inside a frame at /tv/<id>/<season>/<episode> under a titled page
+        d2 = FIX + "/" + TOKEN2; os.makedirs(d2, exist_ok=True)
+        for f in glob.glob(FIX + "/hls_ts/*"): shutil.copy(f, d2)
+        open(FIX + "/frame.html", "w").write("<!doctype html><title>player</title><script>fetch('/%s/index.m3u8').then(r => r.text()).then(() => { document.title = 'player ready'; });</script>" % TOKEN2)
+        open(FIX + "/showpage.html", "w").write("<!doctype html><title>Watch Some Show Season 1 - Free Episodes</title><iframe src='/tv/123/1/4?autoplay=1' width=300 height=200></iframe>")
+        mine[0] = 1; sp = ctx.new_page(); mine[0] = 0
+        sp.goto(base + "showpage.html"); sp.wait_for_timeout(2500)
+        tab3 = pop.evaluate("async () => (await chrome.tabs.query({url: '*://127.0.0.1/showpage.html'}))[0].id")
+        items = [{"url": base + TOKEN2 + "/index.m3u8", "stream": True}]
+        pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+        r6, pr6 = batch("", tab3)
+        check("episode: saved, none failed", [pr6["done"], pr6["failed"]], [1, 0])
+        check("episode: title cleaned (no Watch / Free tail) + S01E04 from the frame URL", sorted(os.path.basename(f) for f in glob.glob(OUT + "/Some Show*")), ["Some Show Season 1 S01E04.mp4"])
+        sp.close()
         b.close()
 finally:
     proc.terminate()
