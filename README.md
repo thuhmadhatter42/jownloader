@@ -120,7 +120,12 @@ What the extension asks for, and why:
 Files are written by a small native-messaging host, a Python script the browser launches on demand.
 That is what makes "any folder, no dialog" possible; Chrome's own download API can't do it.
 
-Paste this into Terminal (it asks for your Mac password once, and installs everything else itself:
+**Download:** [Install-Jownloader.zip](https://github.com/thuhmadhatter42/jownloader/releases/latest/download/Install-Jownloader.zip)
+→ open it → double-click **Install Jownloader.command**. It is unsigned, so the first time macOS says it can't
+check it: click Done, then System Settings → Privacy & Security → **Open Anyway** (once). It runs the same
+install as the command below, in a Terminal window.
+
+Or paste this into Terminal (no macOS warning; it asks for your Mac password once, and installs everything else itself:
 Apple's Command Line Tools if missing, the code in `~/Applications/Jownloader`, Homebrew, the tools below):
 
 ```
