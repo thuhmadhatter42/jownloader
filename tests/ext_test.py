@@ -407,7 +407,7 @@ with sync_playwright() as p:
     pop.wait_for_function("async () => (await chrome.runtime.sendMessage({type:'getProgress'})).now.length === 4", timeout=10000)
     pop.wait_for_timeout(400)
     st = pop.evaluate("async () => { const p = await chrome.runtime.sendMessage({type:'getProgress'}); return [p.active, p.total, p.now.length, await chrome.action.getBadgeText({})]; }")
-    check("stop: before — 4 in flight of 6, the badge counts what is left", st, [1, 6, 4, "6"])
+    check("stop: before — 4 in flight of 6, the badge shows the overall percent", st, [1, 6, 4, "0%"])
     check("stop: the dock shows Stop while it runs", pop.evaluate("() => [document.getElementById('run').hidden, document.getElementById('stop').hidden]"), [False, False])
     t0 = _t.time()
     pop.click("#stop")

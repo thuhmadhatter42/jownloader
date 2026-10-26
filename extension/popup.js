@@ -117,6 +117,12 @@ function runModel(pr) {
   if (pr.active) {
     m.head = pr.stopping ? `Stopping… ${saved} saved so far` : `${pr.done} of ${pr.total} ${noun(pr.kind, pr.total)}`;
     if (pr.now?.length && !pr.stopping) m.now = "Now: " + pr.now.slice(0, 4).join(", ");
+    // a stream / sized file in flight reports how far along it is (pr.part, the sum of the in-flight fractions): the bar then moves
+    // smoothly instead of stepping per finished file. Small runs only; a long list keeps its per-file cells.
+    if (pr.part > 0 && pr.total && pr.total <= 8 && !pr.stopping) {
+      m.frac = Math.min(0.99, (pr.done + pr.part) / pr.total);
+      m.head += ` · ${Math.floor(m.frac * 100)}%`;
+    }
   } else if (pr.stopped) {
     m.head = `Stopped — ${saved} saved, ${pr.notStarted || 0} not started`;
     if (pr.cut) m.meta.push(`${pr.cut} cut off, partial file${pr.cut > 1 ? "s" : ""} removed`);

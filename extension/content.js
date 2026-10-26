@@ -320,10 +320,21 @@
     else if (msg.type === "siteMarkdown") reply(siteMarkdown());
     else if (msg.type === "spotifyCount" && top === window) reply(spotifyCount());
     else if (msg.type === "spotifyRows" && top === window) { spotifyRows().then(reply, () => reply(null)); return true; }
+    else if (msg.type === "jobProgress") {
+      const btn = pending.get(msg.c);
+      if (btn && btn._busy) { btn._busy.frac = msg.frac; btn._busy.phase = msg.phase; if (!btn._t) paintBusy(btn); }
+    }
     else if (msg.type === "saveResult") {
       const btn = pending.get(msg.c);
       clog(msg.ok ? "info" : "warn", "button", `save result: ${msg.ok ? "ok" : "FAILED"}${msg.output ? " — " + msg.output : ""}`, { key: msg.c, button: !!btn });
-      if (btn) { pending.delete(msg.c); flash(btn, msg.ok ? (msg.output ? `saved (${msg.output})` : "saved ✓") : `failed — ${msg.output || "unknown error"}`, 6000); }
+      if (btn) {
+        pending.delete(msg.c);
+        // the button is done with this job unless another of its items is still running
+        if (![...pending.values()].includes(btn)) endBusy(btn);
+        const file = (msg.path || "").split("/").pop();
+        if (msg.ok) btn.title = msg.path || "";
+        flash(btn, msg.ok ? (msg.output ? `✓ saved (${msg.output})` : `✓ saved${file ? " — " + file : ""}`) : `✗ failed — ${msg.output || "unknown error"}`, 6000);
+      }
     }
     return false;
   });
@@ -336,6 +347,7 @@
   async function downloadVideo(v, btn) {
     try {
       clog("info", "button", "⬇ clicked", { page: location.href.slice(0, 200), drm: !!v.mediaKeys, engine: ENGINE_PAGE });
+      if (btn?._busy) { const pc = btn._busy.frac != null ? ` (${Math.floor(btn._busy.frac * 100)}%)` : ""; clog("info", "button", "⬇ clicked again while a save runs"); flash(btn, `already saving${pc}`, 1500); return; }
       if (v.mediaKeys) { flash(btn, "protected video (DRM) — can't be saved by any tool", 4000); return; }
       const urls = videoUrls(v).filter((u) => !u.startsWith("blob:"));
       const date = dateNear(v);
@@ -347,14 +359,41 @@
         if (!items.length) { flash(btn, "streamed video — press play so the stream can be captured", 4000); clog("warn", "button", "no URL, no whole file, no stream captured: nothing to save"); return; }
       }
       clog("info", "button", `sending ${items.length} item(s) to the worker`, { first: items[0].url?.slice(0, 200), engine: !!items[0].engine, stream: !!items[0].stream });
+      startBusy(btn);
       const r = await chrome.runtime.sendMessage({ type: "download", items, kind: "video" });
       if (r?.queued) for (const it of items) pending.set(jobKey(it), btn);
-      const what = items[0].engine ? "downloading" : items[0].stream ? "joining stream" : `saving ${r?.queued}`;
-      flash(btn, r?.queued ? `${what} → ${(await chrome.runtime.sendMessage({ type: "getSettings" }))?.dest?.split("/").filter(Boolean).pop() || "Downloads"}` : r?.skipped ? "already saved before" : "failed", 4000);
+      else endBusy(btn);
+      // queued: the button turns into a progress bar (jobProgress) until saveResult; otherwise say why nothing runs
+      if (!r?.queued) flash(btn, r?.skipped ? "already saved before (or already saving)" : "failed", 4000);
     } catch (e) {
       clog("error", "button", `download threw: ${e?.stack || e}`);
-      flash(btn, `failed — ${e?.message || e}`, 4000);
+      endBusy(btn);
+      flash(btn, `✗ failed — ${e?.message || e}`, 4000);
     }
+  }
+  // ---- the button as a progress bar: busy = {frac: 0..1 | null (unknown), phase: "saving" | "joining"} ----
+  function startBusy(btn) { if (btn) { btn._busy = { frac: null, phase: "saving" }; paintBusy(btn); } }
+  function endBusy(btn) {
+    if (!btn) return;
+    btn._busy = null; try { btn._anim?.cancel(); } catch {}
+    btn._anim = null; btn.style.background = BTN_BG; btn.style.backgroundSize = ""; btn.textContent = label(btn._v);
+  }
+  function paintBusy(btn) {
+    const b = btn._busy; if (!b) return;
+    if (b.phase === "joining") {
+      btn.textContent = "joining…"; stripes(btn);
+    } else if (b.frac != null) {
+      const pc = Math.min(99, Math.floor(b.frac * 100));
+      btn.textContent = `⬇ ${pc}%`;
+      try { btn._anim?.cancel(); } catch {} btn._anim = null;
+      btn.style.backgroundSize = ""; btn.style.background = `linear-gradient(90deg, #2563eb ${pc}%, rgba(20,20,20,.85) ${pc}%)`;
+    } else { btn.textContent = "saving…"; stripes(btn); }
+  }
+  // unknown total: moving stripes
+  function stripes(btn) {
+    if (btn._anim) return;
+    btn.style.background = "repeating-linear-gradient(45deg, #2563eb 0 10px, rgba(20,20,20,.85) 10px 20px)"; btn.style.backgroundSize = "28px 28px";
+    try { btn._anim = btn.animate([{ backgroundPosition: "0 0" }, { backgroundPosition: "28px 0" }], { duration: 700, iterations: Infinity }); } catch {}
   }
   // the HLS/DASH manifests the tab's network layer saw (the background reads them and keeps the masters)
   async function streams() {
@@ -372,7 +411,7 @@
     if (!btn) return;
     btn.textContent = text;
     clearTimeout(btn._t);
-    btn._t = setTimeout(() => { btn._t = 0; btn.textContent = label(btn._v); }, ms);
+    btn._t = setTimeout(() => { btn._t = 0; if (btn._busy) paintBusy(btn); else btn.textContent = label(btn._v); }, ms);
   }
 
   // ---------- overlay button ----------
@@ -388,6 +427,7 @@
     const h = (pv && pv.n) || (u && !u.startsWith("blob:") && (parseInt((/_(\d{3,4})p\b/.exec(u) || [])[1], 10) || 0)) || v.videoHeight || 0;
     return "⬇ Download" + (h ? ` "${h}p" (site's label)` : "");
   }
+  const BTN_BG = "rgba(20,20,20,.85)";
   function makeButton(v) {
     const b = document.createElement("button");
     b._v = v;
@@ -395,7 +435,7 @@
     b.setAttribute("data-jownloader", "1");
     Object.assign(b.style, {
       position: "fixed", zIndex: "2147483647", padding: "6px 10px", font: "600 13px system-ui, sans-serif",
-      color: "#fff", background: "rgba(20,20,20,.85)", border: "1px solid rgba(255,255,255,.5)",
+      color: "#fff", background: BTN_BG, border: "1px solid rgba(255,255,255,.5)",
       borderRadius: "6px", cursor: "pointer", opacity: "0.9", pointerEvents: "auto",
     });
     b.addEventListener("click", (e) => { e.stopPropagation(); e.preventDefault(); downloadVideo(v, b); }, true);
@@ -414,7 +454,7 @@
       const want = settings.showButton && !isPreview(v) && (!!(v.currentSrc || v.src || v.querySelector("source")) || !v.paused);
       let b = buttons.get(v);
       if (want && !b) { b = makeButton(v); buttons.set(v, b); }
-      if (b && !b._t) { const l = label(v); if (b.textContent !== l) b.textContent = l; }
+      if (b && !b._t && !b._busy) { const l = label(v); if (b.textContent !== l) b.textContent = l; }
       if (!want && b) { b.remove(); buttons.delete(v); }
       if (b) place(v, b);
     }

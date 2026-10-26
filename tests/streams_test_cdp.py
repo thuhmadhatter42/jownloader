@@ -19,6 +19,7 @@ open(FIX + "/page.html", "w").write("""<!doctype html><title>Stream Page - Test 
 document.title = "loaded " + document.title; })();</script>""")
 # oneshot*/ playlists (.m3u8/.mpd) are signed-URL style: the first GET of a URL is answered, every later one
 # (whatever its headers, from whoever) is a 403. hits[path] = [answered, refused].
+TOKEN = "lR6E4J4mXVpswQ9zT3kYb7NfH2dGcA5uWj8xE1oLrP4vSiM6yB0tZqKnD7aFgUeCh3XlRw9JmV2bTs5O"[:80]   # a random-looking stream id, as a signed stream URL carries
 hits = {}
 flaky = {}   # /flaky/ segment path -> GETs seen: index1 = 503 then ok; index2 = 502, dropped connection, ok; index3 = dropped connection, ok
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -30,6 +31,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if h[0]:
                 h[1] += 1; self.send_error(403, "token already used"); return
             h[0] += 1
+        if path.startswith("/" + TOKEN + "/") and path.endswith(".ts"): time.sleep(0.4)   # a slow stream: progress is observable mid-save
         if path.startswith("/flaky/") and path.endswith(".ts"):
             n = flaky[path] = flaky.get(path, 0) + 1
             if path.endswith("index1.ts") and n == 1: self.send_error(503, "try later"); return
@@ -161,6 +163,47 @@ try:
         fk = glob.glob(OUT + "/jflaky_*")
         check("retry: transient 5xx / dropped connections -> saved whole", [prk["done"], prk["failed"], prk["error"], len(fk) == 1 and 3.8 <= probe(fk[0])[0] <= 4.3], [1, 0, "", True])
         check("retry: the flaky segments were asked for again", [flaky.get(k) for k in sorted(flaky) if k.endswith(("index1.ts", "index2.ts", "index3.ts"))], [2, 3, 2])
+        # ---- 0.1.53: visible progress + a readable name for a token-named stream, started from the player's own button ----
+        import shutil
+        d = FIX + "/" + TOKEN; os.makedirs(d, exist_ok=True)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=24", "-f", "lavfi", "-i", "sine=frequency=440:duration=24",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-g", "25", "-c:a", "aac", "-b:a", "64k", "-shortest", "-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod", d + "/index.m3u8"], check=True)
+        open(FIX + "/titled.html", "w").write("""<!doctype html><title>My Great Clip - Test Site</title><video id=v width=400 height=300></video><script>
+        v.src = URL.createObjectURL(new MediaSource()); fetch("%s/index.m3u8").then(() => { window.ready = 1; });</script>""" % TOKEN)
+        check("the fixture token is 80 random-looking chars", len(TOKEN), 80)
+        pop.evaluate("async o => await chrome.storage.sync.set({dest: o, prefix: ''})", OUT)
+        pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+        pop.evaluate("() => { window.__parts = []; chrome.runtime.onMessage.addListener((m) => { if (m && m.type === 'progress' && m.active) window.__parts.push([m.part, m.total, m.done]); }); }")
+        mine[0] = 1; pg = ctx.new_page(); mine[0] = 0
+        pg.goto(base + "titled.html"); pg.wait_for_function("window.ready === 1"); pg.wait_for_selector("[data-jownloader]"); pg.wait_for_timeout(500)
+        btn = lambda: pg.evaluate("() => document.querySelector('[data-jownloader]').textContent")
+        pg.click("[data-jownloader]")
+        texts, badges, t0, again = [], [], time.time(), False
+        while time.time() - t0 < 90:
+            t = btn(); texts.append(t); badges.append(pop.evaluate("async () => await chrome.action.getBadgeText({})"))
+            if not again and any(re.match(r"⬇ \d+%", x) for x in texts): pg.click("[data-jownloader]"); again = True
+            if t.startswith("✓") or t.startswith("✗"): break
+            time.sleep(0.1)
+        pcts = [int(m.group(1)) for m in (re.match(r"⬇ (\d+)%", x) for x in texts) if m]
+        check("button shows a percent mid-save, rising", [len(set(pcts)) >= 3, pcts == sorted(pcts), max(pcts or [0]) < 100], [True, True, True])
+        check("button said 'joining…' before the end", "joining…" in texts, True)
+        check("a second click mid-save says it is already saving", any(x.startswith("already saving") for x in texts), True)
+        check("button ends on ✓ with the file name", texts[-1], "✓ saved — My Great Clip.mp4")
+        check("the toolbar badge showed an overall percent while it ran", any(re.fullmatch(r"\d+%", x or "") for x in badges), True)
+        check("badge cleared when the save ended", pop.evaluate("async () => await chrome.action.getBadgeText({})"), "")
+        parts = pop.evaluate("() => window.__parts")
+        ps = [x[0] for x in parts if x[0] > 0]
+        check("progress messages arrive during the save (many, rising)", [len(set(ps)) >= 3, ps == sorted(ps)], [True, True])
+        mp = OUT + "/My Great Clip.mp4"
+        check("token-named stream saved under the page title", [os.path.exists(mp), os.path.exists(OUT + "/" + TOKEN + ".mp4")], [True, False])
+        check("title-named file is the whole ~24 s stream", os.path.exists(mp) and 23.5 <= probe(mp)[0] <= 25, True)
+        pop.evaluate("async () => await chrome.runtime.sendMessage({type:'forgetSaved'})")
+        time.sleep(7)   # the first run's ✓ flash is over
+        pg.click("[data-jownloader]")
+        t0 = time.time()
+        while time.time() - t0 < 90 and not (btn().startswith("✓") or btn().startswith("✗")): time.sleep(0.2)
+        check("saving the same title again never overwrites: (2)", os.path.exists(OUT + "/My Great Clip (2).mp4"), True)
+        pg.close()
         b.close()
 finally:
     proc.terminate()

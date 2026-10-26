@@ -414,7 +414,7 @@ const withStop = (sig, own) => sig === NEVER ? own : own ? AbortSignal.any([own,
 // Flow-controlled: one chunk in flight per file, the host acks each before the next is sent, so memory
 // stays bounded and every message resets the worker's idle timer. Resolves {ok, path} or {ok:false, output}.
 // Never throws.
-async function saveViaHost(url, name, dest, kind, fin = {}, sig = NEVER) {
+async function saveViaHost(url, name, dest, kind, fin = {}, sig = NEVER, on = () => {}) {
   const id = "s" + (++hostSeq);
   let stallTimer = 0;
   log("info", "save", `${id} file: ${name} -> ${dest || "Downloads"}`, { url: logUrl(url), kind, strip: !!fin.strip, webp: fin.webp || "" });
@@ -423,13 +423,14 @@ async function saveViaHost(url, name, dest, kind, fin = {}, sig = NEVER) {
     reader.read(), stopP,
     new Promise((_, rej) => { stallTimer = setTimeout(() => rej(new Error(`stalled: no data for ${STALL_MS / 1000} s`)), STALL_MS); }),
   ]).finally(() => clearTimeout(stallTimer));
-  let res, reader, first;
+  let res, reader, first, total = 0, got = 0;
   try {
     if (sig.aborted) throw stopError();
     res = await fetch(url, { credentials: "include", signal: withStop(sig) });
     log("debug", "save", `${id} response HTTP ${res.status} ${res.headers.get("content-type") || "?"} length=${res.headers.get("content-length") || "?"}`);
     if (!res.ok) throw new Error("HTTP " + res.status);
     reader = res.body.getReader();
+    total = res.headers.get("content-encoding") ? 0 : parseInt(res.headers.get("content-length") || "", 10) || 0;   // a compressed body's length is not the bytes read
     first = await read(reader);   // first chunk before "open": it decides the extension when nothing else does
   } catch (e) {
     try { reader?.cancel(); } catch {}
@@ -455,6 +456,7 @@ async function saveViaHost(url, name, dest, kind, fin = {}, sig = NEVER) {
     for (let chunk = first; ; chunk = await read(reader)) {
       const { value, done } = chunk;
       if (done) break;
+      got += value.length; on(total ? { frac: Math.min(0.99, got / total) } : {});
       if (buf.length) { const n = new Uint8Array(buf.length + value.length); n.set(buf); n.set(value, buf.length); buf = n; } else buf = value;
       while (buf.length >= CHUNK) { const part = buf.subarray(0, CHUNK); buf = buf.subarray(CHUNK); await send(part); }
     }
@@ -749,18 +751,29 @@ async function streamsFor(tabId) {
   return [{ url: failed[0].url, stream: true }];
 }
 // a stream's file name when nothing was typed: the last meaningful path segment of the manifest URL
-// (not index/master/a hex id …), else the page title
+// (not index/master/a random id/token …), else the page's title (the top page's, cleaned for the filesystem, <= 120 chars)
 const STREAM_NOISE = /^(master|index|playlist|manifest|prog_index|chunklist.*|stream|video|videos|media|hls|dash|main|out|v\d*|\d+)$/i;
+// random-looking: long hex, or a long run of letters/digits/-/_ that keeps switching case or digit<->letter (base64-ish)
+function looksLikeToken(s) {
+  if (/^[a-f0-9_-]{16,}$/i.test(s)) return true;
+  if (!/^[A-Za-z0-9_-]{20,}$/.test(s)) return false;
+  const cls = (ch) => /[a-z]/.test(ch) ? 1 : /[A-Z]/.test(ch) ? 2 : /\d/.test(ch) ? 3 : 0;
+  let flips = 0; for (let i = 1; i < s.length; i++) if (cls(s[i]) && cls(s[i - 1]) && cls(s[i]) !== cls(s[i - 1])) flips++;
+  return flips >= s.length * 0.25 || (s.length >= 40 && !/[-_]/.test(s));
+}
+function cleanTitle(t) {
+  return String(t || "").replace(/\s+[|\-–—:]\s+[^|\-–—:]*$/, "").replace(/[\/\\:*?"<>|\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").replace(/^[\s.]+|[\s.]+$/g, "").slice(0, 120).trim();
+}
 function streamName(url, title) {
   try {
     const parts = decodeURIComponent(new URL(url).pathname).split("/").filter(Boolean).map((p) => p.replace(/\.(m3u8|mpd)$/i, ""));
-    for (let i = parts.length - 1; i >= 0; i--) { const s = sanitize(parts[i]); if (s.length > 2 && !STREAM_NOISE.test(s) && !/^[a-f0-9_-]{16,}$/i.test(s)) return s; }
+    for (let i = parts.length - 1; i >= 0; i--) { const s = sanitize(parts[i]); if (s.length > 2 && !STREAM_NOISE.test(s) && !looksLikeToken(s)) return s; }
   } catch {}
-  return sanitize((title || "").replace(/\s*[|\-–—:]\s*[^|\-–—:]*$/, "")) || "video";
+  return cleanTitle(title) || "video";
 }
 // Fetch every segment of the stream's best tracks, stream them to the host as temp files, then have the
 // host join them into name.mp4 in dest. Resolves {ok, path} or {ok:false, output}. Never throws.
-async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = NEVER) {
+async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = NEVER, on = () => {}) {
   const port = hostConnect(), ids = [];
   try {
     if (sig.aborted) throw stopError();
@@ -768,6 +781,9 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = 
     const isHls = text.trimStart().startsWith("#EXTM3U");
     const tracks = isHls ? await hlsTracks(url, text, tabId) : dashTracks(text, url);
     log("info", "stream", `${name}: ${isHls ? "HLS" : "DASH"} manifest, ${tracks.length} track(s) to fetch`, { url: logUrl(url), tracks: tracks.map((t) => ({ kind: t.kind, label: t.label, ext: t.ext, segments: t.segs.length, init: !!t.init })) });
+    const totalParts = tracks.reduce((n, t) => n + t.segs.length + (t.init ? 1 : 0), 0) || 1;
+    let partsDone = 0;
+    on({ frac: 0 }, true);
     for (const t of tracks) {
       const id = "s" + (++hostSeq);
       const opened = await hostAsk(port, { cmd: "open", id, name: `${name}.${t.kind}.${t.ext}`, dst: dest || "", temp: true });
@@ -790,11 +806,13 @@ async function saveStreamViaHost(url, name, dest, fin = {}, tabId = null, sig = 
           if (!r.ok) throw new Error(hostError(r.output));
         }
         progress.bytes += bytes.length; pushProgress(false);
+        on({ frac: Math.min(0.97, ++partsDone / totalParts * 0.97) });   // the last few percent are the join
       }
       const closed = await hostAsk(port, { cmd: "close", id });
       if (!closed.ok) throw new Error(hostError(closed.output));
     }
     if (sig.aborted) throw stopError();
+    on({ frac: 0.97, phase: "joining" }, true);
     const r = await hostAsk(port, { cmd: "join", id: "s" + (++hostSeq), ids, name, dst: dest || "", ...fin });
     log(r.ok ? "info" : "error", "stream", `${name}: join ${r.ok ? `ok -> ${r.path} (${r.bytes} bytes)${r.output ? " — " + r.output : ""}` : "FAILED: " + r.output}`);
     return r.ok ? r : { ok: false, output: hostError(r.output) };
@@ -1080,7 +1098,30 @@ async function spotifyList(url) {
 // errors = every failure of the run, one line each ("song 6 Floaty: YouTube refused the download ..."); now = what is running
 // stopping = Stop was pressed and jobs are letting go; stopped = the run ended by Stop: notStarted never began, cut were
 // cut off mid-file (their partial files removed). done/failed count only jobs that finished on their own.
-const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", errors: [], fails: [], now: [], crawl: null, stopping: false, stopped: false, notStarted: 0, cut: 0 };
+const progress = { total: 0, done: 0, failed: 0, bytes: 0, active: 0, where: "", kind: "", error: "", errors: [], fails: [], now: [], crawl: null, stopping: false, stopped: false, notStarted: 0, cut: 0, part: 0 };
+// part = the sum of the fractions (0..1) of the jobs in flight that know how far along they are (stream segments done / total,
+// bytes / Content-Length): the popup bar and the badge show (done + part) / total. A job that cannot know counts 0 and the button
+// on the page shows an animated "saving…". Each running job reports through jobReporter().
+const liveFrac = new Map();
+const overallPct = () => progress.total ? Math.max(0, Math.min(99, Math.floor(((progress.done + progress.part) / progress.total) * 100))) : 0;
+// One reporter per job: on({frac?, phase?}) keeps liveFrac/progress.part current and tells the originating tab's
+// button (type "jobProgress"), at most 4 a second, a phase change at once. frac only grows.
+function jobReporter(c, tabId) {
+  let last = 0, lastPhase = "", frac = null, phase = "saving", sent = "";
+  const on = (patch = {}, force = false) => {
+    if (patch.phase) phase = patch.phase;
+    if (typeof patch.frac === "number") { frac = Math.max(frac ?? 0, Math.min(1, patch.frac)); liveFrac.set(c, frac); }
+    const now = Date.now();
+    if (!force && phase === lastPhase && now - last < 250) return;
+    last = now; lastPhase = phase;
+    pushProgress(false);
+    const msg = { type: "jobProgress", c, frac, phase };
+    const key = JSON.stringify(msg);
+    if (tabId != null && key !== sent) { sent = key; chrome.tabs.sendMessage(tabId, msg).catch(() => {}); }
+  };
+  on.end = () => { liveFrac.delete(c); };
+  return on;
+}
 // site crawl: page n of m (m = the pages known so far, capped by "Max pages") + the URL being rendered; n = 0 clears it
 // Every crawl has its own entry (id -> {n, m, url}); the bar and badge show the sum of the crawls running, and
 // are only cleared when the last one ends. m only grows, and the bar never steps back (m is raised to hold it).
@@ -1099,7 +1140,7 @@ function crawlProgress(id, n, m, url) {
   if (!progress.crawl && !progress.active) setBadge("");
   pushProgress(true);
 }
-// The badge follows the run: the page number while a crawl renders, else the files still to go (4 characters fit),
+// The badge follows the run: the page number while a crawl renders, else the overall percent (4 characters fit),
 // blank when idle; endOfRun leaves "!" in red when something failed.
 let badgeNow = null;
 function setBadge(text, color = "#2563eb") {
@@ -1109,12 +1150,12 @@ function setBadge(text, color = "#2563eb") {
 }
 function syncBadge() {
   if (progress.crawl) setBadge(String(progress.crawl.n));
-  else if (progress.active) { const left = Math.max(0, progress.total - progress.done - progress.notStarted - progress.cut); setBadge(progress.stopping ? "■" : left > 9999 ? "9999" : String(left)); }
+  else if (progress.active) setBadge(progress.stopping ? "■" : overallPct() + "%");   // overall percent: finished jobs + the fraction of each one in flight
 }
 let progTimer = 0;
 function pushProgress(force) {
   if (progTimer && !force) return;
-  progTimer = setTimeout(() => { progTimer = 0; syncBadge(); chrome.runtime.sendMessage({ type: "progress", ...progress }).catch(() => {}); }, force ? 0 : 150);
+  progTimer = setTimeout(() => { progTimer = 0; progress.part = [...liveFrac.values()].reduce((a, b) => a + b, 0); syncBadge(); chrome.runtime.sendMessage({ type: "progress", ...progress }).catch(() => {}); }, force ? 0 : 150);
 }
 // Stop: every running batch's signal aborts. Queued jobs never start, in-flight fetches abort and their partial files
 // are dropped, engine processes are killed by the host. The batches unwind on their own and the last one ends the run.
@@ -1172,6 +1213,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
   let skipped = 0, unusable = 0;
   // the tab a save starts from (the popup's active tab when the message names none): only that tab's page-copied manifests are used
   const srcTab = opts.tabId ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0]?.id ?? null;
+  const topTitle = srcTab != null && items.some((it) => it && it.stream) ? (await chrome.tabs.get(srcTab).catch(() => null))?.title || "" : "";   // the TOP page's title: a player in an iframe only knows its own
   await serial(async () => {
     const cands = [];
     for (const raw of items) {
@@ -1185,7 +1227,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         : canon(it.url);
       const alts = it.engine && !it.spotify ? engineAlts(it.url, mode, settings.mp3, c) : [];
       if (seen.has(c) || inFlight.has(c)) { skipped++; log("info", "dedupe", `skip: ${seen.has(c) ? "the same item twice in this batch" : "already downloading right now"}`, { key: c }); continue; }
-      seen.add(c); cands.push({ alts, url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: it.title || "", spotify: it.spotify || null, c });
+      seen.add(c); cands.push({ alts, url: it.url, mime: it.ctype || "", date: it.date || "", stream: !!it.stream, engine: !!it.engine, site: !!it.site, maxPages: it.maxPages || 50, follow: !!it.follow, mode: it.mode || "video", title: (it.stream && topTitle) || it.title || "", spotify: it.spotify || null, c });
     }
     // saved before AND the file is still there → skip; gone from the folder → save again
     const saved = await getSaved(cands.map((j) => j.c));
@@ -1225,12 +1267,14 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         progress.now.push(label); pushProgress(false);
         log("info", "job", `start ${label}`, { key: j.c, url: logUrl(j.url), type: j.spotify ? "spotify" : j.engine ? "engine" : j.site ? "site" : j.stream ? "stream" : "file" });
         let r;
+        const on = jobReporter(j.c, opts.tabId ?? null);
+        on({ phase: "saving" }, true);
         try {
-          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 }, sig), sig) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }, sig) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow, sig) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin, srcTab, sig) : await saveViaHost(j.url, j.filename, dest, kind, fin, sig);
+          r = j.spotify ? await spotifyTurn(() => saveEngineViaHost(j.url, "audio", dest, {}, { meta: j.spotify, analyze: !!settings.spotifyBpm, mp3: !!settings.mp3 }, sig), sig) : j.engine ? await saveEngineViaHost(j.url, j.mode, dest, fin, { mp3: j.mode === "audio" && !!settings.mp3 }, sig) : j.site ? await saveSiteViaHost(j.url, j.mode, j.maxPages, dest, fin, j.follow, sig) : j.stream ? await saveStreamViaHost(j.url, j.filename, dest, fin, srcTab, sig, on) : await saveViaHost(j.url, j.filename, dest, kind, fin, sig, on);
           if (r.ok) await markSaved(j.c, r.path);
         }
         catch (e) { r = { ok: false, output: String(e?.message || e) }; log("error", "job", `${label} threw: ${e?.stack || e}`); }
-        inFlight.delete(j.c);
+        inFlight.delete(j.c); on.end();
         const at = progress.now.indexOf(label); if (at >= 0) progress.now.splice(at, 1);
         const secs = ((Date.now() - t0) / 1000).toFixed(1);
         if (r.stopped) {
@@ -1257,7 +1301,7 @@ async function downloadAll(items, kind, opts = {}, onQueued = () => {}) {
         // the ⬇ button's own flash only reflects "queued", not how the save actually finished (it runs
         // async, after the button already replied) — tell the originating tab the real outcome so a
         // failure that happens after the click is never silent.
-        if (opts.tabId != null) chrome.tabs.sendMessage(opts.tabId, { type: "saveResult", c: j.c, ok: r.ok, output: r.output || "" }).catch(() => {});
+        if (opts.tabId != null) chrome.tabs.sendMessage(opts.tabId, { type: "saveResult", c: j.c, ok: r.ok, output: r.output || "", path: r.path || "" }).catch(() => {});
       }
     }));
   } finally {
