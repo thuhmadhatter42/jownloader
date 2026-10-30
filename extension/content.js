@@ -108,15 +108,30 @@
     if (img.srcset) cands.push(...srcsetCands(img.srcset));
     return bestOf(cands) || [img.currentSrc, img.src, img.dataset.src, img.dataset.original, img.dataset.lazySrc].map(abs).find(okUrl) || null;
   }
+  // Full size only: a picture inside a link to an image file is that file (never the resized preview);
+  // any other picture counts only when it is itself >= COLLECT_MIN px on its shorter side (real pixels, or the
+  // largest srcset width it declares). Thumbnails, avatars and not-yet-loaded images are skipped.
+  const COLLECT_MIN = 300;
+  const IMG_EXT = /\.(jpe?g|png|gif|webp|avif)(\?|$)/i;
+  function srcsetMax(img) {
+    const cands = [];
+    const pic = img.closest("picture");
+    if (pic) for (const s of pic.querySelectorAll("source[srcset]")) cands.push(...srcsetCands(s.srcset));
+    if (img.srcset) cands.push(...srcsetCands(img.srcset));
+    return Math.max(0, ...cands.map((c) => c.n));
+  }
   function scanImages() {
     const out = new Map();   // url -> {url, date}
     for (const img of document.querySelectorAll("img")) {
-      if ((img.naturalWidth && img.naturalWidth < 32) || (img.naturalHeight && img.naturalHeight < 32)) continue;
+      const a = img.closest("a[href]");
+      if (a && IMG_EXT.test(a.href) && okUrl(a.href)) { if (!out.has(a.href)) out.set(a.href, { url: a.href, date: dateNear(img) }); continue; }
+      const real = img.naturalWidth && Math.min(img.naturalWidth, img.naturalHeight);
+      if (!(real >= COLLECT_MIN || srcsetMax(img) >= COLLECT_MIN)) continue;
       const best = bestUrl(img);
       if (best && !out.has(best)) out.set(best, { url: best, date: dateNear(img) });
     }
     for (const a of document.querySelectorAll("a[href]")) {
-      if (/\.(jpe?g|png|gif|webp|avif)(\?|$)/i.test(a.href) && !out.has(a.href)) out.set(a.href, { url: a.href, date: dateNear(a) });
+      if (IMG_EXT.test(a.href) && !a.querySelector("img") && !out.has(a.href)) out.set(a.href, { url: a.href, date: dateNear(a) });
     }
     if (top === window) {
       const og = document.querySelector('meta[property="og:image"]');
@@ -488,9 +503,7 @@
   // With the "Collect as I scroll" switch on, every image that is ON SCREEN and rendered at least
   // COLLECT_MIN px on its shorter side is reported once to the background. Thumbnails render small,
   // so a lightbox or feed of full posts collects the real pictures and leaves the grid behind them alone.
-  const COLLECT_MIN = 300;
   const collected = new Set();     // URLs this frame already reported
-  const IMG_EXT = /\.(jpe?g|png|gif|webp|avif)(\?|$)/i;
   function collectVisible() {
     if (!settings.collect) return;
     for (const img of document.querySelectorAll("img")) {

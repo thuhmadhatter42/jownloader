@@ -239,5 +239,19 @@ out="$(env -i JOWN_SKIP_BREW_ENV=1 HOME="$T/ihome" PATH="$T/wbin:/usr/bin:/bin" 
 MF="$T/ihome/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.jshriver.jownloader.json"
 check "H9 manifest for a \" \$ \\ path is valid JSON with the real path" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"] == sys.argv[2] + "/jownloader_host.py")' "$MF" "$IN" 2>&1 | tail -1)" "True"
 
+# Q1 (0.1.55): quarantine flags written by a browser's child processes are stripped from the venv
+QV="$T/qn/.venv"; mkdir -p "$QV/lib/site-packages/numpy" "$T/qn/bin"
+cp "$NATIVE/deps.sh" "$T/qn/deps.sh"
+printf 'home = /usr/bin\n' > "$QV/pyvenv.cfg"; : > "$QV/lib/site-packages/numpy/_core.so"; : > "$QV/lib/site-packages/numpy/mod.py"
+qflag() { xattr -p com.apple.quarantine "$1" &>/dev/null && echo flagged || echo clean; }
+for f in "$QV/pyvenv.cfg" "$QV/lib/site-packages/numpy/_core.so" "$QV/lib/site-packages/numpy/mod.py"; do xattr -w com.apple.quarantine "0081;5f0e1c2a;Brave;" "$f"; done
+check "Q1 setup: files flagged" "$(qflag "$QV/lib/site-packages/numpy/_core.so")" "flagged"
+out="$(env -i HOME="$T/home" PATH="/usr/bin:/bin" bash -c "source '$T/qn/deps.sh'; clear_quarantine_all; echo rc=\$?" 2>&1)"
+check "Q1 flagged venv: every file cleaned" "$(qflag "$QV/pyvenv.cfg") $(qflag "$QV/lib/site-packages/numpy/_core.so") $(qflag "$QV/lib/site-packages/numpy/mod.py")" "clean clean clean"
+check "Q1 one log line says so, rc 0" "$(echo "$out" | grep -c 'Cleared macOS quarantine')/$(echo "$out" | tail -1)" "1/rc=0"
+out="$(env -i HOME="$T/home" PATH="/usr/bin:/bin" bash -c "source '$T/qn/deps.sh'; clear_quarantine_all; echo rc=\$?" 2>&1)"
+check "Q1 clean venv: silent no-op, rc 0" "$(echo "$out" | tr '\n' ' ')" "rc=0 "
+env -i HOME="$T/home" PATH="/usr/bin:/bin" bash -c "source '$T/qn/deps.sh'; clear_quarantine '$T/no-such-dir'"
+check "Q1 missing dir: no failure" "$?" "0"
 
 [ "$fails" = 0 ] && echo "ALL GREEN" || { echo "$fails FAILED"; exit 1; }

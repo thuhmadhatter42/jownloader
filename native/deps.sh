@@ -101,6 +101,7 @@ ensure_venv() {
         "$builder" -m venv "$DEPS_DIR/.venv" && "$VENV_PY" -m pip install -U --quiet pip || true
     fi
     [ -x "$VENV_PY" ] || echo "❌ could not create native/.venv with $builder"
+    clear_quarantine "$DEPS_DIR/.venv"
     return 0
 }
 
@@ -202,7 +203,7 @@ install_tool() {
             echo "  no prebuilt package for this macOS — install $tool by hand: $(manual_install_hint "$tool")"
             return 0
         fi
-        if brew install "$tool"; then return 0; fi
+        if brew install "$tool"; then JOWN_BREW_NEW="$JOWN_BREW_NEW $tool"; return 0; fi
     fi
     echo "  could not install $tool — install it by hand: $(manual_install_hint "$tool")"
     return 0
@@ -247,9 +248,48 @@ gallery_dl_interp() {
     echo "$interp"
 }
 
+# macOS stamps every file a browser's child process writes with com.apple.quarantine ("...;Brave;"), and
+# Gatekeeper then refuses to load the unsigned libraries pip put in the venv (numpy's _multiarray_umath.so:
+# "Apple could not verify ... free of malware"). Strips the flag from everything under $1, but only when a
+# cheap sample (pyvenv.cfg, one .so) carries it: a full walk of a 10k-file venv is slow. Never fatal.
+JOWN_BREW_NEW=""   # brew formulae installed in this run
+has_quarantine() {
+    local f
+    for f in "$1/pyvenv.cfg" "$(find "$1" -type f -name '*.so' -print -quit 2>/dev/null)"; do
+        [ -n "$f" ] && [ -f "$f" ] && xattr -p com.apple.quarantine "$f" &>/dev/null && return 0
+    done
+    return 1
+}
+clear_quarantine() {
+    local d="$1"
+    [ -d "$d" ] || return 0
+    has_quarantine "$d" || return 0
+    xattr -dr com.apple.quarantine "$d" 2>/dev/null || true
+    echo "▸ Cleared macOS quarantine flags from ${d/#$HOME/~}"
+    return 0
+}
+# pip into the venv, then strip the flag at once, so the import probes right after are not blocked by Gatekeeper.
+venv_pip_install() { "$VENV_PY" -m pip install "$@"; local rc=$?; clear_quarantine "$DEPS_DIR/.venv"; return $rc; }
+# Everything deps.sh installs: the venv, the pipx venvs for yt-dlp / gallery-dl, any keg brew added this run.
+clear_quarantine_all() {
+    local venvs v t
+    clear_quarantine "$DEPS_DIR/.venv"
+    venvs=""
+    command -v pipx &>/dev/null && venvs="$(pipx environment --value PIPX_LOCAL_VENVS 2>/dev/null)"
+    for v in "$venvs" "$HOME/Library/Application Support/pipx/venvs" "$HOME/.local/pipx/venvs"; do
+        [ -n "$v" ] || continue
+        for t in yt-dlp gallery-dl; do clear_quarantine "$v/$t"; done
+    done
+    for t in $JOWN_BREW_NEW; do
+        command -v brew &>/dev/null && clear_quarantine "$(brew --cellar "$t" 2>/dev/null)"
+    done
+    return 0
+}
+
 # Installs whatever is missing. Prints nothing when everything is present.
 ensure_deps() {
     ensure_venv
+    clear_quarantine "$DEPS_DIR/.venv"   # an install flagged by an earlier run is cleaned before the probes below
     load_brew
 
     if ! command -v brew &>/dev/null; then
@@ -278,14 +318,14 @@ ensure_deps() {
 
     if ! "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('pypdf') else 1)" 2>/dev/null; then
         echo "▸ Installing pypdf (PDF merge for Whole-site saves)..."
-        "$VENV_PY" -m pip install --prefer-binary --quiet pypdf 2>/dev/null \
+        venv_pip_install --prefer-binary --quiet pypdf 2>/dev/null \
             || echo "  (pip failed — pypdf not installed; whole-site PDF pages will be kept separately)"
     fi
 
     # mutagen writes the tags (title, artist, album, number, cover) into Spotify-link songs
     if ! "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('mutagen') else 1)" 2>/dev/null; then
         echo "▸ Installing mutagen (song tags for Spotify links)..."
-        "$VENV_PY" -m pip install --prefer-binary --quiet mutagen 2>/dev/null \
+        venv_pip_install --prefer-binary --quiet mutagen 2>/dev/null \
             || echo "  (pip failed — mutagen not installed; Spotify-link songs will be saved untagged)"
     fi
 
@@ -307,14 +347,14 @@ ensure_deps() {
     #   librosa             (fallback; installs almost everywhere)
     if ! have_essentia && ! have_librosa; then
         echo "▸ Installing the BPM/key analyzer..."
-        if "$VENV_PY" -m pip install --prefer-binary --quiet essentia-tensorflow >/dev/null 2>&1 \
+        if venv_pip_install --prefer-binary --quiet essentia-tensorflow >/dev/null 2>&1 \
            && "$VENV_PY" -c "import essentia.standard" >/dev/null 2>&1; then
             echo "  ✓ essentia (TempoCNN + HPCP)"
         else
             "$VENV_PY" -m pip uninstall -y essentia-tensorflow >/dev/null 2>&1 || true
             echo "  no essentia build for this Mac — installing librosa instead"
             # --prefer-binary avoids compiling llvmlite from source
-            "$VENV_PY" -m pip install --prefer-binary --quiet librosa >/dev/null 2>&1 || true
+            venv_pip_install --prefer-binary --quiet librosa >/dev/null 2>&1 || true
             if have_librosa; then
                 echo "  ✓ librosa"
             elif venv_is_apple_python; then
@@ -329,13 +369,14 @@ ensure_deps() {
     # librosa's numba refuses to import when it lags numpy (seen 2026-09-11)
     if ! have_essentia && have_librosa && ! numba_imports; then
         echo "▸ Repairing librosa (numba/numpy mismatch)..."
-        "$VENV_PY" -m pip install -U --prefer-binary --quiet numba >/dev/null 2>&1 || true
+        venv_pip_install -U --prefer-binary --quiet numba >/dev/null 2>&1 || true
         if ! numba_imports; then
             if venv_is_apple_python; then echo "❌ $APPLE_PY_HINT."
             else echo "❌ librosa still broken; no BPM/key tags until fixed."; fi
         fi
     fi
 
+    clear_quarantine_all
     chmod +x "$DEPS_DIR"/jownloader_host.py 2>/dev/null || true
 }
 

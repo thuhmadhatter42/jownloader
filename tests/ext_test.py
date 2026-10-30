@@ -93,8 +93,32 @@ with sync_playwright() as p:
     tabs = sw.evaluate("async () => (await chrome.tabs.query({})).map(t => [t.id, t.url])")
     tab_id = [t for t in tabs if "testpage" in (t[1] or "")][0][0]
     res = pop.evaluate("async id => await chrome.runtime.sendMessage({type:'scan', tabId:id})", tab_id)
-    check("scan counts", {k: len(res[k]) for k in ("images", "videos", "docs")}, {"images": 9, "videos": 4, "docs": 1})   # captured varies with cache
-    check("image dates (nearest <time>, else none)", sorted((i["url"].split("/")[4], i["date"]) for i in res["images"]), [("10", "2025-03-07"), ("20", ""), ("40", ""), ("40", ""), ("50", ""), ("51", ""), ("52", ""), ("60", ""), ("70", "2021-07-28")])
+    check("scan counts", {k: len(res[k]) for k in ("images", "videos", "docs")}, {"images": 4, "videos": 4, "docs": 1})   # captured varies with cache
+    check("image scan = full size only (400x300s, the link target of the 600px preview; no 200px/100px thumbs); dates: nearest <time>, else none", sorted((i["url"].split("/")[4], i["date"]) for i in res["images"]), [("10", "2025-03-07"), ("20", ""), ("40", ""), ("70", "2021-07-28")])
+    # full size only, on a grid-like page: tile = preview wrapped in a link to the original; 40px thumb linking to
+    # an html page; 195px avatar; a plain 1200x800 picture. Served from a fake origin so the pictures have real pixels.
+    import struct, zlib
+    def png(w, h):
+        raw = b"".join(b"\x00" + b"\x80\x80\x80" * w for _ in range(h))
+        ck = lambda t, d: struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+        return b"\x89PNG\r\n\x1a\n" + ck(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ck(b"IDAT", zlib.compress(raw)) + ck(b"IEND", b"")
+    sizes = {"/tile-preview.png": (1280, 720), "/thumb.png": (40, 40), "/avatar.png": (195, 195), "/big.png": (1200, 800)}
+    grid = ('<html><body><a href="https://grid.test/full/tile.jpg"><img src="https://grid.test/tile-preview.png" width="373" height="210"></a>'
+            '<a href="/some-page"><img src="https://grid.test/thumb.png" width="40" height="40"></a>'
+            '<img src="https://grid.test/avatar.png" width="195" height="195"><img src="https://grid.test/big.png" width="600" height="400"></body></html>')
+    def serve(route):
+        path = route.request.url.split("grid.test")[1]
+        if path == "/": route.fulfill(status=200, content_type="text/html", body=grid)
+        elif path in sizes: route.fulfill(status=200, content_type="image/png", body=png(*sizes[path]))
+        else: route.fulfill(status=200, content_type="text/html", body="<html></html>")
+    ctx.route("https://grid.test/**", serve)
+    gp = ctx.new_page(); gp.goto("https://grid.test/", wait_until="load"); gp.wait_for_timeout(800)
+    gtabs = sw.evaluate("async () => (await chrome.tabs.query({})).map(t => [t.id, t.url])")
+    gid = [t for t in gtabs if (t[1] or "").startswith("https://grid.test")][0][0]
+    gres = pop.evaluate("async id => await chrome.runtime.sendMessage({type:'scan', tabId:id})", gid)
+    check("grid page: only the linked original and the 1200x800 picture (no preview, thumb, avatar)", sorted(i["url"].split("grid.test")[1] for i in gres["images"]), ["/big.png", "/full/tile.jpg"])
+    gp.close()
+
     check("video date (page has none)", [v.get("date") for v in res["videos"]], ["", "", "", ""])
     check("videos = best variant per player (KVS flashvars, <source size>, JW-style sources) + the same-file one as it plays; the muted-loop preview is not a video",
           sorted(v["url"].split("/")[-1] for v in res["videos"]), ["clip.mp4", "flower.mp4", "friday.mp4?t=1", "movie.mp4"])
