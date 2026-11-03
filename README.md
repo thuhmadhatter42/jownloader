@@ -4,23 +4,22 @@ A Brave / Chrome extension that saves every image, video and document on the pag
 at the best quality the page offers, into any folder you pick. No save dialogs, no re-downloading what
 you already have.
 
-## Install in 2 steps (Mac, Brave or Chrome)
+## Install (Mac, Brave or Chrome)
 
-**1. Paste this into Terminal** (Applications → Utilities → Terminal) and press Return. It asks for your Mac
-password once and takes a few minutes the first time:
+**1. Download** [Install-Jownloader.zip](https://github.com/thuhmadhatter42/jownloader/releases/latest/download/Install-Jownloader.zip)
+and open it. (Already used the green **Code** button → **Download ZIP**? Open that folder instead; it works the same.)
 
-```
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/thuhmadhatter42/jownloader/master/install)"
-```
+**2. Double-click Install Jownloader.command.** The first time, macOS says it can't check it: click **Done**,
+open **System Settings → Privacy & Security**, scroll down, click **Open Anyway**. A window opens and installs
+everything; type your Mac password when it asks (nothing shows as you type). The first run takes a few minutes.
 
-**2. Load it into your browser.** When the script finishes it opens `brave://extensions` and shows the
-`extension` folder in Finder.
-- Turn on **Developer mode** (switch, top right of the extensions page).
-- Drag the highlighted **extension** folder from Finder onto the extensions page.
+**3. Add it to your browser.** When it finishes, the extensions page opens and the **extension** folder is
+highlighted in Finder.
+- Turn on **Developer mode** (top right of the extensions page).
+- Drag the highlighted **extension** folder onto the extensions page.
 - Click the puzzle-piece icon in the toolbar and pin **Jownloader**.
 
-That's it. To update later, run the same command again, then click the circular arrow on Jownloader's card
-at `brave://extensions`. Rather double-click than use Terminal? See [Install (macOS)](#install-macos).
+To update later, double-click **Install Jownloader.command** again.
 
 - **Download all images / videos / documents** — one click each, counts shown before you click.
 - **Best quality, one file per item** — the largest `srcset` / `<picture>` candidate per image; for
